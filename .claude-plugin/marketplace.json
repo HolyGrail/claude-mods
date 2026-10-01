@@ -1,0 +1,19 @@
+{
+  "name": "claude-mods",
+  "owner": {
+    "name": "HolyGrail"
+  },
+  "description": "Claude Code mods by HolyGrail",
+  "plugins": [
+    {
+      "name": "usage-meter",
+      "source": "./plugins/usage-meter",
+      "description": "Shows context, 5-hour and weekly limit usage above the prompt"
+    },
+    {
+      "name": "pr-relay",
+      "source": "./plugins/pr-relay",
+      "description": "Watches the session's pull request and wakes the session when it is merged or Codex reviews it"
+    }
+  ]
+}

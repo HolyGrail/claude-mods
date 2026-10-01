@@ -62,13 +62,28 @@ Desktop アプリが PR の CI の結果をセッションへ送るので、両�
 ## 使い方
 
 `gh` が PATH にあり、認証済みである必要があります。
-1 回だけ試すなら、ターミナルで次のように起動します。
+
+### インストール
+
+Claude Code のプロンプトで、次の 3 つを順に実行します。
+
+```text
+/plugin marketplace add HolyGrail/claude-mods
+/plugin install pr-relay@claude-mods
+/reload-plugins
+```
+
+更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+
+### インストールせずに試す
+
+clone したリポジトリのルートで、次のように起動します。
 
 ```bash
 claude --plugin-dir ./plugins/pr-relay
 ```
 
-常に読み込むなら、`~/.claude/settings.json` の `env` にある `CLAUDE_CODE_PLUGIN_DIRS` にこのディレクトリの絶対パスを足します。
+手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` にある `CLAUDE_CODE_PLUGIN_DIRS` にこのディレクトリの絶対パスを足します。
 
 ## 制約
 

@@ -23,14 +23,27 @@ Desktop アプリは、本体に同梱された Claude Code で動きます。
 本体を更新する前から続いているセッションは、再開しても帯が表示されないことがありました。
 その場合は、新しいセッションを開いてください。
 
-1 回だけ試すなら、ターミナルで次のように起動します。
+### インストール
+
+Claude Code のプロンプトで、次の 3 つを順に実行します。
+
+```text
+/plugin marketplace add HolyGrail/claude-mods
+/plugin install usage-meter@claude-mods
+/reload-plugins
+```
+
+更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+
+### インストールせずに試す
+
+clone したリポジトリのルートで、次のように起動します。
 
 ```bash
 claude --plugin-dir ./plugins/usage-meter
 ```
 
-常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
-
+手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
 ## 制約
 
 5 時間制限と週間制限はアカウント単位の値なので、読み取った値を `$.store` でマシン上のセッション全体に共有しています。
