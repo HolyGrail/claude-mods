@@ -110,6 +110,10 @@ async function adoptShared($) {
   if (isReading(shared) && shared.at >= measuredAt) {
     rateLimits = shared.limits
     measuredAt = shared.at
+  } else if (measuredAt > 0) {
+    // A delayed write from another session took the store back to an older reading, so put this
+    // session's newer one back; the sessions agree again by the next tick
+    await $.store.set(STORE_KEY, { at: measuredAt, limits: rateLimits })
   }
 }
 

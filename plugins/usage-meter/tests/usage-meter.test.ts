@@ -341,3 +341,21 @@ test('a startup merge is saved no older than the reading it merged into', async 
   expect(saved.get('rateLimits')).toEqual({ at: NOW + MINUTE, limits: LIMITS })
 })
 
+test('a session puts its newer reading back when the store went back to an older one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+  // Another session's write of an older measurement landed after this one
+  const older = [fiveHour(55, 2 * HOUR + 13 * MINUTE), LIMITS[1]!]
+  saved.set('rateLimits', { at: NOW - MINUTE, limits: older })
+  await clock.advance(MINUTE)
+
+  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: LIMITS })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+})
+
