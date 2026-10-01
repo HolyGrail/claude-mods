@@ -7,11 +7,17 @@ let rateLimits = []
 let measuredAt = 0
 // The timer that refreshes the band, kept so a later session.start can stop it
 let ticker = null
+// This session's own key in the store
+let ownKey = null
 
-// Rate limits are per account, so share the newest reading with the other sessions.
+// Rate limits are per account, so sessions share readings through $.store, and each shows the
+// newest one. $.store has no atomic update, so each session writes only its own key, and no
+// write can overwrite another session's reading.
 // The mods API has no account id, so after switching accounts on this machine a new
 // session shows the previous account's reading until its own first response.
-const STORE_KEY = 'rateLimits'
+const KEY_PREFIX = 'reading:'
+// Readings older than the longest window say nothing current, so their keys are deleted
+const STALE_MS = 8 * 24 * 3_600_000
 // How often to pick up other sessions' readings and refresh the countdowns and time markers
 const TICK_MS = 60_000
 
@@ -49,18 +55,31 @@ export function register(on) {
     ticker?.cancel()
     rateLimits = []
     measuredAt = 0
+    ownKey = KEY_PREFIX + (await $.session.id())
     const usage = await $.session.usage()
     context = usage.context
-    if (usage.rateLimits.length > 0) {
-      await publishSnapshot($, usage.rateLimits)
-    } else {
-      await adoptShared($)
-    }
+    if (usage.rateLimits.length > 0) await publishSnapshot($, usage.rateLimits)
+    // Also clears keys ended sessions left, which short runs that never tick would not
+    await refresh($)
     ticker = $.clock.every(TICK_MS, async () => {
-      await adoptShared($)
+      await refresh($)
       $.ui.invalidate('ui.render')
     })
     $.ui.invalidate('ui.render')
+    return next(e)
+  })
+
+  // Keeps the store from growing by a key per session. A session whose reading is not the newest
+  // removes its own key. One that holds the newest marks it ended, so the others may delete it once
+  // a newer reading exists: an ended session never writes again, so that delete can't lose a write.
+  on('session.end', async ($, e, next) => {
+    // After /clear, /resume and /branch this module keeps running and measuring
+    if (e.reason === 'clear' || e.reason === 'resume' || !ownKey) return next(e)
+    ticker?.cancel()
+    const { entries, newest } = await scan($)
+    if (newest?.key === ownKey) await $.store.set(ownKey, { ...newest.reading, ended: true })
+    else await $.store.delete(ownKey)
+    await prune($, entries, newest?.key)
     return next(e)
   })
 
@@ -96,42 +115,60 @@ export function register(on) {
 }
 
 async function remember($, limits) {
-  // Take the time first, so an adoptShared that runs meanwhile can't pair old limits with it
+  // Take the time first, so a refresh that runs meanwhile can't pair old limits with it
   const now = await $.clock.now()
   rateLimits = limits
   measuredAt = now
-  await $.store.set(STORE_KEY, { at: now, limits })
+  await $.store.set(ownKey, { at: now, limits })
 }
 
-// Takes another session's reading unless this session's is newer. At an equal time the stored
-// one won the race between two writes, so it is taken too.
-async function adoptShared($) {
-  const shared = await $.store.get(STORE_KEY)
-  if (isReading(shared) && shared.at >= measuredAt) {
-    rateLimits = shared.limits
-    measuredAt = shared.at
-  } else if (measuredAt > 0) {
-    // A delayed write from another session took the store back to an older reading, so put this
-    // session's newer one back; the sessions agree again by the next tick
-    await $.store.set(STORE_KEY, { at: measuredAt, limits: rateLimits })
+// Takes the newest reading any session saved, unless this session's own is newer still, and
+// deletes the keys no session needs: ended sessions' older readings, and any reading too old
+async function refresh($) {
+  const { entries, newest } = await scan($)
+  if (newest && newest.reading.at >= measuredAt) {
+    rateLimits = newest.reading.limits
+    measuredAt = newest.reading.at
+  }
+  await prune($, entries, newest?.key)
+}
+
+async function prune($, entries, newestKey) {
+  const cutoff = (await $.clock.now()) - STALE_MS
+  for (const { key, reading } of entries) {
+    if (key === ownKey || key === newestKey) continue
+    if (!isReading(reading) || reading.ended === true || reading.at < cutoff) await $.store.delete(key)
   }
 }
 
 // usage() at startup may answer this session's last reading, which can be older than the shared
 // one in ways a merge can't tell apart (a window that went away, a spend limit that went down),
-// so a shared reading always wins and the snapshot only fills an empty store
+// so a shared reading always wins and the snapshot is saved only when there is none
 async function publishSnapshot($, snapshot) {
-  // $.store has no atomic update, so read right before writing to keep the race short
-  const shared = await $.store.get(STORE_KEY)
-  if (isReading(shared)) {
-    rateLimits = shared.limits
-    measuredAt = shared.at
+  const { newest } = await scan($)
+  if (newest) {
+    rateLimits = newest.reading.limits
+    measuredAt = newest.reading.at
     return
   }
-  const now = await $.clock.now()
-  rateLimits = snapshot
-  measuredAt = now
-  await $.store.set(STORE_KEY, { at: now, limits: snapshot })
+  await remember($, snapshot)
+}
+
+// Every session's key and what it holds, and the newest reading among them. At an equal time the
+// later key wins, so every session picks the same one.
+async function scan($) {
+  const entries = []
+  let newest = null
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(KEY_PREFIX)) continue
+    const reading = await $.store.get(key)
+    entries.push({ key, reading })
+    if (!isReading(reading)) continue
+    if (!newest || reading.at > newest.reading.at || (reading.at === newest.reading.at && key > newest.key)) {
+      newest = { key, reading }
+    }
+  }
+  return { entries, newest }
 }
 
 function isReading(value) {

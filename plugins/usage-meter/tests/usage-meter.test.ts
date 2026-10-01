@@ -35,19 +35,37 @@ const LIMITS: SessionRateLimit[] = [
 
 const CONTEXT: SessionContextUsage = { tokens: 39_205, window: 200_000, percent: 20 }
 
-function stubSession(on: On, saved: Map<string, unknown>, rateLimits = LIMITS, context = CONTEXT) {
-  on('session.usage', () => ({ value: { startedAt: NOW, context, rateLimits } }))
-  on('session.start', () => ({ cwd: '/work' }))
+// This session's key in the store, and another session's
+const OWN = 'reading:this'
+const OTHER = 'reading:other'
+
+function stubStore(on: On, saved: Map<string, unknown>, onList = () => {}) {
+  on('session.id', () => ({ value: 'this' }))
+  on('store.keys', () => {
+    onList()
+    return { value: [...saved.keys()] }
+  })
   on('store.get', ($, e) => ({ value: saved.get(e.key) }))
   on('store.set', ($, e) => {
     saved.set(e.key, e.value)
     return { value: undefined }
   })
+  on('store.delete', ($, e) => {
+    saved.delete(e.key)
+    return { value: undefined }
+  })
+}
+
+function stubSession(on: On, saved: Map<string, unknown>, rateLimits = LIMITS, context = CONTEXT) {
+  on('session.usage', () => ({ value: { startedAt: NOW, context, rateLimits } }))
+  on('session.start', () => ({ cwd: '/work' }))
+  stubStore(on, saved)
   // What the mods after this one draw in the band
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
 }
 
 const START = { surface: 'terminal', isInteractive: true, cwd: '/work' } as const
+const END = { reason: 'other', sessionId: 'this', resume: { id: '' } } as const
 
 test('colors a limit by how far usage runs ahead of the time gone', async ($, on) => {
   mock.clock(on, { now: NOW })
@@ -159,7 +177,7 @@ test('session.measure updates the figures and shares the limits', async ($, on) 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '75%' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^91% / })).toMatchObject({ props: { color: 'error' } })
-  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: rateLimits })
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: rateLimits })
 })
 
 test('picks up a newer reading another session shared', async ($, on) => {
@@ -169,7 +187,7 @@ test('picks up a newer reading another session shared', async ($, on) => {
   stubSession(on, saved, [])
   await $.session.start(START)
 
-  saved.set('rateLimits', { at: NOW + 1, limits: LIMITS })
+  saved.set(OTHER, { at: NOW + 1, limits: LIMITS })
   await clock.advance(MINUTE)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -200,17 +218,12 @@ test('a later session.start keeps one timer and shows the newest shared reading'
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   let starts = 0
-  let reads = 0
+  let lists = 0
   // The first start reports limits, the later ones report none
   on('session.usage', () => ({ value: { startedAt: NOW, context: CONTEXT, rateLimits: starts++ === 0 ? LIMITS : [] } }))
   on('session.start', () => ({ cwd: '/work' }))
-  on('store.get', ($, e) => {
-    reads += 1
-    return { value: saved.get(e.key) }
-  })
-  on('store.set', ($, e) => {
-    saved.set(e.key, e.value)
-    return { value: undefined }
+  stubStore(on, saved, () => {
+    lists += 1
   })
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
 
@@ -227,12 +240,11 @@ test('a later session.start keeps one timer and shows the newest shared reading'
   ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
 
-  // Only the last start's timer reads the store
-  reads = 0
+  // Only the last start's timer lists the store
+  lists = 0
   await clock.advance(MINUTE)
-  expect(reads).toBe(1)
+  expect(lists).toBe(1)
 })
-
 const SPEND: SessionRateLimit = { kind: 'spend_limit', percentUsed: 40 }
 
 test('drops the bars when every meter would not fit on the line', async ($, on) => {
@@ -264,13 +276,15 @@ test('a startup snapshot older than the shared reading does not overwrite it', a
   const saved = new Map<string, unknown>()
   // Another session measured more of the same 5-hour window since this one last did
   const shared = [fiveHour(70, 2 * HOUR + 13 * MINUTE), LIMITS[1]!]
-  saved.set('rateLimits', { at: NOW - MINUTE, limits: shared })
+  saved.set(OTHER, { at: NOW - MINUTE, limits: shared })
   stubSession(on, saved)
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^70% / })).toBeDefined()
-  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: shared })
+  // The snapshot is not saved over the shared reading
+  expect(saved.get(OWN)).toBeUndefined()
+  expect(saved.get(OTHER)).toEqual({ at: NOW - MINUTE, limits: shared })
 })
 
 test('a measurement that reports no windows clears the limits', async ($, on) => {
@@ -284,54 +298,21 @@ test('a measurement that reports no windows clears the limits', async ($, on) =>
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
-  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: [] })
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: [] })
 })
 
 test('an empty shared reading wins over a startup snapshot', async ($, on) => {
   mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   // Another session measured that the account's windows went away
-  saved.set('rateLimits', { at: NOW - MINUTE, limits: [] })
+  saved.set(OTHER, { at: NOW - MINUTE, limits: [] })
   stubSession(on, saved)
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
-  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: [] })
-})
-
-test('a stored reading at the same time as this session is taken', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const saved = new Map<string, unknown>()
-  stubSession(on, saved, [])
-  on('session.measure', ($, e) => ({ changed: e.changed }))
-  await $.session.start(START)
-
-  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
-  // Another session saved in the same millisecond, and its write landed last
-  saved.set('rateLimits', { at: NOW, limits: [fiveHour(64, 2 * HOUR + 13 * MINUTE), LIMITS[1]!] })
-  await clock.advance(MINUTE)
-
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /^64% / })).toBeDefined()
-})
-
-test('a session puts its newer reading back when the store went back to an older one', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const saved = new Map<string, unknown>()
-  stubSession(on, saved, [])
-  on('session.measure', ($, e) => ({ changed: e.changed }))
-  await $.session.start(START)
-
-  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
-  // Another session's write of an older measurement landed after this one
-  const older = [fiveHour(55, 2 * HOUR + 13 * MINUTE), LIMITS[1]!]
-  saved.set('rateLimits', { at: NOW - MINUTE, limits: older })
-  await clock.advance(MINUTE)
-
-  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: LIMITS })
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+  expect(saved.get(OWN)).toBeUndefined()
+  expect(saved.get(OTHER)).toEqual({ at: NOW - MINUTE, limits: [] })
 })
 
 test('a shared reading wins over a startup snapshot that has more windows', async ($, on) => {
@@ -339,25 +320,153 @@ test('a shared reading wins over a startup snapshot that has more windows', asyn
   const saved = new Map<string, unknown>()
   // Another session measured that only the 5-hour window applies now
   const shared = [LIMITS[0]!]
-  saved.set('rateLimits', { at: NOW - MINUTE, limits: shared })
+  saved.set(OTHER, { at: NOW - MINUTE, limits: shared })
   stubSession(on, saved)
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /4d18h/ })).toBeUndefined()
-  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: shared })
+  expect(saved.get(OWN)).toBeUndefined()
+  expect(saved.get(OTHER)).toEqual({ at: NOW - MINUTE, limits: shared })
 })
 
 test('a shared spend limit that went down wins over a higher startup snapshot', async ($, on) => {
   mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
-  saved.set('rateLimits', { at: NOW - MINUTE, limits: [{ kind: 'spend_limit', percentUsed: 5 }] })
+  saved.set(OTHER, { at: NOW - MINUTE, limits: [{ kind: 'spend_limit', percentUsed: 5 }] })
   stubSession(on, saved, [{ kind: 'spend_limit', percentUsed: 90 }])
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '5%' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
+})
+
+test('readings at the same time resolve to the later key in every session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+  // Another session saved in the same millisecond, under a key that sorts after this one's
+  saved.set('reading:zz', { at: NOW, limits: [fiveHour(64, 2 * HOUR + 13 * MINUTE), LIMITS[1]!] })
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^64% / })).toBeDefined()
+})
+
+test('an older reading another session saved leaves both keys and the display alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+  // A delayed write of an older measurement lands in the other session's own key
+  const older = { at: NOW - MINUTE, limits: [fiveHour(55, 2 * HOUR + 13 * MINUTE), LIMITS[1]!] }
+  saved.set(OTHER, older)
+  await clock.advance(MINUTE)
+
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS })
+  expect(saved.get(OTHER)).toEqual(older)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+})
+
+test('readings older than the longest window are deleted, but not this session own', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  saved.set(OTHER, { at: NOW - 9 * 24 * HOUR, limits: LIMITS })
+  await clock.advance(MINUTE)
+
+  expect(saved.has(OTHER)).toBe(false)
+  expect(saved.has(OWN)).toBe(true)
+})
+
+test('a session that ends removes its key unless it holds the newest reading', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('session.end', () => ({ sessionId: 'this' }))
+  await $.session.start(START)
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+
+  // Another session saved a newer reading, so this session's key goes, and the other's stays
+  saved.set(OTHER, { at: NOW + MINUTE, limits: LIMITS })
+  await $.session.end(END)
+  expect(saved.has(OWN)).toBe(false)
+  expect(saved.has(OTHER)).toBe(true)
+})
+
+test('a session that ends with the newest reading keeps it, marked ended', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('session.end', () => ({ sessionId: 'this' }))
+  await $.session.start(START)
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+
+  saved.set(OTHER, { at: NOW - MINUTE, limits: LIMITS })
+  saved.set('reading:ended-old', { at: NOW - MINUTE, limits: LIMITS, ended: true })
+  await $.session.end(END)
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS, ended: true })
+  // A live session's key stays, and an ended session's older one goes
+  expect(saved.has(OTHER)).toBe(true)
+  expect(saved.has('reading:ended-old')).toBe(false)
+})
+
+test('/clear leaves the key and the refresh timer running', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.end', () => ({ sessionId: 'this' }))
+  await $.session.start(START)
+
+  await $.session.end({ ...END, reason: 'clear' })
+  saved.set(OTHER, { at: NOW, limits: LIMITS })
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+})
+
+test('an ended session older reading is deleted, but an ended newest one stays', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  await $.session.start(START)
+
+  const newest = { at: NOW, limits: LIMITS, ended: true }
+  saved.set('reading:ended-old', { at: NOW - HOUR, limits: LIMITS, ended: true })
+  saved.set('reading:ended-new', newest)
+  saved.set('reading:live-old', { at: NOW - HOUR, limits: LIMITS })
+  await clock.advance(MINUTE)
+
+  expect(saved.has('reading:ended-old')).toBe(false)
+  expect(saved.get('reading:ended-new')).toEqual(newest)
+  // A live session may still write its key, so only its own end removes it
+  expect(saved.has('reading:live-old')).toBe(true)
+})
+
+test('a session clears ended sessions older keys as it starts', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  saved.set('reading:ended-old', { at: NOW - HOUR, limits: LIMITS, ended: true })
+  saved.set(OTHER, { at: NOW - MINUTE, limits: LIMITS })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  expect(saved.has('reading:ended-old')).toBe(false)
+  expect(saved.has(OTHER)).toBe(true)
 })
 
