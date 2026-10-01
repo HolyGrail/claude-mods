@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. There is no package.json or build step; the module runs as plain JS inside Claude Code. Currently the only plugin is `plugins/usage-meter`.
+A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. The repo root is also a plugin marketplace: `.claude-plugin/marketplace.json` lists every plugin, so a new plugin needs an entry there, and a user-visible change should bump `version` in that plugin's `plugin.json` so `claude plugin update` treats it as a new release. There is no package.json or build step; the module runs as plain JS inside Claude Code. Currently the only plugin is `plugins/usage-meter`.
 
 User-facing docs (README.md) are written in Japanese; code comments, commit messages and test names are in English.
 
