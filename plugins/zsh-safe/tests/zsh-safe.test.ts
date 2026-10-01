@@ -38,9 +38,16 @@ test("points ZDOTDIR at the plugin's .zshenv and keeps the person's own for it t
   expect(seen.env.get('ZDOTDIR')).toMatch(/\/zdotdir$/)
   expect(seen.env.get('ZSH_SAFE_ZDOTDIR')).toBe('/Users/me/.config/zsh')
 
-  // A reload finds ZDOTDIR already pointing here, and keeps the person's value as it was
+  // A reload finds ZDOTDIR at the folder it set, and keeps the person's value as it was; so does
+  // one after an update, which moves the plugin's folder
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   expect(seen.env.get('ZSH_SAFE_ZDOTDIR')).toBe('/Users/me/.config/zsh')
+  seen.env.set('ZDOTDIR', '/cache/zsh-safe/0.0.9/zdotdir')
+  seen.env.set('ZSH_SAFE_DIR', '/cache/zsh-safe/0.0.9/zdotdir')
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  expect(seen.env.get('ZSH_SAFE_ZDOTDIR')).toBe('/Users/me/.config/zsh')
+  expect(seen.env.get('ZDOTDIR')).toMatch(/\/zdotdir$/)
+  expect(seen.env.get('ZDOTDIR')).not.toBe('/cache/zsh-safe/0.0.9/zdotdir')
 })
 
 test('leaves nothing to hand back when the person has no ZDOTDIR', async ($, on) => {

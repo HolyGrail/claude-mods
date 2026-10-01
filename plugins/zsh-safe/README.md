@@ -39,13 +39,30 @@ zsh は、起動のたびに `$ZDOTDIR/.zshenv` を読みます。
 
 ## 使い方
 
-1 回だけ試すなら、ターミナルで次のように起動します。
+動作を確かめたのは Claude Code v2.1.286 です。
+
+### インストール
+
+Claude Code のプロンプトで、次の 3 つを順に実行します。
+
+```text
+/plugin marketplace add HolyGrail/claude-mods
+/plugin install zsh-safe@claude-mods
+/reload-plugins
+```
+
+効き始めるのは、次に起動する zsh からです。
+更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+
+### インストールせずに試す
+
+clone したリポジトリのルートで、次のように起動します。
 
 ```bash
 claude --plugin-dir ./plugins/zsh-safe
 ```
 
-常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
+手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
 
 ## テスト
 

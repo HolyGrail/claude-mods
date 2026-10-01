@@ -14,12 +14,13 @@ export function register(on) {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const zdotdir = `${$.plugin.root}/zdotdir`
-    const current = await $.env.get('ZDOTDIR')
-    // A reload finds ZDOTDIR already here, and the person's own value already kept
-    if (current !== zdotdir) {
-      await $.env.set('ZSH_SAFE_ZDOTDIR', current)
-      await $.env.set('ZDOTDIR', zdotdir)
+    // A reload, after an update too, finds ZDOTDIR at the folder this module set (an update
+    // moves it), with the person's own value already kept
+    if ((await $.env.get('ZDOTDIR')) !== (await $.env.get('ZSH_SAFE_DIR'))) {
+      await $.env.set('ZSH_SAFE_ZDOTDIR', await $.env.get('ZDOTDIR'))
     }
+    await $.env.set('ZSH_SAFE_DIR', zdotdir)
+    await $.env.set('ZDOTDIR', zdotdir)
     return started
   })
 
