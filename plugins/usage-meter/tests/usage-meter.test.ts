@@ -51,15 +51,18 @@ const START = { surface: 'terminal', isInteractive: true, cwd: '/work' } as cons
 
 test('colors a limit by how far usage runs ahead of the time gone', async ($, on) => {
   mock.clock(on, { now: NOW })
-  // 2.5 hours left of 5, so half the window is gone
-  const half = 2.5 * HOUR
-  stubSession(on, new Map(), [fiveHour(30, half), fiveHour(50, half), fiveHour(80, half)])
+  stubSession(on, new Map(), [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
   await $.session.start(START)
 
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: '30% 2h30m (23:30)' })).toMatchObject({ props: { color: 'success' } })
-  expect(await ui.find({ type: 'Text', text: '50% 2h30m (23:30)' })).toMatchObject({ props: { color: 'warning' } })
-  expect(await ui.find({ type: 'Text', text: '80% 2h30m (23:30)' })).toMatchObject({ props: { color: 'error' } })
+  // 2.5 hours left of 5, so half the window is gone
+  const half = 2.5 * HOUR
+  for (const [used, color] of [[30, 'success'], [50, 'warning'], [80, 'error']] as const) {
+    await $.session.measure({ context: CONTEXT, rateLimits: [fiveHour(used, half)], changed: ['rateLimits'] })
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: used + '% 2h30m (23:30)' })).toMatchObject({ props: { color } })
+    await ui.unmount()
+  }
 })
 
 test('the 5-hour limit shows its reset time in JST past midnight', async ($, on) => {
@@ -229,3 +232,71 @@ test('a later session.start keeps one timer and shows the newest shared reading'
   await clock.advance(MINUTE)
   expect(reads).toBe(1)
 })
+
+const SPEND: SessionRateLimit = { kind: 'spend_limit', percentUsed: 40 }
+
+test('drops the bars when every meter would not fit on the line', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  stubSession(on, new Map(), [...LIMITS, SPEND])
+  await $.session.start(START)
+
+  // Four meters with bars take 96 columns, two more than the band leaves free at 96
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 96 } })
+  expect(await ui.find({ type: 'Text', text: /░/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '40%' })).toBeDefined()
+  await ui.unmount()
+
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 98 } })
+  expect(await ui.find({ type: 'Text', text: /░/ })).toBeDefined()
+})
+
+test('three meters keep their bars at 80 columns', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  stubSession(on, new Map())
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 80 } })
+  expect(await ui.find({ type: 'Text', text: /░/ })).toBeDefined()
+})
+
+test('a startup snapshot older than the shared reading does not overwrite it', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  // Another session measured more of the same 5-hour window since this one last did
+  const shared = [fiveHour(70, 2 * HOUR + 13 * MINUTE), LIMITS[1]!]
+  saved.set('rateLimits', { at: NOW - MINUTE, limits: shared })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^70% / })).toBeDefined()
+  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: shared })
+})
+
+test('a startup snapshot of a newer window replaces the shared one', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  // The shared reading is from the previous 5-hour window, which reset at NOW - 1 minute
+  saved.set('rateLimits', { at: NOW - 2 * HOUR, limits: [fiveHour(95, -MINUTE), LIMITS[1]!] })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: LIMITS })
+})
+
+test('a measurement that reports no windows clears the limits', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved)
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+
+  await $.session.measure({ context: CONTEXT, rateLimits: [], changed: ['rateLimits'] })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
+  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: [] })
+})
+

@@ -35,8 +35,9 @@ const RED_MIN_USED = 90
 const JST_OFFSET_MS = 9 * HOUR_MS
 
 const BAR_CELLS = 10
-// Below this width the terminal leaves the bars out
-const BARS_MIN_COLUMNS = 80
+// Columns between two meters, and the band's last column, which the terminal may draw over
+const METER_GAP = 3
+const BAND_RESERVED_COLUMNS = 2
 const SVG_BAR = { width: 96, height: 10 }
 const SVG_COLORS = { success: '#4caf50', warning: '#e0a526', error: '#e5534b', track: 'rgba(128,128,128,0.3)', marker: '#5b9bff' }
 // The terminal draws the time marker in this color
@@ -50,11 +51,10 @@ export function register(on) {
     measuredAt = 0
     const usage = await $.session.usage()
     context = usage.context
-    if (usage.rateLimits.length > 0) {
-      await remember($, usage.rateLimits)
-    } else {
-      await adoptShared($)
-    }
+    await adoptShared($)
+    // usage() may answer this session's last reading, which can be older than the shared one
+    const merged = mergeLimits(rateLimits, usage.rateLimits)
+    if (JSON.stringify(merged) !== JSON.stringify(rateLimits)) await remember($, merged)
     ticker = $.clock.every(TICK_MS, async () => {
       await adoptShared($)
       $.ui.invalidate('ui.render')
@@ -66,9 +66,8 @@ export function register(on) {
   // Fires after each turn, and when a rate-limit window moves a whole point
   on('session.measure', async ($, e, next) => {
     context = e.context
-    if (e.changed.includes('rateLimits') && e.rateLimits.length > 0) {
-      await remember($, e.rateLimits)
-    }
+    // A fresh measurement, including an empty one when the account's windows went away
+    if (e.changed.includes('rateLimits')) await remember($, e.rateLimits)
     $.ui.invalidate('ui.render')
     return next(e)
   })
@@ -76,17 +75,17 @@ export function register(on) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const elements = $.ui.resolve(e)
     const now = await $.clock.now()
-    const gauge = e.surface === 'desktop' ? 'svg' : (e.props.bodyColumns ?? 0) >= BARS_MIN_COLUMNS ? 'text' : 'none'
-
     const meters = [{ label: 'ctx', used: context?.percent, elapsed: null, resetsAt: null }]
     for (const limit of rateLimits) {
       meters.push(readLimit(limit, now))
     }
+    for (const m of meters) m.value = valueText(m, now)
+    const gauge = e.surface === 'desktop' ? 'svg' : barsFit(meters, e.props.bodyColumns ?? 0) ? 'text' : 'none'
 
     const line = elements.Box({
       flexDirection: 'row',
-      columnGap: 3,
-      children: meters.map((m) => meter(elements, gauge, m, now)),
+      columnGap: METER_GAP,
+      children: meters.map((m) => meter(elements, gauge, m)),
     })
     // Keep what the mods after this one draw in the band
     const rest = await next(e)
@@ -108,6 +107,24 @@ async function adoptShared($) {
     rateLimits = shared.limits
     measuredAt = shared.at
   }
+}
+
+// Each window from whichever reading is newer: a later reset is a newer window, and within
+// one window usage only grows
+function mergeLimits(base, incoming) {
+  const merged = new Map(base.map((limit) => [limit.kind, limit]))
+  for (const limit of incoming) {
+    const known = merged.get(limit.kind)
+    if (!known || isNewer(limit, known)) merged.set(limit.kind, limit)
+  }
+  return [...merged.values()]
+}
+
+function isNewer(a, b) {
+  const resetA = a.resetsAt == null ? 0 : Date.parse(a.resetsAt)
+  const resetB = b.resetsAt == null ? 0 : Date.parse(b.resetsAt)
+  if (resetA !== resetB) return resetA > resetB
+  return a.percentUsed > b.percentUsed
 }
 
 function readLimit(limit, now) {
@@ -132,13 +149,23 @@ function statusOf(used, elapsed) {
   return 'success'
 }
 
-function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, resetsAt, showsClock }, now) {
+function valueText({ used, resetsAt, showsClock }, now) {
+  let value = typeof used === 'number' ? Math.round(used) + '%' : '—'
+  if (resetsAt != null) value += ' ' + untilReset(resetsAt - now)
+  if (resetsAt != null && showsClock) value += ' (' + jstClock(resetsAt) + ')'
+  return value
+}
+
+// Whether every meter fits on one line with its text bar; every character drawn is one cell wide
+function barsFit(meters, columns) {
+  const width = meters.reduce((sum, m) => sum + [...m.label].length + 1 + BAR_CELLS + 1 + [...m.value].length, 0)
+  return width + METER_GAP * (meters.length - 1) <= columns - BAND_RESERVED_COLUMNS
+}
+
+function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, value }) {
   const known = typeof used === 'number'
   const status = known ? statusOf(used, elapsed) : null
   const style = known ? { color: status } : { dimColor: true }
-  let value = known ? Math.round(used) + '%' : '—'
-  if (resetsAt != null) value += ' ' + untilReset(resetsAt - now)
-  if (resetsAt != null && showsClock) value += ' (' + jstClock(resetsAt) + ')'
 
   const children = [Text({ children: [label] })]
   if (gauge === 'svg') {
