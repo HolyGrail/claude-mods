@@ -30,6 +30,7 @@ type On = Parameters<typeof mock.clock>[0]
 
 type Pull = {
   state?: 'OPEN' | 'MERGED' | 'CLOSED'
+  head?: string
   committedAt?: number
   thumbsUpAt?: number
   reviews?: { id: number; at: number; comments: number }[]
@@ -40,6 +41,7 @@ type Pull = {
 function graphql(pull: Pull) {
   const pullRequest = {
     state: pull.state ?? 'OPEN',
+    headRefOid: pull.head ?? 'a1',
     commits: { nodes: [{ commit: { committedDate: iso(pull.committedAt ?? LAST_PUSH - 5 * MINUTE) } }] },
     reactionGroups: [
       {
@@ -68,8 +70,12 @@ type World = {
   pull: Pull
   // The /dev session files, by name
   devSessions: Record<string, unknown>
-  // What gh pr view answers for the branch, or null when it has no pull request
-  branchPr: { url: string; state: string } | null
+  // What gh pr view answers for the branch, null when it has no pull request, or 'error' when gh fails
+  branchPr: { url: string; state: string } | null | 'error'
+  // What a submitted prompt waits for before its turn starts
+  turnStarts: () => Promise<void>
+  // The argument vectors of the gh api calls
+  queryArgv: (readonly string[])[]
   store: Map<string, unknown>
   prompts: string[]
   toasts: string[]
@@ -97,6 +103,8 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     toasts: [],
     status: undefined,
     queries: 0,
+    queryArgv: [],
+    turnStarts: async () => {},
     ...world,
   }
   mock.env(on, { HOME: '/home' })
@@ -108,11 +116,15 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   }))
   on('fs.read', ($, e) => ({ value: JSON.stringify(w.devSessions[e.path.split('/').pop() ?? '']) }))
   on('process.run', ($, e) => {
-    const run = (exitCode: number, stdout: string) => ({
-      value: { exitCode, stdout, stderr: exitCode ? 'no pull requests found' : '', isStdoutTruncated: false, isStderrTruncated: false },
+    const run = (exitCode: number, stdout: string, stderr = '') => ({
+      value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
-    if (e.argv[1] === 'pr') return w.branchPr ? run(0, JSON.stringify(w.branchPr)) : run(1, '')
+    if (e.argv[1] === 'pr') {
+      if (w.branchPr === 'error') return run(1, '', 'error connecting to api.github.com')
+      return w.branchPr ? run(0, JSON.stringify(w.branchPr)) : run(1, '', 'no pull requests found for branch "feature"')
+    }
     w.queries += 1
+    w.queryArgv.push(e.argv)
     return run(0, graphql(w.pull))
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }))
@@ -125,8 +137,9 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     w.store.delete(e.key)
     return { value: undefined }
   })
-  on('prompt.submit', ($, e) => {
+  on('prompt.submit', async ($, e) => {
     w.prompts.push(e.text)
+    await w.turnStarts()
     return { text: e.text }
   })
   on('ui.toast', ($, e) => {
@@ -147,15 +160,18 @@ test('watches the pull request of the /dev session whose worktree the session ru
   const w = stubWorld(on, {
     devSessions: {
       'other.json': devSession({ worktree_path: '/repo/.wt/other', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/3' }),
+      // The checkout the worktree is nested in has a session of its own
+      'parent.json': devSession({ worktree_path: '/repo', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/2' }),
       'feature.json': devSession(),
     },
   })
   await $.session.start(START)
   // The pull request is looked up once the session is ready
   await clock.settle()
-  await clock.settle()
 
   expect(w.queries).toBe(1)
+  // The repository goes as a string whatever it is named, the number as a number
+  expect(w.queryArgv[0]).toEqual(expect.arrayContaining(['-f', 'owner=HolyGrail', '-f', 'name=claude-mods', '-F', 'number=7']))
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
   expect(w.prompts).toEqual([])
 })
@@ -230,16 +246,26 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
 })
 
-test('a pull request the session creates is watched from then on', async ($, on) => {
+test('a pull request the session creates is watched from then on, without holding up the call', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { devSessions: {} })
+  // Codex reviews it as soon as it opens, before the first poll
+  const w = stubWorld(on, {
+    devSessions: {},
+    pull: { reviews: [{ id: 1, at: NOW + 5_000, comments: 1 }] },
+    // A plugin's prompt starts its turn only once the session is idle, so it resolves after the
+    // running turn, which this tool call belongs to, has ended
+    turnStarts: () => clock.sleep(10 * MINUTE),
+  })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: URL + '\n', stderr: '', interrupted: false }, text: URL }) as never)
   await $.session.start(START)
   await clock.settle()
   expect(w.queries).toBe(0)
 
+  await clock.advance(2_000)
   await $.tool.call({ tool: 'Bash', command: 'gh pr create --title t --body-file "$BODY"' })
+  await clock.settle()
   expect(w.queries).toBe(1)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
 })
 
@@ -254,8 +280,50 @@ test('a push moves the baseline, so a thumbs-up from before it is not an approva
   w.pull.thumbsUpAt = NOW + 10_000
   await clock.advance(30_000)
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2'
   await clock.advance(30_000)
   expect(w.prompts).toEqual([])
+})
+
+test('a push that leaves the head where it was keeps the baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: 'Everything up-to-date', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex approves the head between two polls, and a push then changes nothing
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(30_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(30_000)
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a push the /dev session file records moves the baseline too', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The push went unseen here (git -C, a script); the skill recorded it after the old thumbs-up
+  w.pull.thumbsUpAt = NOW + 10_000
+  w.devSessions['feature.json'] = devSession({ review: { last_push_at: iso(NOW + 20_000) } })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a pull request gh could not look up at startup is looked up again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {}, branchPr: 'error' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.queries).toBe(0)
+
+  w.branchPr = { url: URL, state: 'OPEN' }
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
 })
 
 test('waiting for Codex with poll-codex-review.sh --watch is refused while the pull request is watched', async ($, on) => {
@@ -283,5 +351,6 @@ test('the watch tool reports what is watched and watches the pull request it is 
 
   const watching = await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
   expect(watching.result).toContain(`pr-relay is watching ${URL}`)
+  await clock.settle()
   expect(w.queries).toBe(1)
 })
