@@ -5,10 +5,13 @@
 // with = from expanding to a command's path
 const PREFIX = 'setopt nonomatch noequals; '
 
-// What the shell probe found, resolved once per session.start: whether the Bash tool's shell is
-// zsh, and which timeout command it can run ('timeout', 'gtimeout', null for neither, undefined
-// when the probe failed and nothing is known)
-let probe = null
+// The Bash tool's shell, read once per session.start: its path and whether it is zsh
+let shell = null
+// Which timeout command that shell runs ('timeout', 'gtimeout', null for neither, undefined when
+// the probe failed), probed the first time a command uses timeout, since most sessions never do
+let timeoutProbe = null
+// The commands as the model wrote them, by the rewritten command, so tool.check can decide on them
+const originals = new Map()
 
 // The words after which the next word is still in command position
 const LEAD_WORDS = new Set(['if', 'then', 'elif', 'else', 'do', 'while', 'until', '!', '{', 'time'])
@@ -20,56 +23,67 @@ export function register(on) {
   // Fires again on a reload, which also resets this module's variables
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    probe = detect($)
+    shell = readShell($)
+    timeoutProbe = null
     return started
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const { isZsh, timeoutCommand } = await (probe ??= detect($))
+    const { path, isZsh } = await (shell ??= readShell($))
     let command = e.command
 
-    const timeouts = commandWords(command, 'timeout')
-    if (timeouts.length > 0 && timeoutCommand === null) {
-      return {
-        deny:
-          `${$.plugin.name}: timeout is not installed on this machine (macOS has none). ` +
-          `Run the command without it and set the Bash tool's timeout parameter (in milliseconds) instead.`,
+    const timeouts = command.includes('timeout') ? commandWords(command, 'timeout') : []
+    if (timeouts.length > 0) {
+      const available = await (timeoutProbe ??= probeTimeout($, path))
+      if (available === null) {
+        return {
+          deny:
+            `${$.plugin.name}: timeout is not installed on this machine (macOS has none). ` +
+            `Run the command without it and set the Bash tool's timeout parameter (in milliseconds) instead.`,
+        }
       }
+      if (available === 'gtimeout') command = toGtimeout(command, timeouts)
     }
-    if (timeouts.length > 0 && timeoutCommand === 'gtimeout') command = replaceWords(command, timeouts, 'timeout', 'gtimeout')
     if (isZsh && !command.startsWith(PREFIX)) command = PREFIX + command
 
-    return next(command === e.command ? e : { ...e, command })
+    if (command === e.command) return next(e)
+    originals.set(command, e.command)
+    try {
+      return await next({ ...e, command })
+    } finally {
+      originals.delete(command)
+    }
   })
 
-  // The permission rules see the rewritten command, where `setopt ...;` is a subcommand no allow
-  // rule names. When that alone turns an allowed command into a question, decide on the command
-  // without the prefix instead; a deny on either stands.
+  // The permission rules see the rewritten command: `setopt ...;` is a subcommand no allow rule
+  // names, and `Bash(timeout:*)` does not match gtimeout. When a rewrite alone turns an allowed
+  // command into a question, decide on the command as the model wrote it; a deny on either stands.
   on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
     const verdict = await next(e)
-    const command = e.input?.command
-    if (verdict.decision !== 'ask' || typeof command !== 'string' || !command.startsWith(PREFIX)) return verdict
+    const original = originals.get(e.input?.command)
+    if (verdict.decision !== 'ask' || original === undefined) return verdict
 
-    const unprefixed = await $.tool.check({ tool: 'Bash', input: { ...e.input, command: command.slice(PREFIX.length) } })
-    return unprefixed.decision === 'ask' ? verdict : unprefixed
+    const asWritten = await $.tool.check({ tool: 'Bash', input: { ...e.input, command: original } })
+    return asWritten.decision === 'ask' ? verdict : asWritten
   })
 }
 
-async function detect($) {
+async function readShell($) {
   // The Bash tool runs CLAUDE_CODE_SHELL when it is set, else the login shell
-  const shell = (await $.env.get('CLAUDE_CODE_SHELL')) || (await $.env.get('SHELL')) || '/bin/sh'
-  const isZsh = /(^|\/)zsh$/.test(shell)
+  const path = (await $.env.get('CLAUDE_CODE_SHELL')) || (await $.env.get('SHELL')) || '/bin/sh'
+  return { path, isZsh: /(^|\/)zsh$/.test(path) }
+}
+
+async function probeTimeout($, shellPath) {
   try {
     // A login shell, so PATH includes what the profile adds (Homebrew's gtimeout)
     const { stdout } = await $.process.run(
-      [shell, '-lc', 'for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && echo "$c"; done'],
+      [shellPath, '-lc', 'for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && echo "$c" && break; done'],
       { timeoutMs: 10_000 },
     )
-    const found = stdout.split('\n')
-    const timeoutCommand = found.includes('timeout') ? 'timeout' : found.includes('gtimeout') ? 'gtimeout' : null
-    return { isZsh, timeoutCommand }
+    return stdout.trim() || null
   } catch {
-    return { isZsh, timeoutCommand: undefined }
+    return undefined
   }
 }
 
@@ -161,8 +175,8 @@ function unquote(word) {
   return word.replace(/['"\\]/g, '')
 }
 
-function replaceWords(command, starts, name, replacement) {
+function toGtimeout(command, starts) {
   let out = command
-  for (const start of [...starts].reverse()) out = out.slice(0, start) + replacement + out.slice(start + name.length)
+  for (const start of starts.reverse()) out = `${out.slice(0, start)}g${out.slice(start)}`
   return out
 }

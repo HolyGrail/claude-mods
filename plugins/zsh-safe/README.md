@@ -18,7 +18,7 @@ Bash ツールの呼び出しを受け、`command` を書き換えてから実�
 - **timeout**：コマンドの位置（先頭と `;` `&&` `||` `|` 改行の直後）にある `timeout` を扱います。`timeout` が使えるなら何もしません。`gtimeout`（Homebrew の coreutils）だけがあれば、`gtimeout` に置き換えます。どちらもなければ、Bash ツール自身の `timeout` パラメータを使うよう伝えて、呼び出しを拒否します。
 
 シェルは `CLAUDE_CODE_SHELL`、なければ `SHELL` で判定します。
-`timeout` と `gtimeout` の有無は、セッションの開始時にそのシェルをログインシェルとして起動して調べます。
+`timeout` と `gtimeout` の有無は、`timeout` を使うコマンドが最初に来たときに、そのシェルをログインシェルとして起動して調べます。
 
 `.zshrc` に同じ `setopt` を書いても Claude の Bash には効きます。
 ただしその場合、人が普段使う対話シェルでも、一致しない glob を実行前に止める zsh の安全装置が外れます。
@@ -30,7 +30,9 @@ mod なら、効くのは Claude が呼ぶ Bash だけです。
 `setopt nonomatch noequals; echo ===` は `setopt` というサブコマンドを含むので、`Bash(echo:*)` のような allow ルールに当たらず、確認を求められます。
 実際、この節の処理を外した版を `claude -p` で動かすと、`echo ===` が拒否されました。
 
-そこで、書き換えた `command` の判定が「確認を求める」になったときだけ、前置きを外した `command` で判定し直し、その結果を使います。
+`timeout` を `gtimeout` に置き換えたときも同じで、`Bash(timeout:*)` は `gtimeout` に当たりません。
+
+そこで、書き換えた `command` の判定が「確認を求める」になったときだけ、モデルが書いたままの `command` で判定し直し、その結果を使います。
 どちらかの判定が拒否なら、拒否のままです。
 
 auto mode の分類器とトランスクリプトの権限拒否の記録には、書き換えた後の `command` が渡ります。

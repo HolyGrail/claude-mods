@@ -44,6 +44,6 @@ Rendering: SVG gauge when `e.surface === 'desktop'`, otherwise a text bar sized 
 
 ## zsh-safe architecture
 
-`hooks/register.js` rewrites Bash calls in `tool.call`: under zsh it prefixes `setopt nonomatch noequals; `, and a `timeout` in command position (found by a lexical scan that skips quotes, comments and here-document bodies) becomes `gtimeout` or is denied, depending on what the `session.start` shell probe found.
+`hooks/register.js` rewrites Bash calls in `tool.call`: under zsh it prefixes `setopt nonomatch noequals; `, and a `timeout` in command position (found by a lexical scan that skips quotes, comments and here-document bodies) becomes `gtimeout` or is denied, depending on a login-shell probe that runs the first time a command uses `timeout`.
 
-`tool.check` runs after `tool.call`'s rewrite, so the permission rules see the prefixed command, and `setopt` is a subcommand no allow rule names: without the module's `tool.check` hook, `Bash(echo:*)` stops matching `echo ===`. The hook re-checks an `ask` on the command without the prefix and returns that verdict unless it is also `ask`.
+`tool.check` runs after `tool.call`'s rewrite, so the permission rules see the rewritten command: `setopt` is a subcommand no allow rule names, so without the module's `tool.check` hook `Bash(echo:*)` stops matching `echo ===`, and `Bash(timeout:*)` does not match `gtimeout`. While a rewritten call runs, the module keeps the model's command keyed by the rewritten one; the hook re-checks an `ask` on that original and returns its verdict unless it is also `ask`. Tests cannot call `$.tool.check` from their own hooks, so the permission test holds the call beneath the plugin and checks from the test body.
