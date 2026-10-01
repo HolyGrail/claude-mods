@@ -1,0 +1,256 @@
+import type { SessionRepo } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const NOW = Date.UTC(2026, 9, 1, 12)
+
+const BAND = {
+  plugin: 'notice-board',
+  component: 'AbovePrompt',
+  requestId: 'above-prompt',
+  surface: 'terminal',
+  viewport: { columns: 120, rows: 40 },
+  props: {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 4,
+    bodyColumns: 100,
+    scroll: { offset: 0, bodyRows: 4 },
+    view: {},
+  },
+} as const
+
+const START = { surface: 'terminal', isInteractive: true, cwd: '/work' } as const
+const PRESENTATION = { isFullscreen: false, columns: 100 } as const
+
+// The same repository as two worktrees see it, cloned over HTTPS and over SSH
+const HTTPS: SessionRepo = { root: '/src/app', remote: 'https://github.com/Owner/App.git', internal: false, name: null }
+const SSH: SessionRepo = { root: '/elsewhere/app', remote: 'git@github.com:owner/app', internal: false, name: null }
+const APP_KEY = 'github.com/owner/app'
+
+// The stub registrar a test function receives as its second argument
+type On = Parameters<typeof mock.clock>[0]
+
+type Host = {
+  // The store every session shares, by key
+  store: Map<string, unknown>
+  // Each line this session's model was told
+  passedOn: string[]
+  // What the model knows now
+  known: () => string[]
+}
+
+// Backs $.store with a Map and $.state with an array. A plugin's $.session.append never reaches a
+// test's hooks and fails, so what the model is told is read from the debug line the failure logs.
+function stubHost(on: On, { store = new Map<string, unknown>(), repo = HTTPS as SessionRepo | null } = {}): Host {
+  let known: { id: string; text: string }[] = []
+  const host: Host = { store, passedOn: [], known: () => known.map((k) => k.text) }
+  on('session.id', () => ({ value: 'this' }))
+  on('session.repo', () => ({ value: repo }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.get', ($, e) => ({ value: store.get(e.key) }))
+  on('store.set', ($, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('state.get', () => ({ value: { value: known, version: 0 } }))
+  on('state.set', ($, e) => {
+    known = e.value as typeof known
+    return { value: { isSet: true, version: 0 } }
+  })
+  on('ui.log', ($, e) => {
+    if (e.text.startsWith('notice-board could not tell the model: ')) host.passedOn.push(...e.text.split('\n').slice(1))
+    return { value: undefined }
+  })
+  // What the mods after this one draw in the band
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
+  return host
+}
+
+function notice(text: string, repo: string | null, postedAt: number, by = 'other') {
+  return { text, repo, postedAt, by }
+}
+
+function run($: Engine, args: string) {
+  return $.command.run({ command: 'notice', args, origin: { kind: 'composer' }, presentation: PRESENTATION })
+}
+
+test('a posted notice is stored for the repository and shown here without telling the model again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const host = stubHost(on)
+  await $.session.start(START)
+
+  const { text } = await run($, 'CI is paused, check the Codex review only')
+  expect(text).toBe('Posted to every session in this repository.')
+  expect([...host.store.values()]).toEqual([notice('CI is paused, check the Codex review only', APP_KEY, NOW, 'this')])
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'notice 0m:' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'CI is paused, check the Codex review only' })).toBeDefined()
+  // What the other mods draw stays below
+  expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+  // The command's output tells this session's model, so the next tick passes nothing on
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([])
+})
+
+test("another worktree's notice reaches this session within a tick and the model once", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const host = stubHost(on, { repo: SSH })
+  await $.session.start(START)
+  expect(host.known()).toEqual([])
+
+  host.store.set('notice:1-other', notice('CI is paused', APP_KEY, NOW))
+  await clock.advance(MINUTE)
+  const told = ['Notice to every Claude Code session in this repository, posted 1m ago with /notice: CI is paused']
+  expect(host.passedOn).toEqual(told)
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'notice 1m:' })).toBeDefined()
+
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual(told)
+})
+
+test("another repository's notices stay out, and --all ones reach every repository", async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([
+    ['notice:1-lib', notice('lib only', 'github.com/owner/lib', NOW - HOUR)],
+    ['notice:2-lib', notice('every session', null, NOW - 3 * HOUR)],
+  ])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'lib only' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'every session' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'notice (all) 3h:' })).toBeDefined()
+  expect(host.passedOn).toEqual(['Notice to every Claude Code session on this machine, posted 3h ago with /notice: every session'])
+  expect(host.known()).toEqual(['every session'])
+})
+
+test('/notice clear takes down what this session shows, and the others tell their models', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([
+    ['notice:1-a', notice('CI is paused', APP_KEY, NOW)],
+    ['notice:2-a', notice('every session', null, NOW)],
+    ['notice:3-lib', notice('lib only', 'github.com/owner/lib', NOW)],
+  ])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+
+  expect((await run($, 'clear')).text).toBe('Cleared 2 notices.')
+  expect([...store.keys()]).toEqual(['notice:3-lib'])
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
+  expect(host.known()).toEqual([])
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([
+    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
+    'Notice to every Claude Code session on this machine, posted 0m ago with /notice: every session',
+    'This notice was cleared and no longer applies: CI is paused',
+    'This notice was cleared and no longer applies: every session',
+  ])
+  expect((await run($, 'clear')).text).toBe('No notices to clear.')
+})
+
+test('a notice another session cleared is withdrawn from the model and the band', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+
+  store.delete('notice:1-a')
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([
+    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
+    'This notice was cleared and no longer applies: CI is paused',
+  ])
+  expect(host.known()).toEqual([])
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+})
+
+test('the band shows the newest three and counts the rest', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>()
+  for (let i = 1; i <= 5; i++) store.set('notice:' + i, notice('notice number ' + i, APP_KEY, NOW - i * MINUTE))
+  stubHost(on, { store })
+  await $.session.start(START)
+
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'notice number 1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'notice number 3' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'notice number 4' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '+2 more' })).toBeDefined()
+})
+
+test('a reload keeps what the model was told, and /clear tells it again', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start(START)
+  // An enable or a worker respawn fires session.start again
+  await $.session.start(START)
+  const told = 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused'
+  expect(host.passedOn).toEqual([told])
+
+  await $.classic.SessionStart({ source: 'clear' })
+  expect(host.passedOn).toEqual([told, told])
+})
+
+test('outside a repository only --all can post', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const host = stubHost(on, { repo: null })
+  await $.session.start(START)
+
+  expect((await run($, 'hello')).text).toMatch(/^Not in a git repository/)
+  expect((await run($, '--all hello')).text).toBe('Posted to every session on this machine.')
+  expect([...host.store.values()]).toEqual([notice('hello', null, NOW, 'this')])
+  expect((await run($, '--all')).text).toMatch(/^Usage/)
+  expect((await run($, '')).text).toMatch(/^Usage/)
+})
+
+test('a repository without a remote is named by its main working tree', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const host = stubHost(on, { repo: { root: '/src/app', remote: null, internal: false, name: null } })
+  await $.session.start(START)
+
+  await run($, 'hello')
+  expect([...host.store.values()]).toEqual([notice('hello', 'path:/src/app', NOW, 'this')])
+})
+
+// Stands in for pr-relay, which posts through /notice when it sees a merge: its $.store is its own,
+// so it can't write the notice keys itself. An inline plugin loads on its own, apart from this file.
+const RELAY = {
+  name: 'pr-relay',
+  register: (on: On) => {
+    on('session.start', async ($, e, next) => {
+      $.clock.every(60_000, async () => {
+        const { text } = await $.command.run({ command: 'notice', args: 'main advanced (#12). Rebase before the next push.' })
+        $.ui.toast(text ?? '')
+      })
+      return next(e)
+    })
+  },
+}
+
+test('another plugin posts through $.command.run, as pr-relay does on a merge', { plugins: [RELAY] }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const host = stubHost(on)
+  await $.session.start(START)
+
+  await clock.advance(MINUTE)
+  expect([...host.store.values()]).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE, 'this')])
+  // The session that saw the merge is not told again
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([])
+})

@@ -1,0 +1,84 @@
+# notice-board
+
+マシン上で同時に動く Claude Code のセッションへ、リポジトリ単位でお知らせを届ける mod です。
+「CI を止めているので Codex のレビューだけ見ればよい」のような状況の変化を、セッションごとに打ち直さずに済みます。
+
+```text
+notice 2h: CI is paused, check the Codex review only
+notice (all) 1d: Rate limits are tight this week
+```
+
+## 使い方
+
+```text
+/notice <本文>          同じリポジトリのセッション全体に出す
+/notice --all <本文>    リポジトリを問わず、マシン上の全セッションに出す
+/notice clear           このセッションの帯に出ているお知らせをすべて消す
+```
+
+投稿したセッションが終わっても、お知らせは残ります。
+期限はなく、消えるのは `/notice clear` を実行したときだけです。
+帯には投稿からの経過時間を出すので、古いお知らせは見ればわかります。
+
+1 回だけ試すなら、ターミナルで次のように起動します。
+
+```bash
+claude --plugin-dir ./plugins/notice-board
+```
+
+常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
+mod が動く Claude Code のバージョンは [usage-meter](../usage-meter/README.md#使い方) と同じです。
+
+## 届き方
+
+各セッションは 60 秒ごとにお知らせを読み直します。
+別のセッションで投稿したお知らせは、遅くとも 1 分後には帯に出ます。
+
+モデルには、新しいお知らせを見つけたときに 1 回だけ、会話へ 1 行足して伝えます。
+system prompt には書き込みません。
+書き込むと、お知らせが変わるたびに prompt cache が無効になるからです。
+伝えたお知らせが `/notice clear` で消えたときも、取り下げを 1 回だけ伝えます。
+伝えなければ、モデルは消えたお知らせに従い続けます。
+
+`/clear` とコンパクションのあとは、会話にお知らせが残っていない可能性があるので、いま出ているものを改めて伝えます。
+投稿したセッションのモデルには、コマンドの出力がすでに会話に残っているので、重ねて伝えません。
+
+## 同じリポジトリの判定
+
+origin の URL を `host/owner/name` の形にそろえて比べます。
+`git@github.com:owner/app` と `https://github.com/Owner/App.git` は同じリポジトリです。
+同じリポジトリの worktree も別のクローンも、同じお知らせを受け取ります。
+origin がないリポジトリは、main working tree のパスで比べます。
+
+## ほかの mod からの投稿
+
+`$.store` は mod ごとに分かれていて、ほかの mod からはお知らせのキーを書けません。
+ほかの mod は、`/notice` を `$.command.run` で呼んで投稿します。
+
+```js
+await $.command.run({ command: 'notice', args: 'main advanced (#12). Rebase before the next push.' })
+```
+
+pr-relay（#4）がマージを検知したときに「main が進んだ」と出すのは、この形を想定しています。
+文面には、次の push の前に rebase するよう書くことを勧めます。
+作業の途中で rebase すると、コンフリクトの解消が実装の変更と混ざるからです。
+`$.command.run` はセッションが待機中になってから実行されるので、投稿は数分遅れることがあります。
+
+## 制約
+
+`$.store` には atomic な更新がないため、お知らせごとに `notice:<id>` のキーを分けています。
+投稿がほかのお知らせを上書きすることはありません。
+ただし、`/notice clear` の実行中に投稿されたお知らせは、消えずに残ることがあります。
+
+どのお知らせをモデルに伝えたかは、セッション単位の `$.state` に持ちます。
+mod の再読み込みでは残りますが、`--resume` で別のプロセスに読み込んだ会話では空に戻り、同じお知らせをもう一度伝えます。
+
+## テスト
+
+```bash
+cd plugins/notice-board
+claude plugin test
+```
+
+テストキットでは、mod の `$.session.append` がテストのフックに届かず、失敗します。
+append が失敗すると、mod はモデルに伝えられなかった行を debug ログに残すので、テストはその行でモデルに渡す内容を確かめています。
