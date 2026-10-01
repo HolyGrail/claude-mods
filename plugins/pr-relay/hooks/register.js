@@ -48,7 +48,7 @@ const QUERY = `query($owner: String!, $name: String!, $number: Int!) {
 let watched = null
 // The timers that poll it, kept so the next watch or session.start can stop them
 let timers = []
-// Bumped by every watch, so a poll started for an earlier one leaves the state alone
+// Bumped by every watch and stop, so a poll or a lookup started before leaves the state alone
 let generation = 0
 // The last poll: { at, error? }, for the status line
 let lastCheck = null
@@ -167,9 +167,10 @@ export function register(on) {
 // Looks for the pull request to watch, and asks again a tick later when gh could not answer
 async function discover($, { branchOnly = false } = {}) {
   if (watched) return
+  const gen = generation
   if (!branchOnly) await prune($)
   const found = (branchOnly ? null : await findInDevSessions($)) ?? (await findForBranch($))
-  if (watched) return
+  if (watched || gen !== generation) return
   if (found) watch($, found)
   else if (found === undefined) timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
 }
@@ -178,7 +179,7 @@ async function discover($, { branchOnly = false } = {}) {
 // submits starts its turn only once the session is idle, which a tool call still running is not.
 function watch($, { url, since, sessionFile = null }) {
   stop()
-  const gen = ++generation
+  const gen = generation
   watched = { ...parse(url), since, sessionFile }
   offersCleanup = false
   // Ask at once: a review or a merge may have come while no session watched
@@ -189,6 +190,7 @@ function watch($, { url, since, sessionFile = null }) {
 function stop() {
   for (const timer of timers) timer?.cancel()
   timers = []
+  generation += 1
 }
 
 async function poll($, gen) {
@@ -196,10 +198,13 @@ async function poll($, gen) {
   const pr = watched
   const key = KEY_PREFIX + pr.url
   const now = await $.clock.now()
+  // /dev writes the session's pr_url only after the pull request exists, so a watch that began
+  // before (gh pr create, the watch tool) looks for its file until one names it
+  const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.url))
   const [answer, stored, recordedPush] = await Promise.all([
     query($, pr).then((data) => ({ data }), (error) => ({ error })),
     $.store.get(key),
-    lastPushOf($, pr.sessionFile),
+    lastPushOf($, sessionFile),
   ])
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
@@ -210,6 +215,7 @@ async function poll($, gen) {
   }
   const { data } = answer
   lastCheck = { at: now }
+  if (sessionFile) watched = { ...watched, sessionFile }
   const record = normalize(stored)
   const before = JSON.stringify(record)
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
@@ -225,7 +231,7 @@ async function poll($, gen) {
 
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
     stop()
-    watched = { ...pr, ended: data.state }
+    watched = { ...watched, ended: data.state }
     if (data.state === 'MERGED') {
       offersCleanup = true
       $.ui.invalidate('ui.render')
@@ -248,16 +254,17 @@ async function poll($, gen) {
 // approval, then a review, then the usage limit. Each event is relayed once.
 function relay($, pr, signals, record) {
   const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id))
-  // A review the approval came after is settled by it, so either way it is relayed
-  record.reviews.push(...fresh.map((r) => r.id))
   if (signals.approvedAt > record.approvedAt) {
     record.approvedAt = signals.approvedAt
+    // A review the approval came after is settled by it; a later one still waits its turn
+    record.reviews.push(...fresh.filter((r) => r.at <= signals.approvedAt).map((r) => r.id))
     submit(
       $,
       `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(signals.approvedAt)}）。` +
         'CI の結果を確かめ、完了報告と ~/.claude/dev-sessions のセッションファイルの更新をしてください。',
     )
   } else if (fresh.length > 0) {
+    record.reviews.push(...fresh.map((r) => r.id))
     const comments = fresh.reduce((sum, r) => sum + r.comments, 0)
     submit(
       $,
@@ -298,7 +305,7 @@ function read(data, since) {
   }
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
-    .map((r) => ({ id: r.databaseId, comments: r.comments?.totalCount ?? 0 }))
+    .map((r) => ({ id: r.databaseId, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
   return { approvedAt, usageLimitAt, reviews }
 }
 
@@ -320,21 +327,17 @@ async function query($, pr) {
 // The /dev session whose worktree holds this session's cwd, with an open pull request; the
 // deepest worktree wins, so one nested in another repository's checkout is not taken for it
 async function findInDevSessions($) {
-  const [home, cwd] = await Promise.all([$.env.get('HOME'), $.session.cwd()])
-  if (!home) return null
-  const dir = home + DEV_SESSIONS
-  const entries = await $.fs.list(dir).catch(() => [])
-  const files = entries.filter((entry) => entry.kind === 'file' && entry.name.endsWith('.json')).map((entry) => `${dir}/${entry.name}`)
-  const sessions = await Promise.all(files.map((file) => readJson($, file)))
+  const [{ files, sessions }, cwd] = await Promise.all([readDevSessions($), $.session.cwd()])
   let best = null
   sessions.forEach((session, i) => {
     const root = session?.worktree_path?.replace(/\/+$/, '')
-    if (session?.status !== 'pr-open' || !PR_URL.test(session.pr_url ?? '') || !root) return
-    if (cwd !== root && !cwd.startsWith(root + '/')) return
-    if (best && best.root.length >= root.length) return
-    best = { root, url: session.pr_url, since: lastPush(session), sessionFile: files[i] }
+    if (!root || (cwd !== root && !cwd.startsWith(root + '/'))) return
+    if (!best || root.length > best.root.length) best = { root, session, file: files[i] }
   })
-  return best && { url: best.url, since: best.since, sessionFile: best.sessionFile }
+  // The session that owns the cwd decides, even when it has no pull request yet
+  const session = best?.session
+  if (session?.status !== 'pr-open' || !PR_URL.test(session.pr_url ?? '')) return null
+  return { url: session.pr_url, since: lastPush(session), sessionFile: best.file }
 }
 
 // The open pull request of the branch checked out here: null when there is none, undefined when gh
@@ -348,6 +351,22 @@ async function findForBranch($) {
   } catch {
     return undefined
   }
+}
+
+// The /dev session file that names this pull request, or null
+async function findSessionFile($, url) {
+  const { files, sessions } = await readDevSessions($)
+  const i = sessions.findIndex((session) => session?.pr_url === url)
+  return i < 0 ? null : files[i]
+}
+
+async function readDevSessions($) {
+  const home = await $.env.get('HOME')
+  if (!home) return { files: [], sessions: [] }
+  const dir = home + DEV_SESSIONS
+  const entries = await $.fs.list(dir).catch(() => [])
+  const files = entries.filter((entry) => entry.kind === 'file' && entry.name.endsWith('.json')).map((entry) => `${dir}/${entry.name}`)
+  return { files, sessions: await Promise.all(files.map((file) => readJson($, file))) }
 }
 
 // The last push the /dev session file records now

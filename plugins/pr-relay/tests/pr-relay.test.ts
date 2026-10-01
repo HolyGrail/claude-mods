@@ -354,3 +354,46 @@ test('the watch tool reports what is watched and watches the pull request it is 
   await clock.settle()
   expect(w.queries).toBe(1)
 })
+
+test('the worktree that holds the cwd decides, even before its pull request exists', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    devSessions: {
+      'parent.json': devSession({ worktree_path: '/repo', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/2' }),
+      'feature.json': devSession({ status: 'in-progress', pr_url: null }),
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.queries).toBe(0)
+  expect(w.status).toBeUndefined()
+})
+
+test('a review that comes after an approval is relayed on its own', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { thumbsUpAt: NOW - 10 * MINUTE, reviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 3 }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました'), expect.stringContaining('inline コメント 3 件')])
+})
+
+test('a pull request watched before /dev records it follows the session file once it does', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {} })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+
+  // The skill records the PR and, later, a push this module did not see; the old thumbs-up stays
+  w.devSessions['feature.json'] = devSession({ review: { last_push_at: iso(NOW + 20_000) } })
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})

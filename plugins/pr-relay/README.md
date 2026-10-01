@@ -8,7 +8,7 @@
 
 セッションの開始時に、次の順で PR を探します。
 
-1. `~/.claude/dev-sessions/*.json`（`/dev` スキルのセッションファイル）のうち、`worktree_path` がセッションの cwd を含み、`status` が `pr-open` のものの `pr_url`
+1. `~/.claude/dev-sessions/*.json`（`/dev` スキルのセッションファイル）のうち、`worktree_path` がセッションの cwd を含むもの。複数あれば最も深い worktree のものを選び、その `status` が `pr-open` なら `pr_url` を監視する
 2. `gh pr view` で引いた、現在のブランチの OPEN な PR
 
 セッションの途中で `gh pr create` を実行すると、その出力の URL から監視を始めます。
@@ -39,8 +39,8 @@ Codex の 👍 は PR に 1 つしか付かず、作成時刻が前の push の�
 
 最後の push の時刻には、次のうち最も新しいものを使います。
 
-- セッションファイルの `review.last_push_at`
-- このセッションで `git push` を実行した時刻
+- セッションファイルの `review.last_push_at`（確認のたびに読み直す。`gh pr create` などで先に監視を始めた PR も、その URL を書いたセッションファイルが現れたら追う）
+- このセッションで `git push` を実行した時刻（PR の head が変わったときだけ使う。`Everything up-to-date` の push では基準時刻を進めない）
 - PR の最新コミットのコミット時刻
 
 知らせたイベントは `$.store` に PR ごとに記録します。
