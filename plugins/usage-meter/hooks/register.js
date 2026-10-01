@@ -16,8 +16,12 @@ let ownKey = null
 // The mods API has no account id, so after switching accounts on this machine a new
 // session shows the previous account's reading until its own first response.
 const KEY_PREFIX = 'reading:'
-// Readings older than the longest window say nothing current, so their keys are deleted
+// Readings older than the longest window say nothing current: they are never shown, and their
+// keys are deleted
 const STALE_MS = 8 * 24 * 3_600_000
+// The session.end reasons after which this module stops; /clear, /resume (which /branch reports)
+// and logout leave it running and measuring
+const FINAL_REASONS = ['prompt_input_exit', 'other']
 // How often to pick up other sessions' readings and refresh the countdowns and time markers
 const TICK_MS = 60_000
 
@@ -73,13 +77,20 @@ export function register(on) {
   // removes its own key. One that holds the newest marks it ended, so the others may delete it once
   // a newer reading exists: an ended session never writes again, so that delete can't lose a write.
   on('session.end', async ($, e, next) => {
-    // After /clear, /resume and /branch this module keeps running and measuring
-    if (e.reason === 'clear' || e.reason === 'resume' || !ownKey) return next(e)
+    if (!FINAL_REASONS.includes(e.reason) || !ownKey) return next(e)
     ticker?.cancel()
     const { entries, newest } = await scan($)
     if (newest?.key === ownKey) await $.store.set(ownKey, { ...newest.reading, ended: true })
     else await $.store.delete(ownKey)
     await prune($, entries, newest?.key)
+    return next(e)
+  })
+
+  // /clear, /resume, /branch (fork) and compaction change the context, which session.measure
+  // reports only after the next turn
+  on('classic.SessionStart', { source: ['clear', 'resume', 'fork', 'compact'] }, async ($, e, next) => {
+    context = (await $.session.usage()).context
+    $.ui.invalidate('ui.render')
     return next(e)
   })
 
@@ -159,11 +170,12 @@ async function publishSnapshot($, snapshot) {
 async function scan($) {
   const entries = []
   let newest = null
+  const cutoff = (await $.clock.now()) - STALE_MS
   for (const key of await $.store.keys()) {
     if (!key.startsWith(KEY_PREFIX)) continue
     const reading = await $.store.get(key)
     entries.push({ key, reading })
-    if (!isReading(reading)) continue
+    if (!isReading(reading) || reading.at < cutoff) continue
     if (!newest || reading.at > newest.reading.at || (reading.at === newest.reading.at && key > newest.key)) {
       newest = { key, reading }
     }

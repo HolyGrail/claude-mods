@@ -425,21 +425,23 @@ test('a session that ends with the newest reading keeps it, marked ended', async
   expect(saved.has('reading:ended-old')).toBe(false)
 })
 
-test('/clear leaves the key and the refresh timer running', async ($, on) => {
+test('/clear, /resume and logout leave the key and the refresh timer running', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
-  stubSession(on, saved, [])
+  stubSession(on, saved)
   on('session.end', () => ({ sessionId: 'this' }))
   await $.session.start(START)
 
-  await $.session.end({ ...END, reason: 'clear' })
-  saved.set(OTHER, { at: NOW, limits: LIMITS })
+  for (const reason of ['clear', 'resume', 'logout'] as const) {
+    await $.session.end({ ...END, reason })
+  }
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS })
+  saved.set(OTHER, { at: NOW + 1, limits: [fiveHour(70, 2 * HOUR), LIMITS[1]!] })
   await clock.advance(MINUTE)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^70% / })).toBeDefined()
 })
-
 test('an ended session older reading is deleted, but an ended newest one stays', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
@@ -468,5 +470,40 @@ test('a session clears ended sessions older keys as it starts', async ($, on) =>
 
   expect(saved.has('reading:ended-old')).toBe(false)
   expect(saved.has(OTHER)).toBe(true)
+})
+
+test('a reading older than the longest window is never shown, even as the only one', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  saved.set(OTHER, { at: NOW - 9 * 24 * HOUR, limits: [{ kind: 'spend_limit', percentUsed: 90 }] })
+  stubSession(on, saved, [{ kind: 'spend_limit', percentUsed: 5 }])
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '5%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
+  // The startup snapshot is saved, and the stale key is deleted
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: [{ kind: 'spend_limit', percentUsed: 5 }] })
+  expect(saved.has(OTHER)).toBe(false)
+})
+
+test('/clear shows the emptied context before the next turn', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  let cleared = false
+  on('session.usage', () => ({
+    value: { startedAt: NOW, context: cleared ? { window: 200_000 } : CONTEXT, rateLimits: LIMITS },
+  }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('classic.SessionStart', () => ({}))
+  stubStore(on, new Map())
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
+  await $.session.start(START)
+
+  cleared = true
+  await $.classic.SessionStart({ source: 'clear' })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '20%' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '—' })).toBeDefined()
 })
 
