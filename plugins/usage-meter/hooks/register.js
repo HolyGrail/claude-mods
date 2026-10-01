@@ -118,45 +118,24 @@ async function adoptShared($) {
 }
 
 // usage() at startup may answer this session's last reading, which can be older than the shared
-// one, so it only adds windows the shared reading lacks or has older
+// one in ways a merge can't tell apart (a window that went away, a spend limit that went down),
+// so a shared reading always wins and the snapshot only fills an empty store
 async function publishSnapshot($, snapshot) {
   // $.store has no atomic update, so read right before writing to keep the race short
   const shared = await $.store.get(STORE_KEY)
   if (isReading(shared)) {
     rateLimits = shared.limits
     measuredAt = shared.at
-    // An empty shared reading is a measurement that the windows went away
-    if (shared.limits.length === 0) return
+    return
   }
-  const merged = mergeLimits(rateLimits, snapshot)
-  if (JSON.stringify(merged) === JSON.stringify(rateLimits)) return
-  // Never older than the reading it was merged into, or sessions holding that one would skip it
-  const now = Math.max(await $.clock.now(), measuredAt)
-  rateLimits = merged
+  const now = await $.clock.now()
+  rateLimits = snapshot
   measuredAt = now
-  await $.store.set(STORE_KEY, { at: now, limits: merged })
+  await $.store.set(STORE_KEY, { at: now, limits: snapshot })
 }
 
 function isReading(value) {
   return value != null && typeof value.at === 'number' && Array.isArray(value.limits)
-}
-
-// Each window from whichever reading is newer: a later reset is a newer window, and within
-// one window usage only grows
-function mergeLimits(base, incoming) {
-  const merged = new Map(base.map((limit) => [limit.kind, limit]))
-  for (const limit of incoming) {
-    const known = merged.get(limit.kind)
-    if (!known || isNewer(limit, known)) merged.set(limit.kind, limit)
-  }
-  return [...merged.values()]
-}
-
-function isNewer(a, b) {
-  const resetA = a.resetsAt == null ? 0 : Date.parse(a.resetsAt)
-  const resetB = b.resetsAt == null ? 0 : Date.parse(b.resetsAt)
-  if (resetA !== resetB) return resetA > resetB
-  return a.percentUsed > b.percentUsed
 }
 
 function readLimit(limit, now) {

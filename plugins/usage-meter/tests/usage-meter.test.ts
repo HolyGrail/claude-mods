@@ -273,19 +273,6 @@ test('a startup snapshot older than the shared reading does not overwrite it', a
   expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: shared })
 })
 
-test('a startup snapshot of a newer window replaces the shared one', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  const saved = new Map<string, unknown>()
-  // The shared reading is from the previous 5-hour window, which reset at NOW - 1 minute
-  saved.set('rateLimits', { at: NOW - 2 * HOUR, limits: [fiveHour(95, -MINUTE), LIMITS[1]!] })
-  stubSession(on, saved)
-  await $.session.start(START)
-
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
-  expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: LIMITS })
-})
-
 test('a measurement that reports no windows clears the limits', async ($, on) => {
   mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
@@ -329,18 +316,6 @@ test('a stored reading at the same time as this session is taken', async ($, on)
   expect(await ui.find({ type: 'Text', text: /^64% / })).toBeDefined()
 })
 
-test('a startup merge is saved no older than the reading it merged into', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  const saved = new Map<string, unknown>()
-  // Another session saved a 5-hour reading stamped later than this session's clock reads
-  saved.set('rateLimits', { at: NOW + MINUTE, limits: [LIMITS[0]!] })
-  stubSession(on, saved)
-  await $.session.start(START)
-
-  // The snapshot adds the weekly window, saved at the shared reading's time
-  expect(saved.get('rateLimits')).toEqual({ at: NOW + MINUTE, limits: LIMITS })
-})
-
 test('a session puts its newer reading back when the store went back to an older one', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
@@ -357,5 +332,32 @@ test('a session puts its newer reading back when the store went back to an older
   expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: LIMITS })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+})
+
+test('a shared reading wins over a startup snapshot that has more windows', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  // Another session measured that only the 5-hour window applies now
+  const shared = [LIMITS[0]!]
+  saved.set('rateLimits', { at: NOW - MINUTE, limits: shared })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /4d18h/ })).toBeUndefined()
+  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: shared })
+})
+
+test('a shared spend limit that went down wins over a higher startup snapshot', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  saved.set('rateLimits', { at: NOW - MINUTE, limits: [{ kind: 'spend_limit', percentUsed: 5 }] })
+  stubSession(on, saved, [{ kind: 'spend_limit', percentUsed: 90 }])
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '5%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
 })
 
