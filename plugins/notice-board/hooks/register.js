@@ -44,11 +44,7 @@ export function register(on) {
       argumentHint: '[--all] <text> | clear',
     })
     await refresh($)
-    ticker = $.clock.every(TICK_MS, () => {
-      const forget = forgetNext
-      forgetNext = false
-      return refresh($, { forget })
-    })
+    ticker = $.clock.every(TICK_MS, () => refresh($))
     return next(e)
   })
 
@@ -62,6 +58,13 @@ export function register(on) {
     // Only now, so a tick during the switch can't spend the flag on the outgoing conversation
     if (e.source !== 'fork') forgetNext = true
     return result
+  })
+
+  // A prompt or a /notice comes from the conversation that is now installed, so the notices are
+  // retold there; a tick may still run against the outgoing one, and what it tells is retold here
+  on('prompt.submit', async ($, e, next) => {
+    if (forgetNext) await refresh($, { consume: true })
+    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
@@ -111,13 +114,13 @@ async function post($, text, all) {
   const postedAt = await $.clock.now()
   posts += 1
   await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId + '-' + posts, { text, repo: all ? null : repoKey, postedAt })
-  await refresh($)
+  await refresh($, { consume: true })
   return all ? 'Posted to every session on this machine.' : 'Posted to every session in this repository.'
 }
 
 // Takes down every notice this session shows; each other session tells its model at its next tick
 async function clear($) {
-  await refresh($)
+  await refresh($, { consume: true })
   const cleared = notices
   await Promise.all(cleared.map((notice) => $.store.delete(KEY_PREFIX + notice.id)))
   await refresh($)
@@ -126,11 +129,13 @@ async function clear($) {
 }
 
 // Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws
-function refresh($, options) {
-  const run = queue.then(
-    () => load($, options),
-    () => load($, options),
-  )
+function refresh($, { consume = false } = {}) {
+  const run_ = () => {
+    const forget = consume && forgetNext
+    if (forget) forgetNext = false
+    return load($, { forget })
+  }
+  const run = queue.then(run_, run_)
   queue = run.catch(() => {})
   return run.then(() => $.ui.invalidate('ui.render'))
 }

@@ -199,6 +199,7 @@ test('a reload keeps what the model was told, and /clear tells it again at the n
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   // An enable or a worker respawn fires session.start again
   await $.session.start(START)
@@ -207,6 +208,8 @@ test('a reload keeps what the model was told, and /clear tells it again at the n
 
   await $.classic.SessionStart({ source: 'clear' })
   await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([told])
+  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
   expect(host.passedOn).toEqual([told, told.replace('0m ago', '1m ago')])
 })
 
@@ -277,6 +280,7 @@ test('/resume tells the resumed conversation again at the next tick, and /branch
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   expect(host.passedOn).toHaveLength(1)
 
@@ -285,8 +289,9 @@ test('/resume tells the resumed conversation again at the next tick, and /branch
   expect(host.passedOn).toHaveLength(1)
   // /resume installs the resumed conversation only after its SessionStart hooks
   await $.classic.SessionStart({ source: 'resume' })
-  expect(host.passedOn).toHaveLength(1)
   await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(1)
+  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
   expect(host.passedOn).toHaveLength(2)
 })
 
