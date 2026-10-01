@@ -1,0 +1,19 @@
+{
+  "name": "claude-mods",
+  "owner": {
+    "name": "HolyGrail"
+  },
+  "description": "Claude Code mods by HolyGrail",
+  "plugins": [
+    {
+      "name": "usage-meter",
+      "source": "./plugins/usage-meter",
+      "description": "Shows context, 5-hour and weekly limit usage above the prompt"
+    },
+    {
+      "name": "notice-board",
+      "source": "./plugins/notice-board",
+      "description": "Shares notices with every session in the same repository, or on the machine"
+    }
+  ]
+}
