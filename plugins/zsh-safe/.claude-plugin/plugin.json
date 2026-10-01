@@ -1,0 +1,6 @@
+{
+  "name": "zsh-safe",
+  "version": "0.1.0",
+  "description": "Lets Bash commands written for bash run under zsh: unmatched globs, leading =, and a missing timeout",
+  "author": { "name": "HolyGrail" }
+}

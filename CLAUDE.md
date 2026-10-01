@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. There is no package.json or build step; the module runs as plain JS inside Claude Code. Currently the only plugin is `plugins/usage-meter`.
+A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. There is no package.json or build step; the module runs as plain JS inside Claude Code. The plugins are `plugins/usage-meter` and `plugins/zsh-safe`.
 
 User-facing docs (README.md) are written in Japanese; code comments, commit messages and test names are in English.
 
@@ -41,3 +41,9 @@ Rate limits are per account, so readings are shared across all sessions on the m
 - `/clear`, `/resume` and `/branch` (fork) switch session id mid-module, handled in `classic.SessionStart`: the old key is released as if ended and writes move to the new id. Compaction keeps the same key.
 
 Rendering: SVG gauge when `e.surface === 'desktop'`, otherwise a text bar sized against `props.bodyColumns` (dropped entirely when the line won't fit). Color rules and thresholds are in the README and the constants at the top of `register.js`.
+
+## zsh-safe architecture
+
+`hooks/register.js` rewrites Bash calls in `tool.call`: under zsh it prefixes `setopt nonomatch noequals; `, and a `timeout` in command position (found by a lexical scan that skips quotes, comments and here-document bodies) becomes `gtimeout` or is denied, depending on what the `session.start` shell probe found.
+
+`tool.check` runs after `tool.call`'s rewrite, so the permission rules see the prefixed command, and `setopt` is a subcommand no allow rule names: without the module's `tool.check` hook, `Bash(echo:*)` stops matching `echo ===`. The hook re-checks an `ask` on the command without the prefix and returns that verdict unless it is also `ask`.
