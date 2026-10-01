@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
-// 2026-10-01T12:00:00Z
+// 2026-10-01T12:00:00Z, 21:00 in JST
 const NOW = Date.UTC(2026, 9, 1, 12)
 
 const BAND = {
@@ -57,9 +57,18 @@ test('colors a limit by how far usage runs ahead of the time gone', async ($, on
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: '30% 2h30m' })).toMatchObject({ props: { color: 'success' } })
-  expect(await ui.find({ type: 'Text', text: '50% 2h30m' })).toMatchObject({ props: { color: 'warning' } })
-  expect(await ui.find({ type: 'Text', text: '80% 2h30m' })).toMatchObject({ props: { color: 'error' } })
+  expect(await ui.find({ type: 'Text', text: '30% 2h30m (23:30)' })).toMatchObject({ props: { color: 'success' } })
+  expect(await ui.find({ type: 'Text', text: '50% 2h30m (23:30)' })).toMatchObject({ props: { color: 'warning' } })
+  expect(await ui.find({ type: 'Text', text: '80% 2h30m (23:30)' })).toMatchObject({ props: { color: 'error' } })
+})
+
+test('the 5-hour limit shows its reset time in JST past midnight', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  stubSession(on, new Map(), [fiveHour(40, 3 * HOUR + 5 * MINUTE)])
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '40% 3h5m (00:05)' })).toBeDefined()
 })
 
 test('a fresh window with little usage is green', async ($, on) => {
@@ -113,8 +122,8 @@ test('draws context, both limits and the other mods on each surface', async ($, 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     expect(await ui.find({ type: 'Text', text: '20%' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '62% 2h13m' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '5% 4d18h' })).toMatchObject({ props: { color: 'success' } })
+    expect(await ui.find({ type: 'Text', text: '62% 2h13m (23:13)' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^5% 4d18h$/ })).toMatchObject({ props: { color: 'success' } })
     expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
     await ui.unmount()
   }

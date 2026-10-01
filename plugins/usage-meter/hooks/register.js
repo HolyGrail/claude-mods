@@ -13,7 +13,8 @@ const TICK_MS = 60_000
 
 const HOUR_MS = 3_600_000
 const WINDOWS = {
-  five_hour: { label: '5h', ms: 5 * HOUR_MS },
+  // showsClock adds the reset time of day, in JST
+  five_hour: { label: '5h', ms: 5 * HOUR_MS, showsClock: true },
   seven_day: { label: '7d', ms: 7 * 24 * HOUR_MS },
   spend_limit: { label: '$' },
 }
@@ -25,6 +26,9 @@ const RED_BELOW_MARGIN = -15
 const GREEN_MAX_USED = 10
 // Usage this high is red whatever the pace
 const RED_MIN_USED = 90
+
+// JST has no daylight saving time, so a fixed offset gives its clock
+const JST_OFFSET_MS = 9 * HOUR_MS
 
 const BAR_CELLS = 10
 // Below this width the terminal leaves the bars out
@@ -107,7 +111,7 @@ function readLimit(limit, now) {
     return { label, used: 0, elapsed: window?.ms ? 0 : null, resetsAt: null }
   }
   const elapsed = window?.ms && resetsAtMs != null ? clamp(100 - ((resetsAtMs - now) / window.ms) * 100) : null
-  return { label, used: limit.percentUsed, elapsed, resetsAt: resetsAtMs }
+  return { label, used: limit.percentUsed, elapsed, resetsAt: resetsAtMs, showsClock: window?.showsClock === true }
 }
 
 // Green, yellow or red by how far usage runs ahead of the time gone in its window
@@ -120,12 +124,13 @@ function statusOf(used, elapsed) {
   return 'success'
 }
 
-function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, resetsAt }, now) {
+function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, resetsAt, showsClock }, now) {
   const known = typeof used === 'number'
   const status = known ? statusOf(used, elapsed) : null
   const style = known ? { color: status } : { dimColor: true }
   let value = known ? Math.round(used) + '%' : '—'
   if (resetsAt != null) value += ' ' + untilReset(resetsAt - now)
+  if (resetsAt != null && showsClock) value += ' (' + jstClock(resetsAt) + ')'
 
   const children = [Text({ children: [label] })]
   if (gauge === 'svg') {
@@ -189,6 +194,12 @@ function svgBar(used, elapsed, status) {
 
 function clamp(percent) {
   return Math.min(Math.max(percent, 0), 100)
+}
+
+// The time of day as HH:MM, 24-hour, in JST
+function jstClock(ms) {
+  const jst = new Date(ms + JST_OFFSET_MS)
+  return String(jst.getUTCHours()).padStart(2, '0') + ':' + String(jst.getUTCMinutes()).padStart(2, '0')
 }
 
 function untilReset(ms) {
