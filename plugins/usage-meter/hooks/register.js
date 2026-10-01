@@ -8,7 +8,9 @@ let measuredAt = 0
 // The timer that refreshes the band, kept so a later session.start can stop it
 let ticker = null
 
-// Rate limits are per account, so share the newest reading with the other sessions
+// Rate limits are per account, so share the newest reading with the other sessions.
+// The mods API has no account id, so after switching accounts on this machine a new
+// session shows the previous account's reading until its own first response.
 const STORE_KEY = 'rateLimits'
 // How often to pick up other sessions' readings and refresh the countdowns and time markers
 const TICK_MS = 60_000

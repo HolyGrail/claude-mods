@@ -193,27 +193,38 @@ test('shows a dash before the first reading', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '—' })).toMatchObject({ props: { dimColor: true } })
 })
 
-test('a later session.start drops the earlier limits and timer', async ($, on) => {
+test('a later session.start keeps one timer and shows the newest shared reading', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   let starts = 0
   let reads = 0
-  // The first start reports limits, the second reports none
+  // The first start reports limits, the later ones report none
   on('session.usage', () => ({ value: { startedAt: NOW, context: CONTEXT, rateLimits: starts++ === 0 ? LIMITS : [] } }))
   on('session.start', () => ({ cwd: '/work' }))
   on('store.get', ($, e) => {
     reads += 1
     return { value: saved.get(e.key) }
   })
-  on('store.set', () => ({ value: undefined }))
+  on('store.set', ($, e) => {
+    saved.set(e.key, e.value)
+    return { value: undefined }
+  })
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
 
   await $.session.start(START)
+  // Limits are per account, so the reading the first start saved is still the newest one
   await $.session.start(START)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeDefined()
+  await ui.unmount()
+
+  // With nothing saved, the earlier start's limits are not kept in the module
+  saved.clear()
+  await $.session.start(START)
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
 
-  // Only the second start's timer reads the store
+  // Only the last start's timer reads the store
   reads = 0
   await clock.advance(MINUTE)
   expect(reads).toBe(1)
