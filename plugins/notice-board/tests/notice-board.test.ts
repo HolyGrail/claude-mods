@@ -306,6 +306,28 @@ test("a session that moves to another repository is told its notices no longer a
   expect([...store.keys()]).toEqual(['notice:1-a'])
 })
 
+test('two posts in the same millisecond keep both notices', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const host = stubHost(on)
+  await $.session.start(START)
+
+  await Promise.all([run($, 'first'), run($, 'second')])
+  expect([...host.store.values()].map((n) => (n as { text: string }).text).sort()).toEqual(['first', 'second'])
+})
+
+test('a session that ends stops picking up notices', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>()
+  const host = stubHost(on, { store })
+  on('session.end', () => ({ sessionId: 'this' }))
+  await $.session.start(START)
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'this', resume: { id: '' } })
+  store.set('notice:1-other', notice('CI is paused', APP_KEY, NOW))
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([])
+})
+
 // Stands in for pr-relay, which posts through /notice when it sees a merge: its $.store is its own,
 // so it can't write the notice keys itself. An inline plugin loads on its own, apart from this file.
 const RELAY = {

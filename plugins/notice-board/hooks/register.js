@@ -11,6 +11,8 @@ let ticker = null
 let queue = Promise.resolve()
 // Set when the conversation was replaced, so the next tick tells the new one every notice
 let forgetNext = false
+// Counts this module's posts, so two in the same millisecond get keys of their own
+let posts = 0
 
 // $.store has no atomic update, so each notice has a key of its own: posting never overwrites
 // another session's notice, and clearing deletes keys instead of rewriting a shared list
@@ -23,14 +25,17 @@ const TICK_MS = 60_000
 // The band shows this many notices, newest first, and counts the rest
 const MAX_SHOWN = 3
 
+// The session.end reasons after which this module stops; /clear, /resume and logout leave it running
+const FINAL_REASONS = ['prompt_input_exit', 'other']
+
 const USAGE = 'Usage: /notice <text> | /notice --all <text> | /notice clear'
 
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
     ticker?.cancel()
+    // The queue stays: a load the previous start began may still be running
     notices = []
-    queue = Promise.resolve()
     forgetNext = false
     sessionId = await $.session.id()
     await $.command.register({
@@ -53,7 +58,14 @@ export function register(on) {
   // hook. A fork copies the conversation, the notices with it.
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
+    const result = await next(e)
+    // Only now, so a tick during the switch can't spend the flag on the outgoing conversation
     if (e.source !== 'fork') forgetNext = true
+    return result
+  })
+
+  on('session.end', async ($, e, next) => {
+    if (FINAL_REASONS.includes(e.reason)) ticker?.cancel()
     return next(e)
   })
 
@@ -97,7 +109,8 @@ async function post($, text, all) {
   const repoKey = repoKeyOf(await $.session.repo())
   if (!all && repoKey === null) return 'Not in a git repository. Use /notice --all <text> to post to every session.'
   const postedAt = await $.clock.now()
-  await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId, { text, repo: all ? null : repoKey, postedAt })
+  posts += 1
+  await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId + '-' + posts, { text, repo: all ? null : repoKey, postedAt })
   await refresh($)
   return all ? 'Posted to every session on this machine.' : 'Posted to every session in this repository.'
 }
