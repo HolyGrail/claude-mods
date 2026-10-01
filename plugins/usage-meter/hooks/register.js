@@ -5,6 +5,8 @@ let context = null
 let rateLimits = []
 // When rateLimits was last measured, in $.clock.now() milliseconds
 let measuredAt = 0
+// The timer that refreshes the band, kept so a later session.start can stop it
+let ticker = null
 
 // Rate limits are per account, so share the newest reading with the other sessions
 const STORE_KEY = 'rateLimits'
@@ -39,7 +41,11 @@ const SVG_COLORS = { success: '#4caf50', warning: '#e0a526', error: '#e5534b', t
 const MARKER_COLOR = 'cyan'
 
 export function register(on) {
+  // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
+    ticker?.cancel()
+    rateLimits = []
+    measuredAt = 0
     const usage = await $.session.usage()
     context = usage.context
     if (usage.rateLimits.length > 0) {
@@ -47,7 +53,7 @@ export function register(on) {
     } else {
       await adoptShared($)
     }
-    $.clock.every(TICK_MS, async () => {
+    ticker = $.clock.every(TICK_MS, async () => {
       await adoptShared($)
       $.ui.invalidate('ui.render')
     })
