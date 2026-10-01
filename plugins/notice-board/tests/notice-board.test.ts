@@ -156,8 +156,8 @@ test('/notice clear takes down what this session shows, and the others tell thei
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'Notice to every Claude Code session on this machine, posted 0m ago with /notice: every session',
-    'This notice was cleared and no longer applies: CI is paused',
-    'This notice was cleared and no longer applies: every session',
+    'This notice no longer applies: CI is paused',
+    'This notice no longer applies: every session',
   ])
   expect((await run($, 'clear')).text).toBe('No notices to clear.')
 })
@@ -172,7 +172,7 @@ test('a notice another session cleared is withdrawn from the model and the band'
   await clock.advance(MINUTE)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
-    'This notice was cleared and no longer applies: CI is paused',
+    'This notice no longer applies: CI is paused',
   ])
   expect(host.known()).toEqual([])
   const ui = await $.ui.mount(BAND)
@@ -194,8 +194,8 @@ test('the band shows the newest three and counts the rest', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '+2 more' })).toBeDefined()
 })
 
-test('a reload keeps what the model was told, and /clear tells it again', async ($, on) => {
-  mock.clock(on, { now: NOW })
+test('a reload keeps what the model was told, and /clear tells it again at the next tick', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
@@ -206,7 +206,8 @@ test('a reload keeps what the model was told, and /clear tells it again', async 
   expect(host.passedOn).toEqual([told])
 
   await $.classic.SessionStart({ source: 'clear' })
-  expect(host.passedOn).toEqual([told, told])
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([told, told.replace('0m ago', '1m ago')])
 })
 
 test('outside a repository only --all can post', async ($, on) => {
@@ -237,6 +238,11 @@ test('remotes keep a numeric owner, a port and the case of their path', async ($
     ['https://GitHub.com/123/app', 'github.com/123/app'],
     ['ssh://git@git.example.com:2222/team/App.git', 'git.example.com:2222/team/App'],
     ['ssh://git@git.example.com:3333/team/App.git', 'git.example.com:3333/team/App'],
+    ['ssh://git@[2001:db8::1]/team/App.git', '[2001:db8::1]/team/App'],
+    ['git@[2001:db8::1]:/team/App.git', '[2001:db8::1]/team/App'],
+    // Local remotes, whose spelling may be relative, fall back to the main working tree
+    ['../upstream.git', 'path:/src/app'],
+    ['file:///srv/app.git', 'path:/src/app'],
   ]
   let remote = ''
   const host = stubHost(on, { repo: () => ({ root: '/src/app', remote, internal: false, name: null }) })
@@ -266,8 +272,8 @@ test('a cleared notice is not withdrawn while another notice shown carries its t
   ])
 })
 
-test('/resume tells the resumed conversation again, and /branch keeps what the fork copied', async ($, on) => {
-  mock.clock(on, { now: NOW })
+test('/resume tells the resumed conversation again at the next tick, and /branch keeps what the fork copied', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
@@ -275,9 +281,29 @@ test('/resume tells the resumed conversation again, and /branch keeps what the f
   expect(host.passedOn).toHaveLength(1)
 
   await $.classic.SessionStart({ source: 'fork' })
+  await clock.advance(MINUTE)
   expect(host.passedOn).toHaveLength(1)
+  // /resume installs the resumed conversation only after its SessionStart hooks
   await $.classic.SessionStart({ source: 'resume' })
+  expect(host.passedOn).toHaveLength(1)
+  await clock.advance(MINUTE)
   expect(host.passedOn).toHaveLength(2)
+})
+
+test("a session that moves to another repository is told its notices no longer apply", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  let repo = HTTPS
+  const host = stubHost(on, { store, repo: () => repo })
+  await $.session.start(START)
+
+  repo = { root: '/src/lib', remote: 'https://github.com/owner/lib.git', internal: false, name: null }
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([
+    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
+    'This notice no longer applies: CI is paused',
+  ])
+  expect([...store.keys()]).toEqual(['notice:1-a'])
 })
 
 // Stands in for pr-relay, which posts through /notice when it sees a merge: its $.store is its own,

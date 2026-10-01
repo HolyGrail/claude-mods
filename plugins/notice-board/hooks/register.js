@@ -9,6 +9,8 @@ let sessionId = null
 let ticker = null
 // Loads run one at a time, so a tick and a command can't pass the same notice on twice
 let queue = Promise.resolve()
+// Set when the conversation was replaced, so the next tick tells the new one every notice
+let forgetNext = false
 
 // $.store has no atomic update, so each notice has a key of its own: posting never overwrites
 // another session's notice, and clearing deletes keys instead of rewriting a shared list
@@ -29,6 +31,7 @@ export function register(on) {
     ticker?.cancel()
     notices = []
     queue = Promise.resolve()
+    forgetNext = false
     sessionId = await $.session.id()
     await $.command.register({
       name: 'notice',
@@ -36,16 +39,21 @@ export function register(on) {
       argumentHint: '[--all] <text> | clear',
     })
     await refresh($)
-    ticker = $.clock.every(TICK_MS, () => refresh($))
+    ticker = $.clock.every(TICK_MS, () => {
+      const forget = forgetNext
+      forgetNext = false
+      return refresh($, { forget })
+    })
     return next(e)
   })
 
   // /clear, /resume and /branch (fork) switch to another session id, which later posts carry.
-  // /clear, compaction and /resume leave a conversation that may not hold the notices, so they
-  // are passed on again; a fork copies the conversation, the notices with it.
+  // /clear, compaction and /resume leave a conversation that may not hold the notices, so the next
+  // tick passes them on again; not now, since /resume installs its conversation only after this
+  // hook. A fork copies the conversation, the notices with it.
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
-    await refresh($, { forget: e.source !== 'fork' })
+    if (e.source !== 'fork') forgetNext = true
     return next(e)
   })
 
@@ -120,13 +128,11 @@ async function load($, { forget = false } = {}) {
   const repoKey = repoKeyOf(await $.session.repo())
   const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
-  const stored = new Set()
   const shown = []
   keys.forEach((key, i) => {
     const notice = values[i]
     if (!isNotice(notice)) return
     const id = key.slice(KEY_PREFIX.length)
-    stored.add(id)
     if (notice.repo === null || (repoKey !== null && notice.repo === repoKey)) shown.push({ id, ...notice })
   })
   // At an equal time the later id comes first, so every session lists them alike
@@ -135,15 +141,17 @@ async function load($, { forget = false } = {}) {
 
   const known = forget ? [] : ((await $.state.get(KNOWN)).value ?? [])
   const knownIds = new Set(known.map((k) => k.id))
+  const shownIds = new Set(shown.map((notice) => notice.id))
   // This session's own posts too: a command's output is not part of what the model reads
   const fresh = shown.filter((notice) => !knownIds.has(notice.id)).reverse()
-  // A cleared notice whose text another notice shown here still carries still applies
-  const withdrawn = known.filter((k) => !stored.has(k.id) && !shown.some((notice) => notice.text === k.text))
+  // Cleared, or meant for a repository this session has left; one whose text another notice shown
+  // here still carries still applies
+  const withdrawn = known.filter((k) => !shownIds.has(k.id) && !shown.some((notice) => notice.text === k.text))
   if (!forget && fresh.length === 0 && withdrawn.length === 0) return
 
   // Known before the append: a run that refuses it refuses it every time, so it is not retried
   await $.state.set(KNOWN, [
-    ...known.filter((k) => stored.has(k.id)),
+    ...known.filter((k) => shownIds.has(k.id)),
     ...fresh.map((notice) => ({ id: notice.id, text: notice.text })),
   ])
   if (fresh.length === 0 && withdrawn.length === 0) return
@@ -155,7 +163,7 @@ async function load($, { forget = false } = {}) {
         (notice.repo === null ? 'on this machine' : 'in this repository') +
         ', posted ' + ago(now - notice.postedAt) + ' ago with /notice: ' + notice.text,
     ),
-    ...withdrawn.map((k) => 'This notice was cleared and no longer applies: ' + k.text),
+    ...withdrawn.map((k) => 'This notice no longer applies: ' + k.text),
   ]
   const text = lines.join('\n')
   const result = await $.session
@@ -167,16 +175,17 @@ async function load($, { forget = false } = {}) {
 
 // Names a repository the same in each of its worktrees and clones: the origin remote as
 // host[:port]/path, whether it is spelled as a URL (https://, ssh://) or scp-style (git@host:path),
-// with or without a user or .git; or, with no remote, the main working tree's path. The path keeps
-// its case, which some servers tell apart.
+// with or without a user or .git. The path keeps its case, which some servers tell apart. With no
+// remote, or a local one (a path or file://, whose spelling may be relative), the main working
+// tree's path.
 function repoKeyOf(repo) {
   if (!repo) return null
-  if (!repo.remote) return 'path:' + repo.root
-  const remote = repo.remote.trim()
-  const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)(:\d+)?\/(.+)$/i.exec(remote)
-  const scp = url ? null : /^(?:[^@/]+@)?([^/:]+):(.+)$/.exec(remote)
+  const remote = repo.remote?.trim() ?? ''
+  // A host is a name or a bracketed IPv6 address
+  const url = /^(?!file:)[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+)(:\d+)?\/(.+)$/i.exec(remote)
+  const scp = url ? null : /^(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+):(?!\/\/)(.+)$/.exec(remote)
   const parts = url ? [url[1] + (url[2] ?? ''), url[3]] : scp ? [scp[1], scp[2]] : null
-  if (!parts) return remote
+  if (!parts) return 'path:' + repo.root
   return parts[0].toLowerCase() + '/' + parts[1].replace(/^\/+|\/+$/g, '').replace(/\.git$/, '')
 }
 
