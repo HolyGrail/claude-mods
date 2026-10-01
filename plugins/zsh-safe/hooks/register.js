@@ -1,17 +1,13 @@
 // Lets Bash commands written the bash way run under zsh: an unmatched glob and a leading = pass
 // through as text, and a timeout the shell lacks is refused with the fix.
+//
+// The options come from zdotdir/.zshenv, which every zsh Claude Code starts reads once ZDOTDIR
+// points there. Commands are never rewritten, so the permission rules, the auto mode classifier
+// and the transcript all see the command the model wrote.
 
-// Under zsh, nonomatch passes an unmatched glob on as text, as bash does, and noequals keeps a
-// word starting with = from expanding to a command's path. The guard leaves other shells alone,
-// so nothing has to guess which shell the Bash tool picks.
-const PREFIX = '[ -n "$ZSH_VERSION" ] && setopt nonomatch noequals; '
-
-// Whether the Bash tool's shell can run timeout (undefined when the probe failed), probed the
-// first time a command uses timeout, since most sessions never do
+// Whether the Bash tool's shell can run timeout (undefined when unknown), probed the first time
+// a command uses timeout, since most sessions never do
 let timeoutProbe = null
-// The calls running with a rewritten command, by tool_use_id: the command as the model wrote it,
-// the rewritten one, and whether a PreToolUse hook asked or denied
-const calls = new Map()
 
 // The words after which the next word is still in command position
 const LEAD_WORDS = new Set(['if', 'then', 'elif', 'else', 'do', 'while', 'until', '!', '{', 'time'])
@@ -26,67 +22,43 @@ export function register(on) {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     timeoutProbe = null
+    const zdotdir = `${$.plugin.root}/zdotdir`
+    const current = await $.env.get('ZDOTDIR')
+    // A reload finds ZDOTDIR already here, and the person's own value already kept
+    if (current !== zdotdir) {
+      await $.env.set('ZSH_SAFE_ZDOTDIR', current)
+      await $.env.set('ZDOTDIR', zdotdir)
+    }
     return started
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const command = e.command
-    if (command.includes('timeout') && runsTimeout(command) && (await (timeoutProbe ??= probeTimeout($))) === false) {
+    if (e.command.includes('timeout') && runsTimeout(e.command) && (await (timeoutProbe ??= probeTimeout($))) === false) {
       return {
         deny:
           `${$.plugin.name}: timeout is not installed on this machine (macOS has none). ` +
           `Run the command without it and set the Bash tool's timeout parameter (in milliseconds) instead.`,
       }
     }
-    if (command.startsWith(PREFIX)) return next(e)
-
-    const call = { original: command, rewritten: PREFIX + command, isHookDecided: false }
-    calls.set(e.tool_use_id, call)
-    try {
-      return await next({ ...e, command: call.rewritten })
-    } finally {
-      calls.delete(e.tool_use_id)
-    }
+    return next(e)
   })
-
-  // A PreToolUse hook's ask or deny is the engine's answer, not the prefix's doing: keep it
-  on('classic.PreToolUse', { tool: 'Bash' }, async ($, e, next) => {
-    const decided = await next(e)
-    const call = calls.get(e.tool_use_id)
-    if (call !== undefined && (decided.ask !== undefined || decided.deny !== undefined)) call.isHookDecided = true
-    return decided
-  })
-
-  // The permission rules see the rewritten command, where the prefix's `[` and `setopt` are
-  // subcommands no allow rule names. Decide on the command as the model wrote it as well: its
-  // deny stands, and its allow stands in for an ask the prefix alone caused.
-  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
-    const verdict = await next(e)
-    const call = callChecked(e)
-    if (call === undefined || verdict.decision === 'deny' || (verdict.decision === 'ask' && call.isHookDecided)) return verdict
-
-    const asWritten = await $.tool.check({ tool: 'Bash', input: { ...e.input, command: call.original } })
-    if (asWritten.decision === 'deny') return asWritten
-    return verdict.decision === 'ask' && asWritten.decision === 'allow' ? asWritten : verdict
-  })
-}
-
-// The rewritten call a check is about: by its id on a real call, else (a plugin's query) by the
-// command; none when a hook changed the command since this module rewrote it
-function callChecked(e) {
-  const command = e.input?.command
-  const call = e.tool_use_id !== undefined ? calls.get(e.tool_use_id) : [...calls.values()].find(c => c.rewritten === command)
-  return call?.rewritten === command ? call : undefined
 }
 
 async function probeTimeout($) {
-  // The Bash tool runs CLAUDE_CODE_SHELL when it is set, else the login shell
-  const shell = (await $.env.get('CLAUDE_CODE_SHELL')) || (await $.env.get('SHELL')) || '/bin/sh'
+  // The Bash tool runs CLAUDE_CODE_SHELL when it is set, else the login shell; for any other
+  // shell, or none, what it would pick is unknown
+  const shell = (await $.env.get('CLAUDE_CODE_SHELL')) || (await $.env.get('SHELL'))
+  if (shell === undefined || !/(^|\/)(zsh|bash)[^/]*$/.test(shell)) return undefined
   try {
-    // Login and interactive, so the profile's PATH and the rc file's functions count, as they do
-    // in the Bash tool's snapshot of the shell
+    // Login and interactive, with bash's rc file too, so the profile's PATH and the rc file's
+    // functions count, as they do in the Bash tool's snapshot of the shell
     const { stdout } = await $.process.run(
-      [shell, '-lic', `command -v timeout >/dev/null 2>&1 && echo ${PROBE_MARK}yes || echo ${PROBE_MARK}no`],
+      [
+        shell,
+        '-lic',
+        `[ -n "\${BASH_VERSION-}" ] && [ -f ~/.bashrc ] && . ~/.bashrc >/dev/null 2>&1; ` +
+          `command -v timeout >/dev/null 2>&1 && echo ${PROBE_MARK}yes || echo ${PROBE_MARK}no`,
+      ],
       { stdin: '', timeoutMs: 10_000 },
     )
     const answer = stdout.split('\n').find(line => line.startsWith(PROBE_MARK))?.slice(PROBE_MARK.length)
@@ -102,13 +74,16 @@ function runsTimeout(command) {
 }
 
 // Whether `name` stands as a command in `command`: at the start or after ; & | ( or a newline,
-// outside quotes, comments, here-document bodies, arithmetic, [[ ]] tests and array values. A
-// lexical scan, not a parse: a command inside $(...) or after `env` is not found.
+// outside quotes, $(...), comments, here-document bodies, arithmetic, [[ ]] tests, case
+// statements and array values. A lexical scan, not a parse: a command inside one of those, or
+// after `env`, is not found.
 function hasCommand(command, name) {
   // Here-documents whose bodies start after the current line
   const heredocs = []
   // Set when `<<` or `<<-` stood alone, so the next word is its delimiter
   let stripsTabsOfNext = null
+  // The word that closes a construct being skipped, `]]` or `esac`
+  let skipsTo = null
   let isCommandPosition = true
   let i = 0
 
@@ -118,13 +93,13 @@ function hasCommand(command, name) {
       i++
     } else if (c === '\n') {
       i = skipHeredocs(command, i + 1, heredocs.splice(0))
-      isCommandPosition = true
+      isCommandPosition = skipsTo === null
     } else if (c === '(' && (command[i + 1] === '(' || command[i - 1] === '=')) {
       // Arithmetic, (( ... )), or an array's values
       i = skipParens(command, i + 1)
       isCommandPosition = false
     } else if (SEPARATORS.includes(c)) {
-      isCommandPosition = c !== ')'
+      isCommandPosition = skipsTo === null && c !== ')'
       i++
     } else if (c === '#') {
       const end = command.indexOf('\n', i)
@@ -134,12 +109,6 @@ function hasCommand(command, name) {
       i = wordEnd(command, i)
       const word = command.slice(start, i)
 
-      if (word === '[[') {
-        const end = command.indexOf(']]', i)
-        i = end === -1 ? command.length : end + 2
-        isCommandPosition = false
-        continue
-      }
       if (stripsTabsOfNext !== null) {
         heredocs.push({ delimiter: unquote(word), stripsTabs: stripsTabsOfNext })
         stripsTabsOfNext = null
@@ -148,12 +117,20 @@ function hasCommand(command, name) {
         if (at !== -1) {
           const rest = word.slice(at + 2)
           const stripsTabs = rest.startsWith('-')
-          const delimiter = unquote(stripsTabs ? rest.slice(1) : rest)
-          if (delimiter === '') stripsTabsOfNext = stripsTabs
-          else heredocs.push({ delimiter, stripsTabs })
+          const token = stripsTabs ? rest.slice(1) : rest
+          // An empty token means the delimiter is the next word; '' or "" is an empty delimiter
+          if (token === '') stripsTabsOfNext = stripsTabs
+          else heredocs.push({ delimiter: unquote(token), stripsTabs })
         }
       }
 
+      if (skipsTo !== null) {
+        if (word === skipsTo) skipsTo = null
+        isCommandPosition = false
+        continue
+      }
+      if (isCommandPosition && word === '[[') skipsTo = ']]'
+      else if (isCommandPosition && word === 'case') skipsTo = 'esac'
       if (isCommandPosition && word === name) return true
       isCommandPosition = isCommandPosition && LEAD_WORDS.has(word)
     }
@@ -162,16 +139,19 @@ function hasCommand(command, name) {
 }
 
 function wordEnd(command, i) {
-  while (i < command.length && !BLANKS.includes(command[i]) && !SEPARATORS.includes(command[i])) {
-    const c = command[i]
-    if (c === '\\') i += 2
-    else if (c === "'") i = command[i - 1] === '$' ? skipEscaped(command, i + 1, "'") : skipLiteral(command, i + 1)
-    else if (c === '"') i = skipDoubleQuoted(command, i + 1)
-    else if (c === '`') i = skipEscaped(command, i + 1, '`')
-    else if (c === '$' && command[i + 1] === '(') i = skipParens(command, i + 2)
-    else i++
-  }
+  while (i < command.length && !BLANKS.includes(command[i]) && !SEPARATORS.includes(command[i])) i = skipToken(command, i)
   return Math.min(i, command.length)
+}
+
+// Steps over one character, or one quoted string or substitution starting at `i`
+function skipToken(command, i) {
+  const c = command[i]
+  if (c === '\\') return i + 2
+  if (c === "'") return command[i - 1] === '$' ? skipEscaped(command, i + 1, "'") : skipLiteral(command, i + 1)
+  if (c === '"') return skipDoubleQuoted(command, i + 1)
+  if (c === '`') return skipEscaped(command, i + 1, '`')
+  if (c === '$' && command[i + 1] === '(') return skipParens(command, i + 2)
+  return i + 1
 }
 
 // Each skip starts just inside its opening and returns the index just past its close
@@ -200,15 +180,9 @@ function skipParens(command, i) {
   let depth = 1
   while (i < command.length) {
     const c = command[i]
-    if (c === '\\') i += 2
-    else if (c === "'") i = skipLiteral(command, i + 1)
-    else if (c === '"') i = skipDoubleQuoted(command, i + 1)
-    else if (c === '`') i = skipEscaped(command, i + 1, '`')
-    else {
-      if (c === '(') depth++
-      if (c === ')' && --depth === 0) return i + 1
-      i++
-    }
+    if (c === '(') depth++
+    if (c === ')' && --depth === 0) return i + 1
+    i = c === '(' || c === ')' ? i + 1 : skipToken(command, i)
   }
   return i
 }
