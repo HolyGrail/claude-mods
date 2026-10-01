@@ -1,28 +1,25 @@
 import { type Engine, expect, mock, test } from 'claude-code/testing'
 
-const PREFIX = 'setopt nonomatch noequals; '
+const PREFIX = '[ -n "$ZSH_VERSION" ] && setopt nonomatch noequals; '
 
 // The stub registrar a test function receives as its second argument
 type On = Parameters<typeof mock.clock>[0]
 
-type World = {
-  shell: string
-  // The timeout commands the shell probe finds, or 'probe fails'
-  timeouts?: readonly string[] | 'probe fails'
-}
+// Holds a call where the engine would run it, until released
+type Hold = (command: string) => Promise<void>
 
-// Starts a session in `world` and returns what reaches the engine: each Bash command run, and
-// how many times the shell was probed
-async function start($: Engine, on: On, { shell, timeouts = [] }: World, hold?: Hold) {
+// Starts a session whose shell has timeout or not (or whose probe fails), and returns what reaches
+// the engine: each Bash command run, and how many times the shell was probed
+async function start($: Engine, on: On, timeout: 'installed' | 'missing' | 'probe fails', hold?: Hold) {
   const seen = { ran: [] as string[], probes: 0 }
-  mock.env(on, { SHELL: shell })
+  mock.env(on, { SHELL: '/bin/zsh' })
   on('session.start', () => ({ cwd: '/work' }))
   on('process.run', () => {
     seen.probes++
-    if (timeouts === 'probe fails') throw new Error('cannot start')
-    return {
-      value: { exitCode: 0, stdout: timeouts.map(c => `${c}\n`).join(''), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
-    }
+    if (timeout === 'probe fails') throw new Error('cannot start')
+    // Startup files may print before the probe's answer
+    const stdout = `Welcome back\nzsh-safe:timeout=${timeout === 'installed' ? 'yes' : 'no'}\n`
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('tool.call', { tool: 'Bash' }, async ($, e) => {
     const command = e.command as string
@@ -34,100 +31,104 @@ async function start($: Engine, on: On, { shell, timeouts = [] }: World, hold?: 
   return seen
 }
 
-// Holds each call where the engine would run it, until released
-type Hold = (command: string) => Promise<void>
-
-// Asks the permission decision on `command` while its call is held where the engine decides it
-async function decisionWhileRunning($: Engine, command: string, held: { next: () => Promise<[string, () => void]> }) {
-  const running = $.tool.call({ tool: 'Bash', command })
-  const [rewritten, release] = await held.next()
-  const { decision } = await $.tool.check({ tool: 'Bash', input: { command: rewritten } })
-  release()
-  await running
-  return decision
+async function run($: Engine, command: string) {
+  return $.tool.call({ tool: 'Bash', command })
 }
 
-test('prefixes setopt under zsh, so an unmatched glob and a leading = run as bash would', async ($, on) => {
-  const seen = await start($, on, { shell: '/bin/zsh' })
+test('prefixes the setopt, so under zsh an unmatched glob and a leading = run as bash would', async ($, on) => {
+  const seen = await start($, on, 'missing')
 
-  await $.tool.call({ tool: 'Bash', command: 'grep -r --include=*.ts foo .' })
-  await $.tool.call({ tool: 'Bash', command: 'echo ===' })
-  await $.tool.call({ tool: 'Bash', command: `${PREFIX}ls` })
+  await run($, 'grep -r --include=*.ts foo .')
+  await run($, 'echo ===')
+  await run($, `${PREFIX}ls`)
 
   expect(seen.ran).toEqual([`${PREFIX}grep -r --include=*.ts foo .`, `${PREFIX}echo ===`, `${PREFIX}ls`])
   // No command used timeout, so the shell was never started
   expect(seen.probes).toBe(0)
 })
 
-test('leaves the command alone under bash where timeout is installed', async ($, on) => {
-  const seen = await start($, on, { shell: '/bin/bash', timeouts: ['timeout', 'gtimeout'] })
-  await $.tool.call({ tool: 'Bash', command: 'echo ===' })
-  await $.tool.call({ tool: 'Bash', command: 'timeout 5 make' })
-  expect(seen.ran).toEqual(['echo ===', 'timeout 5 make'])
-})
+test('refuses a timeout command with the fix where the shell has no timeout', async ($, on) => {
+  const seen = await start($, on, 'missing')
 
-test('runs timeout as gtimeout where only gtimeout is installed, in command position only', async ($, on) => {
-  const seen = await start($, on, { shell: '/bin/bash', timeouts: ['gtimeout'] })
-
-  await $.tool.call({ tool: 'Bash', command: 'timeout 5 make' })
-  await $.tool.call({ tool: 'Bash', command: 'cd app && timeout 30s npm test | tail -5; timeout 1 true' })
-  await $.tool.call({ tool: 'Bash', command: 'if timeout 2 ping -c1 host; then echo up; fi' })
-  // Arguments, quotes, comments and here-document bodies are not commands
-  await $.tool.call({ tool: 'Bash', command: 'grep timeout log.txt' })
-  await $.tool.call({ tool: 'Bash', command: `echo "a; timeout 5"; echo 'b | timeout 5'` })
-  await $.tool.call({ tool: 'Bash', command: 'make # then timeout 5 it' })
-  await $.tool.call({ tool: 'Bash', command: "cat <<'EOF' > run.sh\ntimeout 5 make\nEOF\necho done" })
-
-  expect(seen.ran).toEqual([
-    'gtimeout 5 make',
-    'cd app && gtimeout 30s npm test | tail -5; gtimeout 1 true',
-    'if gtimeout 2 ping -c1 host; then echo up; fi',
-    'grep timeout log.txt',
-    `echo "a; timeout 5"; echo 'b | timeout 5'`,
-    'make # then timeout 5 it',
-    "cat <<'EOF' > run.sh\ntimeout 5 make\nEOF\necho done",
-  ])
+  for (const command of [
+    'timeout 5 make',
+    'cd app && timeout 30s npm test | tail -5',
+    'if timeout 2 ping -c1 host; then echo up; fi',
+    '(timeout 1 true)',
+    'cat <<EOF > a\nbody\nEOF\ntimeout 5 make',
+  ]) {
+    expect((await run($, command)).deny).toContain("Bash tool's timeout parameter")
+  }
+  expect(seen.ran).toEqual([])
   // Probed once, on the first command that used timeout
   expect(seen.probes).toBe(1)
 })
 
-test('refuses timeout with the fix where neither timeout nor gtimeout is installed', async ($, on) => {
-  const seen = await start($, on, { shell: '/bin/zsh' })
+test('runs commands where timeout is no command of their own', async ($, on) => {
+  const seen = await start($, on, 'missing')
+  const commands = [
+    'grep timeout log.txt',
+    `echo "a; timeout 5"; echo 'b | timeout 5'`,
+    `printf "%s\\n" "$(printf "%s" "one; timeout 5")"`,
+    `echo $'it\\'s; timeout 5'`,
+    'make # then timeout 5 it',
+    "cat <<'EOF' > run.sh\ntimeout 5 make\nEOF",
+    "cat<<'EOF' > run.sh\ntimeout 5 make\nEOF",
+    "cat 0<<EOF > run.sh\ntimeout 5 make\n\tEOF\ntimeout 1 make\nEOF",
+    'cat <<-EOF > run.sh\n\ttimeout 5 make\n\tEOF',
+    'timeout=5; echo $(( timeout * 1000 ))',
+    'n=$(( timeout + 1 )); (( timeout > 1 ))',
+    '[[ -n $x && timeout == "$y" ]] && echo same',
+    'steps=(build timeout test); echo $steps',
+    'timeout() { perl -e "alarm shift; exec @ARGV" "$@"; }; timeout 5 make',
+  ]
+  for (const command of commands) await run($, command)
+  expect(seen.ran).toEqual(commands.map(command => PREFIX + command))
+})
 
-  const denied = await $.tool.call({ tool: 'Bash', command: 'sleep 1 && timeout 5 make' })
-  await $.tool.call({ tool: 'Bash', command: 'grep timeout log.txt' })
-
-  expect(denied.deny).toContain("Bash tool's timeout parameter")
-  expect(seen.ran).toEqual([`${PREFIX}grep timeout log.txt`])
+test('passes timeout through where the shell has it', async ($, on) => {
+  const seen = await start($, on, 'installed')
+  await run($, 'timeout 5 make')
+  expect(seen.ran).toEqual([`${PREFIX}timeout 5 make`])
 })
 
 test('passes timeout through where the shell probe failed', async ($, on) => {
-  const seen = await start($, on, { shell: '/bin/bash', timeouts: 'probe fails' })
-  await $.tool.call({ tool: 'Bash', command: 'timeout 5 make' })
-  expect(seen.ran).toEqual(['timeout 5 make'])
+  const seen = await start($, on, 'probe fails')
+  await run($, 'timeout 5 make')
+  expect(seen.ran).toEqual([`${PREFIX}timeout 5 make`])
 })
 
-test('decides on the command as the model wrote it when the rewrite alone makes it a question', async ($, on) => {
-  // Rules beneath that allow echo and timeout, deny rm, and ask about anything else
+test('decides on the command as the model wrote it, keeping every deny and a hook asking', async ($, on) => {
+  // Rules beneath: echo is allowed, and any prefixed command too (as `Bash(*)` would), except that
+  // curl is denied as written; anything else is a question. A PreToolUse hook asks about "confirm".
   on('tool.check', ($, e) => {
     const { command } = e.input as { command: string }
-    if (command.includes('rm ')) return { decision: 'deny', reason: 'rm is denied' }
-    if (/^(echo|timeout) /.test(command)) return { decision: 'allow', rule: 'Bash(echo:*)' }
+    if (command.startsWith('curl ')) return { decision: 'deny', reason: 'curl is denied' }
+    if (command.startsWith('echo ') || command.startsWith(`${PREFIX}curl `)) return { decision: 'allow' }
     return { decision: 'ask' }
   })
-  let arrive: (arrival: [string, () => void]) => void = () => {}
-  const held = { next: () => new Promise<[string, () => void]>(resolve => (arrive = resolve)) }
-  const seen = await start($, on, { shell: '/bin/zsh', timeouts: ['gtimeout'] }, command =>
-    new Promise(release => arrive([command, () => release()])),
-  )
+  on('classic.PreToolUse', { tool: 'Bash' }, ($, e) => ((e.command as string).includes('confirm') ? { ask: 'please confirm' } : {}))
 
-  const decisions = []
-  for (const command of ['echo ===', 'timeout 5 echo hi', 'make', 'echo a; rm -rf build']) {
-    decisions.push(await decisionWhileRunning($, command, held))
+  // Each call is held where the engine decides it, while the test asks for the decision
+  let arrive: (command: string) => void = () => {}
+  let release: () => void = () => {}
+  await start($, on, 'installed', command => {
+    arrive(command)
+    return new Promise(resolve => (release = resolve))
+  })
+  async function decisionOn(command: string) {
+    const arrived = new Promise<string>(resolve => (arrive = resolve))
+    const running = run($, command)
+    const { decision } = await $.tool.check({ tool: 'Bash', input: { command: await arrived } })
+    release()
+    await running
+    return decision
   }
 
-  expect(seen.ran[1]).toBe(`${PREFIX}gtimeout 5 echo hi`)
-  expect(decisions).toEqual(['allow', 'allow', 'ask', 'deny'])
+  expect(await decisionOn('echo ===')).toBe('allow')
+  expect(await decisionOn('make')).toBe('ask')
+  expect(await decisionOn('curl example.com')).toBe('deny')
+  expect(await decisionOn('echo confirm')).toBe('ask')
   // Once the call has run, the rewritten command is decided as written
   expect((await $.tool.check({ tool: 'Bash', input: { command: `${PREFIX}echo ===` } })).decision).toBe('ask')
 })
