@@ -300,3 +300,32 @@ test('a measurement that reports no windows clears the limits', async ($, on) =>
   expect(saved.get('rateLimits')).toEqual({ at: NOW, limits: [] })
 })
 
+test('an empty shared reading wins over a startup snapshot', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  // Another session measured that the account's windows went away
+  saved.set('rateLimits', { at: NOW - MINUTE, limits: [] })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^62% / })).toBeUndefined()
+  expect(saved.get('rateLimits')).toEqual({ at: NOW - MINUTE, limits: [] })
+})
+
+test('a stored reading at the same time as this session is taken', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved, [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+  // Another session saved in the same millisecond, and its write landed last
+  saved.set('rateLimits', { at: NOW, limits: [fiveHour(64, 2 * HOUR + 13 * MINUTE), LIMITS[1]!] })
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^64% / })).toBeDefined()
+})
+

@@ -51,10 +51,11 @@ export function register(on) {
     measuredAt = 0
     const usage = await $.session.usage()
     context = usage.context
-    await adoptShared($)
-    // usage() may answer this session's last reading, which can be older than the shared one
-    const merged = mergeLimits(rateLimits, usage.rateLimits)
-    if (JSON.stringify(merged) !== JSON.stringify(rateLimits)) await remember($, merged)
+    if (usage.rateLimits.length > 0) {
+      await publishSnapshot($, usage.rateLimits)
+    } else {
+      await adoptShared($)
+    }
     ticker = $.clock.every(TICK_MS, async () => {
       await adoptShared($)
       $.ui.invalidate('ui.render')
@@ -100,13 +101,37 @@ async function remember($, limits) {
   await $.store.set(STORE_KEY, { at: measuredAt, limits })
 }
 
-// Takes another session's reading when it is newer than this session's
+// Takes another session's reading unless this session's is newer. At an equal time the stored
+// one won the race between two writes, so it is taken too.
 async function adoptShared($) {
   const shared = await $.store.get(STORE_KEY)
-  if (shared && shared.at > measuredAt && Array.isArray(shared.limits)) {
+  if (isReading(shared) && shared.at >= measuredAt) {
     rateLimits = shared.limits
     measuredAt = shared.at
   }
+}
+
+// usage() at startup may answer this session's last reading, which can be older than the shared
+// one, so it only adds windows the shared reading lacks or has older
+async function publishSnapshot($, snapshot) {
+  const now = await $.clock.now()
+  // $.store has no atomic update, so read right before writing to keep the race short
+  const shared = await $.store.get(STORE_KEY)
+  if (isReading(shared)) {
+    rateLimits = shared.limits
+    measuredAt = shared.at
+    // An empty shared reading is a measurement that the windows went away
+    if (shared.limits.length === 0) return
+  }
+  const merged = mergeLimits(rateLimits, snapshot)
+  if (JSON.stringify(merged) === JSON.stringify(rateLimits)) return
+  rateLimits = merged
+  measuredAt = now
+  await $.store.set(STORE_KEY, { at: now, limits: merged })
+}
+
+function isReading(value) {
+  return value != null && typeof value.at === 'number' && Array.isArray(value.limits)
 }
 
 // Each window from whichever reading is newer: a later reset is a newer window, and within
