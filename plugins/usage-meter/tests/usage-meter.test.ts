@@ -39,8 +39,8 @@ const CONTEXT: SessionContextUsage = { tokens: 39_205, window: 200_000, percent:
 const OWN = 'reading:this'
 const OTHER = 'reading:other'
 
-function stubStore(on: On, saved: Map<string, unknown>, onList = () => {}) {
-  on('session.id', () => ({ value: 'this' }))
+function stubStore(on: On, saved: Map<string, unknown>, onList = () => {}, sessionId = () => 'this') {
+  on('session.id', () => ({ value: sessionId() }))
   on('store.keys', () => {
     onList()
     return { value: [...saved.keys()] }
@@ -505,5 +505,54 @@ test('/clear shows the emptied context before the next turn', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '20%' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '—' })).toBeDefined()
+})
+
+test('a session left idle past the longest window stops showing its own reading', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubSession(on, new Map(), [])
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+  await $.session.measure({ context: CONTEXT, rateLimits: [{ kind: 'spend_limit', percentUsed: 90 }], changed: ['rateLimits'] })
+
+  // The mock clock runs at most 10,000 timer calls per advance, and 8 days is 11,520 ticks
+  await clock.advance(4 * 24 * HOUR)
+  await clock.advance(4 * 24 * HOUR + MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
+})
+
+test('/resume hands the old key over and writes under the new session id', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  let id = 'this'
+  on('session.usage', () => ({ value: { startedAt: NOW, context: CONTEXT, rateLimits: [] } }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('classic.SessionStart', () => ({}))
+  stubStore(on, saved, () => {}, () => id)
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
+  await $.session.start(START)
+  await $.session.measure({ context: CONTEXT, rateLimits: LIMITS, changed: ['rateLimits'] })
+
+  id = 'resumed'
+  await $.classic.SessionStart({ source: 'resume' })
+  // The old key held the newest reading, so it stays for the others, marked ended
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS, ended: true })
+
+  await $.session.measure({ context: CONTEXT, rateLimits: [fiveHour(70, 2 * HOUR), LIMITS[1]!], changed: ['rateLimits'] })
+  expect(saved.get('reading:resumed')).toEqual({ at: NOW, limits: [fiveHour(70, 2 * HOUR), LIMITS[1]!] })
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS, ended: true })
+})
+
+test('compaction keeps the same key', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved)
+  on('classic.SessionStart', () => ({}))
+  await $.session.start(START)
+
+  await $.classic.SessionStart({ source: 'compact' })
+  expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS })
 })
 

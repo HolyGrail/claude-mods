@@ -79,16 +79,19 @@ export function register(on) {
   on('session.end', async ($, e, next) => {
     if (!FINAL_REASONS.includes(e.reason) || !ownKey) return next(e)
     ticker?.cancel()
-    const { entries, newest } = await scan($)
-    if (newest?.key === ownKey) await $.store.set(ownKey, { ...newest.reading, ended: true })
-    else await $.store.delete(ownKey)
-    await prune($, entries, newest?.key)
+    await releaseKey($)
     return next(e)
   })
 
   // /clear, /resume, /branch (fork) and compaction change the context, which session.measure
-  // reports only after the next turn
+  // reports only after the next turn. All but compaction also switch to another session id, so
+  // this module hands its key over as an ended session would, and writes under the new id.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork', 'compact'] }, async ($, e, next) => {
+    const key = KEY_PREFIX + (await $.session.id())
+    if (ownKey && key !== ownKey) {
+      await releaseKey($)
+      ownKey = key
+    }
     context = (await $.session.usage()).context
     $.ui.invalidate('ui.render')
     return next(e)
@@ -140,7 +143,21 @@ async function refresh($) {
   if (newest && newest.reading.at >= measuredAt) {
     rateLimits = newest.reading.limits
     measuredAt = newest.reading.at
+  } else if (!newest && measuredAt < (await $.clock.now()) - STALE_MS) {
+    // This session's own reading has gone stale too, as in one left idle for days
+    rateLimits = []
+    measuredAt = 0
   }
+  await prune($, entries, newest?.key)
+}
+
+// Stops using this session's key: keeps its reading marked ended if it is the newest, so the
+// others may delete it once a newer one exists, and removes it otherwise, since only the newest
+// reading is ever shown
+async function releaseKey($) {
+  const { entries, newest } = await scan($)
+  if (newest?.key === ownKey) await $.store.set(ownKey, { ...newest.reading, ended: true })
+  else await $.store.delete(ownKey)
   await prune($, entries, newest?.key)
 }
 
