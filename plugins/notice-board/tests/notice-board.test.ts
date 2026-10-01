@@ -26,7 +26,7 @@ const START = { surface: 'terminal', isInteractive: true, cwd: '/work' } as cons
 const PRESENTATION = { isFullscreen: false, columns: 100 } as const
 
 // The same repository as two worktrees see it, cloned over HTTPS and over SSH
-const HTTPS: SessionRepo = { root: '/src/app', remote: 'https://github.com/Owner/App.git', internal: false, name: null }
+const HTTPS: SessionRepo = { root: '/src/app', remote: 'https://github.com/owner/app.git', internal: false, name: null }
 const SSH: SessionRepo = { root: '/elsewhere/app', remote: 'git@github.com:owner/app', internal: false, name: null }
 const APP_KEY = 'github.com/owner/app'
 
@@ -44,11 +44,11 @@ type Host = {
 
 // Backs $.store with a Map and $.state with an array. A plugin's $.session.append never reaches a
 // test's hooks and fails, so what the model is told is read from the debug line the failure logs.
-function stubHost(on: On, { store = new Map<string, unknown>(), repo = HTTPS as SessionRepo | null } = {}): Host {
+function stubHost(on: On, { store = new Map<string, unknown>(), repo = (): SessionRepo | null => HTTPS } = {}): Host {
   let known: { id: string; text: string }[] = []
   const host: Host = { store, passedOn: [], known: () => known.map((k) => k.text) }
   on('session.id', () => ({ value: 'this' }))
-  on('session.repo', () => ({ value: repo }))
+  on('session.repo', () => ({ value: repo() }))
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
@@ -75,35 +75,37 @@ function stubHost(on: On, { store = new Map<string, unknown>(), repo = HTTPS as 
   return host
 }
 
-function notice(text: string, repo: string | null, postedAt: number, by = 'other') {
-  return { text, repo, postedAt, by }
+function notice(text: string, repo: string | null, postedAt: number) {
+  return { text, repo, postedAt }
 }
 
 function run($: Engine, args: string) {
   return $.command.run({ command: 'notice', args, origin: { kind: 'composer' }, presentation: PRESENTATION })
 }
 
-test('a posted notice is stored for the repository and shown here without telling the model again', async ($, on) => {
+test('a posted notice is stored for the repository, shown here and told to this model once', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const host = stubHost(on)
   await $.session.start(START)
 
   const { text } = await run($, 'CI is paused, check the Codex review only')
   expect(text).toBe('Posted to every session in this repository.')
-  expect([...host.store.values()]).toEqual([notice('CI is paused, check the Codex review only', APP_KEY, NOW, 'this')])
+  expect([...host.store.values()]).toEqual([notice('CI is paused, check the Codex review only', APP_KEY, NOW)])
   const ui = await $.ui.mount(BAND)
   expect(await ui.find({ type: 'Text', text: 'notice 0m:' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'CI is paused, check the Codex review only' })).toBeDefined()
   // What the other mods draw stays below
   expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
-  // The command's output tells this session's model, so the next tick passes nothing on
+  // A command's output is not part of what the model reads, so the poster's model is told too
+  const told = ['Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused, check the Codex review only']
+  expect(host.passedOn).toEqual(told)
   await clock.advance(MINUTE)
-  expect(host.passedOn).toEqual([])
+  expect(host.passedOn).toEqual(told)
 })
 
 test("another worktree's notice reaches this session within a tick and the model once", async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const host = stubHost(on, { repo: SSH })
+  const host = stubHost(on, { repo: () => SSH })
   await $.session.start(START)
   expect(host.known()).toEqual([])
 
@@ -209,23 +211,73 @@ test('a reload keeps what the model was told, and /clear tells it again', async 
 
 test('outside a repository only --all can post', async ($, on) => {
   mock.clock(on, { now: NOW })
-  const host = stubHost(on, { repo: null })
+  const host = stubHost(on, { repo: () => null })
   await $.session.start(START)
 
   expect((await run($, 'hello')).text).toMatch(/^Not in a git repository/)
   expect((await run($, '--all hello')).text).toBe('Posted to every session on this machine.')
-  expect([...host.store.values()]).toEqual([notice('hello', null, NOW, 'this')])
+  expect([...host.store.values()]).toEqual([notice('hello', null, NOW)])
   expect((await run($, '--all')).text).toMatch(/^Usage/)
   expect((await run($, '')).text).toMatch(/^Usage/)
 })
 
 test('a repository without a remote is named by its main working tree', async ($, on) => {
   mock.clock(on, { now: NOW })
-  const host = stubHost(on, { repo: { root: '/src/app', remote: null, internal: false, name: null } })
+  const host = stubHost(on, { repo: () => ({ root: '/src/app', remote: null, internal: false, name: null }) })
   await $.session.start(START)
 
   await run($, 'hello')
-  expect([...host.store.values()]).toEqual([notice('hello', 'path:/src/app', NOW, 'this')])
+  expect([...host.store.values()]).toEqual([notice('hello', 'path:/src/app', NOW)])
+})
+
+test('remotes keep a numeric owner, a port and the case of their path', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const remotes = [
+    ['git@github.com:123/app.git', 'github.com/123/app'],
+    ['https://GitHub.com/123/app', 'github.com/123/app'],
+    ['ssh://git@git.example.com:2222/team/App.git', 'git.example.com:2222/team/App'],
+    ['ssh://git@git.example.com:3333/team/App.git', 'git.example.com:3333/team/App'],
+  ]
+  let remote = ''
+  const host = stubHost(on, { repo: () => ({ root: '/src/app', remote, internal: false, name: null }) })
+  await $.session.start(START)
+
+  for (const [spelled = ''] of remotes) {
+    remote = spelled
+    await run($, 'hello')
+    // Each post at its own time, so each has its own key
+    await clock.advance(1)
+  }
+  expect([...host.store.values()].map((n) => (n as { repo: string }).repo)).toEqual(remotes.map(([, key]) => key))
+})
+
+test('a cleared notice is not withdrawn while another notice shown carries its text', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', null, NOW)]])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+
+  store.delete('notice:1-a')
+  store.set('notice:2-b', notice('CI is paused', APP_KEY, NOW + MINUTE))
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toEqual([
+    'Notice to every Claude Code session on this machine, posted 0m ago with /notice: CI is paused',
+    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
+  ])
+})
+
+test('/resume tells the resumed conversation again, and /branch keeps what the fork copied', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start(START)
+  expect(host.passedOn).toHaveLength(1)
+
+  await $.classic.SessionStart({ source: 'fork' })
+  expect(host.passedOn).toHaveLength(1)
+  await $.classic.SessionStart({ source: 'resume' })
+  expect(host.passedOn).toHaveLength(2)
 })
 
 // Stands in for pr-relay, which posts through /notice when it sees a merge: its $.store is its own,
@@ -234,10 +286,9 @@ const RELAY = {
   name: 'pr-relay',
   register: (on: On) => {
     on('session.start', async ($, e, next) => {
-      $.clock.every(60_000, async () => {
-        const { text } = await $.command.run({ command: 'notice', args: 'main advanced (#12). Rebase before the next push.' })
-        $.ui.toast(text ?? '')
-      })
+      $.clock.after(60_000, () =>
+        $.command.run({ command: 'notice', args: 'main advanced (#12). Rebase before the next push.' }),
+      )
       return next(e)
     })
   },
@@ -249,8 +300,9 @@ test('another plugin posts through $.command.run, as pr-relay does on a merge', 
   await $.session.start(START)
 
   await clock.advance(MINUTE)
-  expect([...host.store.values()]).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE, 'this')])
-  // The session that saw the merge is not told again
+  expect([...host.store.values()]).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE)])
   await clock.advance(MINUTE)
-  expect(host.passedOn).toEqual([])
+  expect(host.passedOn).toEqual([
+    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: main advanced (#12). Rebase before the next push.',
+  ])
 })

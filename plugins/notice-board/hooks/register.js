@@ -40,12 +40,12 @@ export function register(on) {
     return next(e)
   })
 
-  // /clear and compaction leave a conversation that may no longer hold the notices, so they are
-  // passed on again. /clear also switches to another session id, so this session's own posts are
-  // passed on too.
-  on('classic.SessionStart', { source: ['clear', 'compact'] }, async ($, e, next) => {
+  // /clear, /resume and /branch (fork) switch to another session id, which later posts carry.
+  // /clear, compaction and /resume leave a conversation that may not hold the notices, so they
+  // are passed on again; a fork copies the conversation, the notices with it.
+  on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
-    await refresh($, { forget: true })
+    await refresh($, { forget: e.source !== 'fork' })
     return next(e)
   })
 
@@ -89,7 +89,7 @@ async function post($, text, all) {
   const repoKey = repoKeyOf(await $.session.repo())
   if (!all && repoKey === null) return 'Not in a git repository. Use /notice --all <text> to post to every session.'
   const postedAt = await $.clock.now()
-  await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId, { text, repo: all ? null : repoKey, postedAt, by: sessionId })
+  await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId, { text, repo: all ? null : repoKey, postedAt })
   await refresh($)
   return all ? 'Posted to every session on this machine.' : 'Posted to every session in this repository.'
 }
@@ -135,9 +135,10 @@ async function load($, { forget = false } = {}) {
 
   const known = forget ? [] : ((await $.state.get(KNOWN)).value ?? [])
   const knownIds = new Set(known.map((k) => k.id))
-  // This session's own posts reach its model as the command's output
-  const fresh = shown.filter((notice) => notice.by !== sessionId && !knownIds.has(notice.id)).reverse()
-  const withdrawn = known.filter((k) => !stored.has(k.id))
+  // This session's own posts too: a command's output is not part of what the model reads
+  const fresh = shown.filter((notice) => !knownIds.has(notice.id)).reverse()
+  // A cleared notice whose text another notice shown here still carries still applies
+  const withdrawn = known.filter((k) => !stored.has(k.id) && !shown.some((notice) => notice.text === k.text))
   if (!forget && fresh.length === 0 && withdrawn.length === 0) return
 
   // Known before the append: a run that refuses it refuses it every time, so it is not retried
@@ -165,16 +166,18 @@ async function load($, { forget = false } = {}) {
 }
 
 // Names a repository the same in each of its worktrees and clones: the origin remote as
-// host/owner/name, whether it is spelled as SSH or HTTPS, with or without .git; or, with no
-// remote, the main working tree's path
+// host[:port]/path, whether it is spelled as a URL (https://, ssh://) or scp-style (git@host:path),
+// with or without a user or .git; or, with no remote, the main working tree's path. The path keeps
+// its case, which some servers tell apart.
 function repoKeyOf(repo) {
   if (!repo) return null
   if (!repo.remote) return 'path:' + repo.root
   const remote = repo.remote.trim()
-  const match = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/](.+)$/i.exec(remote)
-  if (!match) return remote.toLowerCase()
-  const path = match[2].replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '')
-  return (match[1] + '/' + path).toLowerCase()
+  const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)(:\d+)?\/(.+)$/i.exec(remote)
+  const scp = url ? null : /^(?:[^@/]+@)?([^/:]+):(.+)$/.exec(remote)
+  const parts = url ? [url[1] + (url[2] ?? ''), url[3]] : scp ? [scp[1], scp[2]] : null
+  if (!parts) return remote
+  return parts[0].toLowerCase() + '/' + parts[1].replace(/^\/+|\/+$/g, '').replace(/\.git$/, '')
 }
 
 function isNotice(value) {
