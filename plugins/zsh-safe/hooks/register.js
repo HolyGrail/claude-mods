@@ -10,9 +10,9 @@
 const TIMEOUT_MISSING = /command not found: timeout\b|\btimeout: command not found/
 
 export function register(on) {
-  // Fires again on a reload
+  // Fires again on a reload. Sets ZDOTDIR before passing the event on, so the hooks beneath that
+  // start zsh already get it
   on('session.start', async ($, e, next) => {
-    const started = await next(e)
     const zdotdir = `${$.plugin.root}/zdotdir`
     // A reload, after an update too, finds ZDOTDIR at the folder this module set (an update
     // moves it), with the person's own value already kept
@@ -21,7 +21,7 @@ export function register(on) {
     }
     await $.env.set('ZSH_SAFE_DIR', zdotdir)
     await $.env.set('ZDOTDIR', zdotdir)
-    return started
+    return next(e)
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -29,7 +29,10 @@ export function register(on) {
     if (ran.isError !== true || !TIMEOUT_MISSING.test(ran.text)) return ran
     const fix =
       `${$.plugin.name}: timeout is not installed on this machine (macOS has none). ` +
-      `Run the command without it and set the Bash tool's timeout parameter (in milliseconds) instead.`
+      `When the whole command may share one deadline, run it without timeout and set the Bash tool's ` +
+      `timeout parameter (in milliseconds). When the deadline must cover one part only, as in ` +
+      `\`timeout 5 build || cleanup\`, use \`perl -e 'alarm shift; exec @ARGV' 5 build\` instead, ` +
+      `which exits 142 rather than 124 when the time runs out.`
     return { ...ran, context: [...(ran.context ?? []), fix] }
   })
 }

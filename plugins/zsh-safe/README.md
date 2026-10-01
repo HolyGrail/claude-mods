@@ -33,6 +33,7 @@ zsh は、起動のたびに `$ZDOTDIR/.zshenv` を読みます。
 
 - `zdotdir/.zshenv` の `setopt` は、利用者の `.zshenv` の後、`.zprofile` と `.zshrc` の前に実行されます。そのため、`.zshrc` で `unsetopt nonomatch` のように打ち消している環境では効きません。
 - `ZDOTDIR` は、Claude Code がこのあと起動するすべての zsh に効きます。Bash ツールのほか、設定のフックから zsh を起動するスクリプトも含みます。コマンドの中でさらに起動した zsh は、元の `ZDOTDIR` に戻っているので、影響を受けません。
+- mod を無効にしたりアンインストールしたりしても、そのプロセスの `ZDOTDIR` は戻りません。mods API に、アンロードを知らせるイベントがないからです。Claude Code を再起動すると戻ります。
 - `timeout` の失敗は防ぎません。`make clean && timeout 30 make` なら、`make clean` は実行されたあとで止まります。mod がないときと同じ振る舞いで、変わるのは、モデルが同じ往復のうちに直し方を受け取ることです。
 - 実行前にコマンドを解析して `timeout` を拒否する方法は、採っていません。字句の解析は、変数名、ヒアドキュメントの行、`case` のパターンを取り違えて、正しいコマンドを止めます。結果のエラー文を見る方法なら、`env timeout` や `$( )` の中のように表記が何であっても拾えます。
 - `timeout` を書き換えることもしません。`perl -e 'alarm shift; exec @ARGV'` では、時間切れの終了コードが `timeout` の 124 から SIGALRM の 142 に変わり、`5s` のような単位付きの時間や小数、`-k` / `-s` の指定も再現できません。
