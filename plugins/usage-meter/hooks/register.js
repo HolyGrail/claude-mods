@@ -96,9 +96,11 @@ export function register(on) {
 }
 
 async function remember($, limits) {
+  // Take the time first, so an adoptShared that runs meanwhile can't pair old limits with it
+  const now = await $.clock.now()
   rateLimits = limits
-  measuredAt = await $.clock.now()
-  await $.store.set(STORE_KEY, { at: measuredAt, limits })
+  measuredAt = now
+  await $.store.set(STORE_KEY, { at: now, limits })
 }
 
 // Takes another session's reading unless this session's is newer. At an equal time the stored
@@ -114,7 +116,6 @@ async function adoptShared($) {
 // usage() at startup may answer this session's last reading, which can be older than the shared
 // one, so it only adds windows the shared reading lacks or has older
 async function publishSnapshot($, snapshot) {
-  const now = await $.clock.now()
   // $.store has no atomic update, so read right before writing to keep the race short
   const shared = await $.store.get(STORE_KEY)
   if (isReading(shared)) {
@@ -125,6 +126,8 @@ async function publishSnapshot($, snapshot) {
   }
   const merged = mergeLimits(rateLimits, snapshot)
   if (JSON.stringify(merged) === JSON.stringify(rateLimits)) return
+  // Never older than the reading it was merged into, or sessions holding that one would skip it
+  const now = Math.max(await $.clock.now(), measuredAt)
   rateLimits = merged
   measuredAt = now
   await $.store.set(STORE_KEY, { at: now, limits: merged })

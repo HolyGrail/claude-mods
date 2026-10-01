@@ -329,3 +329,15 @@ test('a stored reading at the same time as this session is taken', async ($, on)
   expect(await ui.find({ type: 'Text', text: /^64% / })).toBeDefined()
 })
 
+test('a startup merge is saved no older than the reading it merged into', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  // Another session saved a 5-hour reading stamped later than this session's clock reads
+  saved.set('rateLimits', { at: NOW + MINUTE, limits: [LIMITS[0]!] })
+  stubSession(on, saved)
+  await $.session.start(START)
+
+  // The snapshot adds the weekly window, saved at the shared reading's time
+  expect(saved.get('rateLimits')).toEqual({ at: NOW + MINUTE, limits: LIMITS })
+})
+
