@@ -132,7 +132,7 @@ export function register(on) {
     const command = e.command ?? ''
     // A stopgap until the /dev skill's Phase 5.5 ends the turn after a push by itself: its waiting
     // loop would otherwise poll for what this module already watches
-    if (watched && !watched.ended && /poll-codex-review\.sh/.test(command) && /--watch\b/.test(command)) {
+    if (watched && !watched.ended && runsWatch(command)) {
       return {
         deny:
           `pr-relay is watching ${watched.url} and will send a prompt when Codex reviews it, approves it ` +
@@ -593,4 +593,124 @@ function describe() {
 function clock(ms) {
   const d = new Date(ms + JST_OFFSET_MS)
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+}
+
+// Whether a Bash command runs poll-codex-review.sh with --watch, as opposed to merely mentioning it
+// in a commit message, a pull request body or a comment. Only a simple command whose command word
+// is the script (or a variable this command set to it, as the /dev skill's `"$SCRIPT" ... --watch`
+// does) counts. Quoted strings stay one word and here-document bodies and comments are dropped, so
+// prose never reads as a command. Anything less plain (`bash -c '...'`, `$(...)`) is let through:
+// a missed deny only lets the skill wait the old way, while a wrong one blocks unrelated work.
+const SCRIPT = /(^|\/)poll-codex-review\.sh$/
+// Words that may stand before the command word without being it
+const PREFIXES = new Set(['!', '{', 'do', 'then', 'else', 'if', 'elif', 'while', 'until', 'time',
+  'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh'])
+
+function runsWatch(command) {
+  if (!command.includes('poll-codex-review.sh')) return false
+  const scripts = new Set()
+  for (const words of simpleCommands(command)) {
+    let i = 0
+    for (; i < words.length; i++) {
+      const { text } = words[i]
+      const assigned = /^(?:export\s+)?([A-Za-z_]\w*)=(.*)$/s.exec(text)
+      if (assigned) {
+        if (SCRIPT.test(assigned[2])) scripts.add(assigned[1])
+        continue
+      }
+      if (PREFIXES.has(text) || text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
+      break
+    }
+    if (i >= words.length) continue
+    const variable = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(words[i].text)
+    const isScript = variable ? scripts.has(variable[1]) : SCRIPT.test(words[i].text)
+    if (isScript && words.slice(i + 1).some((w) => w.text === '--watch')) return true
+  }
+  return false
+}
+
+// Splits a command into simple commands (on newlines, `;`, `&`, `|`, `(` and `)` outside quotes),
+// each a list of words with their quotes removed. Here-document bodies and comments are skipped.
+function simpleCommands(command) {
+  const commands = []
+  let words = []
+  let word = null
+  const heredocs = []
+  const endWord = () => {
+    if (word !== null) words.push({ text: word })
+    word = null
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length) commands.push(words)
+    words = []
+  }
+  let i = 0
+  while (i < command.length) {
+    const c = command[i]
+    if (c === '\n') {
+      endCommand()
+      i += 1
+      // Skips each pending here-document's body, up to and including its delimiter line
+      for (const { delimiter, stripTabs } of heredocs.splice(0)) {
+        while (i < command.length) {
+          const eol = command.indexOf('\n', i)
+          const line = command.slice(i, eol < 0 ? command.length : eol)
+          i = eol < 0 ? command.length : eol + 1
+          if ((stripTabs ? line.replace(/^\t+/, '') : line) === delimiter) break
+        }
+      }
+    } else if (c === '\\') {
+      if (command[i + 1] !== '\n') word = (word ?? '') + (command[i + 1] ?? '')
+      i += 2
+    } else if (c === "'") {
+      const end = command.indexOf("'", i + 1)
+      const stop = end < 0 ? command.length : end
+      word = (word ?? '') + command.slice(i + 1, stop)
+      i = stop + 1
+    } else if (c === '"') {
+      let text = ''
+      i += 1
+      while (i < command.length && command[i] !== '"') {
+        if (command[i] === '\\' && '"\\$`\n'.includes(command[i + 1] ?? '')) i += 1
+        text += command[i] ?? ''
+        i += 1
+      }
+      word = (word ?? '') + text
+      i += 1
+    } else if (c === '#' && word === null) {
+      const eol = command.indexOf('\n', i)
+      i = eol < 0 ? command.length : eol
+    } else if (command.startsWith('<<<', i)) {
+      endWord()
+      i += 3
+    } else if (command.startsWith('<<', i)) {
+      endWord()
+      const m = /^<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|<>()]+))/.exec(command.slice(i))
+      if (!m) {
+        i += 2
+        continue
+      }
+      heredocs.push({ delimiter: m[2] ?? m[3] ?? m[4], stripTabs: m[1] === '-' })
+      i += m[0].length
+    } else if (c === '&' && command[i + 1] === '>') {
+      endWord()
+      i += 2
+    } else if (';&|()'.includes(c)) {
+      endCommand()
+      i += 1
+    } else if (c === '<' || c === '>') {
+      endWord()
+      // `2>&1` and `&>` are redirections, not a background `&`
+      i += command[i + 1] === '&' ? 2 : 1
+    } else if (c === ' ' || c === '\t') {
+      endWord()
+      i += 1
+    } else {
+      word = (word ?? '') + c
+      i += 1
+    }
+  }
+  endCommand()
+  return commands
 }
