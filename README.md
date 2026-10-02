@@ -8,6 +8,7 @@ Claude Code の mod 集です。
 | mod | 内容 |
 | --- | --- |
 | [usage-meter](plugins/usage-meter/README.md) | プロンプト入力欄の上に、コンテキストと 5 時間制限・週間制限の使用率を常時表示する |
+| [pr-relay](plugins/pr-relay/README.md) | セッションの PR を監視し、マージされたときと Codex がレビューを付けたときだけセッションを起こす |
 
 ## インストール
 
