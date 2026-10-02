@@ -55,12 +55,14 @@ function stubHost(
     beforeRead = async (): Promise<void> => {},
     // Holds a read of the repository back
     beforeRepo = async (): Promise<void> => {},
-    // What version 0.1 kept in $.state of the notices it told
-    known = [] as { id: string; text: string }[],
+    // What version 0.1 kept in $.state of the notices it told, for the session now installed
+    known = (): { id: string; text: string }[] => [],
+    // The session id now installed
+    id = (): string => 'this',
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
-  on('session.id', () => ({ value: 'this' }))
+  on('session.id', () => ({ value: id() }))
   on('session.messages', async () => {
     await beforeRead()
     return { value: host.transcript }
@@ -69,7 +71,7 @@ function stubHost(
     await beforeRepo()
     return { value: repo() }
   })
-  on('state.get', () => ({ value: { value: known, version: 0 } }))
+  on('state.get', () => ({ value: { value: known(), version: 0 } }))
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
@@ -470,7 +472,7 @@ test('a session that ran version 0.1 reads its unsigned rows, withdrawing what w
     { id: '1-a', text: 'CI is paused' },
     { id: '2-b', text: 'Use the staging DB' },
   ]
-  const host = stubHost(on, { store, known })
+  const host = stubHost(on, { store, known: () => known })
   host.transcript = [
     said(
       'user',
@@ -482,6 +484,75 @@ test('a session that ran version 0.1 reads its unsigned rows, withdrawing what w
   ]
   await $.session.start(START)
   expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
+})
+
+test("a tick during /resume keeps the outgoing conversation's record to it", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const resumed = { at: NOW, told: [{ key: 'repo\nUse the staging DB', text: 'Use the staging DB' }] }
+  store.set('told:new', resumed)
+  let id = 'old'
+  const host = stubHost(on, { store, id: () => id })
+  // A tick lands while the outgoing conversation is still installed
+  on('classic.SessionStart', async () => {
+    await clock.advance(MINUTE)
+    return {}
+  })
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  expect(store.get('told:old')).toEqual({ at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] })
+
+  // The host moves to the resumed session's id before its SessionStart hooks
+  id = 'new'
+  await $.classic.SessionStart({ source: 'resume' })
+  expect(store.get('told:new')).toEqual(resumed)
+})
+
+test("/branch carries the record of what the copied conversation was told", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  let id = 'old'
+  const host = stubHost(on, { store, id: () => id })
+  on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  id = 'new'
+  await $.classic.SessionStart({ source: 'fork' })
+  expect(store.get('told:new')).toEqual(store.get('told:old'))
+
+  // The fork's window is full without the row, and the notice is cleared: it is still withdrawn
+  const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
+  host.transcript = Array.from({ length: 4096 }, (_, i) => message(i))
+  store.delete('notice:1-a')
+  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn.at(-1)).toBe('This notice no longer applies: CI is paused')
+})
+
+test("/resume reads the resumed session's version 0.1 record", async ($, on) => {
+  mock.clock(on, { now: NOW })
+  let known: { id: string; text: string }[] = []
+  const host = stubHost(on, { known: () => known })
+  on('classic.SessionStart', () => {
+    known = [{ id: '1-a', text: 'CI is paused' }]
+    return {}
+  })
+  on('prompt.submit', ($, e) => e as never)
+  await $.session.start(START)
+
+  await $.classic.SessionStart({ source: 'resume' })
+  host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 1h ago with /notice: CI is paused')]
+  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
+})
+
+test('a version 0.1 row whose body holds a line like a withdrawal is read whole', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const body = 'first line\nThis notice no longer applies: first line'
+  const host = stubHost(on, { known: () => [{ id: '1-a', text: body }] })
+  host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: ' + body)]
+  await $.session.start(START)
+  expect(host.passedOn).toEqual(['This notice no longer applies: ' + body])
 })
 
 test('a refused line is tried again after a rewind, even in a conversation past the window', async ($, on) => {

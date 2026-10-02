@@ -81,10 +81,20 @@ export function register(on) {
   // conversation they leave is read at the next load: /resume installs its own only after this hook,
   // so a tick in between may tell the outgoing one, and the load after it tells the new one
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
-    sessionId = await $.session.id()
+    const outgoing = sessionId
     forgetRefusals()
     const result = await next(e)
-    // Again, for a tick that began during the switch and met a refusal in the outgoing conversation
+    // Only now: a tick during the switch still reads the outgoing conversation, and keeps its record
+    // and refusals to it
+    sessionId = await $.session.id()
+    legacy = await legacyOf($)
+    // A fork copies the conversation, and with it what was told before its window
+    if (e.source === 'fork' && outgoing !== null && outgoing !== sessionId) {
+      const record = await $.store.get(RECORD_PREFIX + outgoing)
+      if (isRecord(record) && !isRecord(await $.store.get(RECORD_PREFIX + sessionId))) {
+        await $.store.set(RECORD_PREFIX + sessionId, record)
+      }
+    }
     forgetRefusals()
     return result
   })
@@ -169,8 +179,9 @@ function refresh($) {
 // Reads the notices meant for this session, and tells the model about the ones its conversation
 // does not hold and the ones it holds that have since been cleared
 async function load($) {
-  // Before any wait, so a restart that lands during one is seen
+  // Before any wait, so a restart or a switch that lands during one is seen
   const started = generation
+  const id = sessionId
   const repoKey = repoKeyOf(await $.session.repo())
   const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
@@ -185,7 +196,6 @@ async function load($) {
   shown.sort((a, b) => b.postedAt - a.postedAt || (a.id < b.id ? 1 : -1))
   notices = shown
 
-  const id = sessionId
   const messages = await $.session.messages()
   if (refused.size > 0) {
     const now = messages.map(fingerprint)
@@ -285,8 +295,8 @@ async function toldIn(messages, secret) {
     }
     // A row of version 0.1 counts where that version's record says it told the text
     if (legacy.size === 0) continue
-    const parts = message.text.split(LINE_START_V1)
-    if (!parts.every((part) => TOLD_V1.test(part) || WITHDRAWN_V1.test(part))) continue
+    const parts = partsV1(message.text)
+    if (parts === null) continue
     for (const part of parts) {
       const added = TOLD_V1.exec(part)
       if (added && legacy.has(added[2])) {
@@ -301,6 +311,27 @@ async function toldIn(messages, secret) {
     }
   }
   return { told, withdrawals }
+}
+
+// Splits a row of version 0.1 into its lines. A body may itself hold a new line that starts like
+// another line, so a body the record lists is taken whole first, the longest such; any other runs
+// to the next line start.
+function partsV1(text) {
+  const parts = []
+  let rest = text
+  while (rest !== '') {
+    const head = /^(?:Notice to every Claude Code session (?:on this machine|in this repository), posted \d+[mhd] ago with \/notice: |This notice no longer applies: )/.exec(rest)
+    if (!head) return null
+    const body = rest.slice(head[0].length)
+    const known = [...legacy]
+      .filter((t) => body.startsWith(t) && (body.length === t.length || body.slice(t.length).search(LINE_START_V1) === 0))
+      .sort((a, b) => b.length - a.length)[0]
+    const end = known !== undefined ? known.length : body.search(LINE_START_V1)
+    const length = end === -1 ? body.length : end
+    parts.push(head[0] + body.slice(0, length))
+    rest = body.slice(length).replace(/^\n/, '')
+  }
+  return parts
 }
 
 // The texts version 0.1's record holds, if this session ran it
