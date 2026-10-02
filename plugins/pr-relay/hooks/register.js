@@ -6,8 +6,6 @@
 const TICK_MS = 60_000
 // Codex's login as GraphQL spells it (REST adds "[bot]")
 const CODEX = 'chatgpt-codex-connector'
-// Where the /dev skill keeps its sessions, under $HOME
-const DEV_SESSIONS = '/.claude/dev-sessions'
 // What this module has already relayed for a pull request lives under this prefix plus its URL, in
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
@@ -64,10 +62,8 @@ const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int
 }`
 const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 
-// The pull request this session watches: { url, id, owner, name, number, since, sessionFile,
-// pagedAt?, ended? },
-// or null. since is the last push the watch started from; sessionFile the /dev session that
-// named it, whose last_push_at moves on with each push the skill records.
+// The pull request this session watches: { url, id, owner, name, number, since, pagedAt?, ended? },
+// or null. since is the last push the watch started from.
 let watched = null
 // The timers that poll it, kept so the next watch or session.start can stop them
 let timers = []
@@ -179,8 +175,8 @@ export function register(on) {
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const command = e.command ?? ''
-    // Best effort: a push or a pull request made any other way is caught by the head commit's date,
-    // the /dev session file and session.start
+    // Best effort: a push made another way is caught by the head commit's date, and session.start
+    // looks up the branch's pull request
     const creates = /\bgh\s+pr\s+create\b/.test(command)
     const pushing = !creates && /\bgit\s+push\b/.test(command)
     if (!creates && !pushing) return next(e)
@@ -210,9 +206,9 @@ export function register(on) {
         note.pending = [...note.pending.filter((p) => p !== push), push]
         note.dirty = true
       }
-      // A pull request with no note yet (its first poll still reads the session file, or the watch
-      // turned away first) gets an idle one, so the other sessions see the push run; the first poll
-      // takes it up
+      // A pull request with no note yet (its first poll has not written one, or the watch turned
+      // away first) gets an idle one, so the other sessions see the push run; the first poll takes
+      // it up
       if (prId && !notesOf(prId).length) {
         // The id is known from the start, so the push goes out without waiting on it
         const key = `${POLL_PREFIX}${sessionId ?? (await sessionIdOf($))}:${prId}`
@@ -330,12 +326,10 @@ function reset($) {
 async function discover($, { branchOnly = false } = {}) {
   if (watched && !watched.ended) return
   const gen = generation
-  // Pruning is housekeeping: a store that fails it does not keep the pull request unwatched
+  // Pruning is startup housekeeping, skipped for a lookup after a push; a store that fails it
+  // does not keep the pull request unwatched
   if (!branchOnly) await prune($).catch(() => {})
-  // A /dev session that owns the cwd but has no pull request yet answers false: its own gh pr
-  // create starts the watch, not whatever the branch had before
-  const owned = branchOnly ? null : await findInDevSessions($)
-  const found = owned === false ? null : (owned ?? (await findForBranch($)))
+  const found = await findForBranch($)
   const at = await $.clock.now()
   if ((watched && !watched.ended) || gen !== generation) return
   if (found?.error !== undefined) {
@@ -354,13 +348,13 @@ async function discover($, { branchOnly = false } = {}) {
 
 // Starts watching. The first poll runs on the clock, never inside the caller's hook: a prompt it
 // submits starts its turn only once the session is idle, which a tool call still running is not.
-function watch($, { url, since, sessionFile = null }) {
+function watch($, { url, since }) {
   stop()
   const gen = generation
   const pr = parse(url)
   // The note of the poll this stops must not hold back the sessions still watching its pull request
-  // while this watch's first poll reads the session file; watching the same pull request again, its
-  // first poll takes up what the note held
+  // while this watch's first poll starts; watching the same pull request again, its first poll
+  // takes up what the note held
   if (lastNote) retire($)
   // A push still waiting for its head to move stays with the pull request it was bound to, even one
   // that ended; one made while none was watched is the push that led here
@@ -369,7 +363,7 @@ function watch($, { url, since, sessionFile = null }) {
   for (const push of pushes) push.pr ??= pr.id
   // Watching the same pull request again keeps the baseline its polls learned
   if (watched?.id !== pr.id) knownSince = 0
-  watched = { ...pr, since, sessionFile }
+  watched = { ...pr, since }
   lookupFailure = null
   lastHead = null
   lastHeadAt = 0
@@ -404,17 +398,13 @@ async function pollOnce($, gen) {
   await settleRetired($)
   const pr = watched
   const key = KEY_PREFIX + pr.id
-  // /dev writes the session's pr_url only after the pull request exists, so a watch that began
-  // before (gh pr create, the watch tool) looks for its file until one names it
-  const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
-  const recordedPush = await lastPushOf($, sessionFile)
-  // A watch that began while this read the session file owns what the session knows now
+  // A watch that began while the retired notes settled owns what the session knows now
   if (gen !== generation) return
   // What an earlier poll of this watch paged through is not asked for again
-  const floor = Math.max(pr.since, recordedPush, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
+  const floor = Math.max(pr.since, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
   // Noted before asking, so a session that starts polling while this one waits on GitHub finds it,
   // with the pushes known already, so a session that relays before this one finishes counts them
-  knownSince = Math.max(knownSince, pr.since, recordedPush)
+  knownSince = Math.max(knownSince, pr.since)
   // A poll the other sessions cannot see would relay beside the one they elect, so it waits a tick
   const note = await notePoll($, pr, gen).catch(async (error) => {
     lastCheck = { at: await $.clock.now(), error: `poll note: ${error?.message ?? error}` }
@@ -424,13 +414,13 @@ async function pollOnce($, gen) {
   if (!note) return
   const now = note.at
   try {
-    await pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note })
+    await pollNoted($, gen, { pr, key, now, floor, note })
   } finally {
     await finishNote($, note)
   }
 }
 
-async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note }) {
+async function pollNoted($, gen, { pr, key, now, floor, note }) {
   // Read before GitHub is asked: a push that starts, and even finishes, while the query or the
   // record is on its way may have replaced the head the query saw
   const started = pushStarts.get(pr.id) ?? 0
@@ -480,7 +470,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
       () => null,
       (error) => error,
     )
-    // A watch that began while it went out owns the head and the session file now
+    // A watch that began while it went out owns the head and the baseline now
     if (gen !== generation) return
     if (refused) {
       await retire($)
@@ -495,7 +485,6 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     lastHeadAt = seenAt
   }
   lastCheck = { at: now }
-  watched = { ...watched, ...(sessionFile ? { sessionFile } : {}) }
   // One that leaves the waking to another session leaves the end to it too, and sees it next round
   // from the record, as the session that relays: only then does it stop and offer the cleanup
   const ended = !defers && (data.state === 'MERGED' || data.state === 'CLOSED')
@@ -526,7 +515,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
       // what its note said
       const owns = watched?.id === pr.id
       noted = Math.max(othersSince, owns ? knownSince : note.since)
-      const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now, seenAt)
+      const sends = update($, pr, data, record, noted, pending, defers, pushing, now, seenAt)
       // The session that relays writes the record at about this moment, so a copy read before its
       // marks must not land over them: one that leaves it the waking writes only its own note
       if (owns) knownSince = Math.max(knownSince, record.since)
@@ -620,12 +609,12 @@ async function late($, now, pr, note) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing, now, seenAt) {
+function update($, pr, data, record, notedPush, pending, defers, pushing, now, seenAt) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
   const committedAt = Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0
-  record.since = Math.max(record.since, pr.since, recordedPush, committedAt, notedPush)
+  record.since = Math.max(record.since, pr.since, committedAt, notedPush)
   // An ended poll that finishes after the watch turned leaves the next pull request's pushes alone
   if (watched?.id === pr.id) {
     pushes = pushes.filter((push) => {
@@ -1143,24 +1132,6 @@ async function graphql($, pr, document, before) {
   return data
 }
 
-// The pull request of the /dev session whose worktree holds this session's cwd: null when no
-// session does, false when the one that does has none open. The deepest worktree wins, so one
-// nested in another repository's checkout is not taken for it.
-async function findInDevSessions($) {
-  const [{ files, sessions }, cwd] = await Promise.all([readDevSessions($), $.session.cwd()])
-  let best = null
-  sessions.forEach((session, i) => {
-    const root = session?.worktree_path?.replace(/\/+$/, '')
-    if (!root || (cwd !== root && !cwd.startsWith(root + '/'))) return
-    if (!best || root.length > best.root.length) best = { root, session, file: files[i] }
-  })
-  // The session that owns the cwd decides, even when it has no pull request yet
-  const session = best?.session
-  if (!session) return null
-  if (session.status !== 'pr-open' || !PR_URL.test(session.pr_url ?? '')) return false
-  return { url: session.pr_url, since: lastPush(session), sessionFile: best.file }
-}
-
 // The open pull request of the branch checked out here: null when there is none, { error } when gh
 // could not tell
 async function findForBranch($) {
@@ -1175,38 +1146,6 @@ async function findForBranch($) {
   } catch (error) {
     return { error: String(error?.message ?? error) }
   }
-}
-
-// The /dev session file that names this pull request, or null
-async function findSessionFile($, id) {
-  const { files, sessions } = await readDevSessions($)
-  const i = sessions.findIndex((session) => PR_URL.test(session?.pr_url ?? '') && parse(session.pr_url).id === id)
-  return i < 0 ? null : files[i]
-}
-
-async function readDevSessions($) {
-  const home = await $.env.get('HOME')
-  if (!home) return { files: [], sessions: [] }
-  const dir = home + DEV_SESSIONS
-  const entries = await $.fs.list(dir).catch(() => [])
-  const files = entries.filter((entry) => entry.kind === 'file' && entry.name.endsWith('.json')).map((entry) => `${dir}/${entry.name}`)
-  return { files, sessions: await Promise.all(files.map((file) => readJson($, file))) }
-}
-
-// The last push the /dev session file records now
-async function lastPushOf($, file) {
-  return file ? lastPush(await readJson($, file)) : 0
-}
-
-function lastPush(session) {
-  return Date.parse(session?.review?.last_push_at ?? '') || 0
-}
-
-function readJson($, file) {
-  return $.fs
-    .read(file)
-    .then((text) => JSON.parse(text))
-    .catch(() => null)
 }
 
 async function prune($) {
@@ -1271,7 +1210,7 @@ function normalize(record) {
 }
 
 // id is the pull request whatever the case it is spelled in, as GitHub reads owner and repository
-// names: the store key, and what watches and session files are matched by
+// names: the store key, and what watches are matched by
 function parse(url) {
   const [whole, owner, name, number] = url.match(PR_URL)
   return { url: whole, id: whole.toLowerCase(), owner, name, number: Number(number) }
