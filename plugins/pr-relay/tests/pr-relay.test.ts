@@ -362,6 +362,10 @@ test('waiting for Codex with poll-codex-review.sh --watch is refused while the p
     `</dev/null >>/tmp/poll.log ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
     // The delimiter is EOF once its quotes are removed, so the call after the body still counts
     `cat <<'E'OF\nbody\nEOF\n${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `export SCRIPT=${POLL}\n"$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `/bin/bash ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `timeout -s TERM 600 ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `(SCRIPT=${POLL}; "$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch)`,
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toContain('End the turn')
@@ -385,6 +389,8 @@ test('poll-codex-review.sh run without --watch, or only mentioned, is let throug
     `echo done # then ${POLL} HolyGrail/claude-mods 7 now --watch`,
     `SCRIPT=${POLL}; SCRIPT=/bin/echo; "$SCRIPT" --watch`,
     `bash -n ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // The subshell's assignment does not reach the parent
+    `SCRIPT=/bin/echo; (SCRIPT=${POLL}); "$SCRIPT" --watch`,
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toBeUndefined()

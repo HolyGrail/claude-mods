@@ -603,31 +603,50 @@ function clock(ms) {
 // a missed deny only lets the skill wait the old way, while a wrong one blocks unrelated work.
 const SCRIPT = /(^|\/)poll-codex-review\.sh$/
 // Words that may stand before the command word without being it
+// (matched by basename, so `/bin/bash` counts too)
 const PREFIXES = new Set(['!', '{', 'do', 'then', 'else', 'if', 'elif', 'while', 'until', 'time',
-  'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh'])
+  'export', 'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh'])
 const SHELLS = new Set(['bash', 'sh', 'zsh'])
+// Options of those prefixes that take the next word as their value (`timeout -s TERM 600`)
+const OPTION_VALUES = { env: ['-u', '-C', '-S'], timeout: ['-s', '-k'] }
 // A shell word: quoted parts, escapes and plain characters, up to an unquoted blank or operator
 const SHELL_WORD = /^(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>()'"\\])+/
 
 function runsWatch(command) {
   if (!command.includes('poll-codex-review.sh')) return false
-  const scripts = new Set()
-  for (const words of simpleCommands(command)) {
+  // Variables set to the script, one set per subshell: an assignment inside `( )` ends with it
+  const scopes = [new Set()]
+  for (const entry of simpleCommands(command)) {
+    if (entry === OPEN) {
+      scopes.push(new Set(scopes.at(-1)))
+      continue
+    }
+    if (entry === CLOSE) {
+      if (scopes.length > 1) scopes.pop()
+      continue
+    }
+    const words = entry
+    const scripts = scopes.at(-1)
     let i = 0
-    let shell = false
+    let prefix = null
     let checksOnly = false
     for (; i < words.length; i++) {
       const { text } = words[i]
-      const assigned = /^(?:export\s+)?([A-Za-z_]\w*)=(.*)$/s.exec(text)
+      const assigned = /^([A-Za-z_]\w*)=(.*)$/s.exec(text)
       if (assigned) {
         if (SCRIPT.test(assigned[2])) scripts.add(assigned[1])
         else scripts.delete(assigned[1])
         continue
       }
-      if (SHELLS.has(text)) shell = true
+      const name = text.slice(text.lastIndexOf('/') + 1)
+      if (PREFIXES.has(name)) {
+        prefix = name
+        continue
+      }
       // `bash -n` reads the script without running it
-      if (shell && /^-[A-Za-z]*n/.test(text)) checksOnly = true
-      if (PREFIXES.has(text) || text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
+      if (SHELLS.has(prefix) && /^-[A-Za-z]*n/.test(text)) checksOnly = true
+      if (OPTION_VALUES[prefix]?.includes(text)) i += 1
+      if (text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
       break
     }
     if (i >= words.length || checksOnly) continue
@@ -638,8 +657,12 @@ function runsWatch(command) {
   return false
 }
 
+const OPEN = Symbol('(')
+const CLOSE = Symbol(')')
+
 // Splits a command into simple commands (on newlines, `;`, `&`, `|`, `(` and `)` outside quotes),
-// each a list of words with their quotes removed. Here-document bodies and comments are skipped.
+// each a list of words with their quotes removed, with OPEN and CLOSE where a `(` or `)` stood.
+// Here-document bodies and comments are skipped.
 function simpleCommands(command) {
   const commands = []
   let words = []
@@ -725,6 +748,8 @@ function simpleCommands(command) {
       i += command[i + 2] === '>' ? 3 : 2
     } else if (';&|()'.includes(c)) {
       endCommand()
+      if (c === '(') commands.push(OPEN)
+      if (c === ')') commands.push(CLOSE)
       i += 1
     } else if (c === '<' || c === '>') {
       redirect()
