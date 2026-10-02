@@ -905,16 +905,16 @@ test('a tick that comes while a poll still waits on GitHub leaves that poll its 
   expect(w.store.get('poll:session-b')).toMatchObject({ at: NOW })
 })
 
-test('a poll that could not ask GitHub takes its note back', async ($, on) => {
+test('a poll that could not ask GitHub leaves its note idle, with the push it knows', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { queryError: 'HTTP 502' })
   await $.session.start(START)
   await clock.settle()
   expect(w.status).toBe('PR #7 確認失敗 21:00: HTTP 502')
-  expect(w.store.has('poll:session-b')).toBe(false)
+  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
 })
 
-test('a session that ends takes its poll note away', async ($, on) => {
+test('a session that ends leaves its poll note idle', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   on('session.end', () => ({ sessionId: 'session-b' }))
@@ -923,7 +923,7 @@ test('a session that ends takes its poll note away', async ($, on) => {
   expect(w.store.get('poll:session-b')).toMatchObject(pollNote(NOW))
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  expect(w.store.has('poll:session-b')).toBe(false)
+  expect(w.store.get('poll:session-b')).toMatchObject({ idle: true })
 })
 
 test('a lookup that succeeds after failing clears the failure from the status line', async ($, on) => {
@@ -981,4 +981,31 @@ test('a poll note carries the push the session file records from the start', asy
 
   await clock.advance(10_000)
   expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+})
+
+test('an idle note holds nothing back but its push still counts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // The other session's query failed a moment ago; only it knew of the push after the approval
+  const w = stubWorld(on, { pull: { thumbsUpAt: NOW - 5 * MINUTE, reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 1_000), since: NOW - 2 * MINUTE, idle: true })
+  await $.session.start(START)
+  await clock.settle()
+
+  // The review after the push is relayed; the approval before it is not
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('resuming another conversation mid-poll leaves the note idle rather than running', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { answers: () => clock.sleep(10_000) })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.get('poll:session-b')).toMatchObject({ running: true })
+
+  // The resumed conversation has no pull request to watch
+  w.devSessions = {}
+  await $.classic.SessionStart({ source: 'resume' })
+  await clock.advance(10_000)
+  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
 })
