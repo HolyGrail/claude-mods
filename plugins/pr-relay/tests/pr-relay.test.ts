@@ -687,3 +687,43 @@ test('resuming another conversation watches its pull request instead', async ($,
   await clock.settle()
   expect(w.status).toBe('PR #9 監視中 · 21:00 確認')
 })
+
+test('a session.start that finds no pull request clears the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+
+  w.devSessions = {}
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBeUndefined()
+})
+
+test('pages an earlier poll went through are not asked for again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: {
+      reviews: [{ id: 2, at: NOW - 10 * MINUTE, comments: 0, by: 'someone' }],
+      olderReviews: [{ id: 1, at: NOW - 20 * MINUTE, comments: 4 }],
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.queries).toBe(2)
+
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(3)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('what was relayed for an open pull request outlasts two weeks unwatched', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - 25 * MINUTE, comments: 2 }] } })
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [1], ended: null, at: NOW - 20 * 24 * 60 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.prompts).toEqual([])
+})

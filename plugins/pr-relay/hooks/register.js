@@ -19,8 +19,13 @@ const NO_PR = /no pull requests found/i
 const FINAL_REASONS = ['prompt_input_exit', 'other']
 
 const HOUR_MS = 3_600_000
-// Records untouched this long belong to pull requests nobody watches any more
+// Records of pull requests that ended and are untouched this long are of no more use. One left
+// open keeps what was relayed for it far longer, since a session that finds it again would
+// otherwise be woken for the same events.
 const STALE_MS = 14 * 24 * HOUR_MS
+const OPEN_STALE_MS = 90 * 24 * HOUR_MS
+// Events are paged back only to the previous poll of the same watch, less this much
+const PAGE_OVERLAP_MS = 5 * 60_000
 // How a pull request that is no longer open reads
 const ENDED = { MERGED: 'マージ', CLOSED: 'クローズ' }
 // JST has no daylight saving time, so a fixed offset gives its clock
@@ -42,7 +47,8 @@ const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int
 }`
 const QUERY = queryOf(`state headRefOid commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 
-// The pull request this session watches: { url, owner, name, number, since, sessionFile, ended? },
+// The pull request this session watches: { url, id, owner, name, number, since, sessionFile,
+// pagedAt?, ended? },
 // or null. since is the last push the watch started from; sessionFile the /dev session that
 // named it, whose last_push_at moves on with each push the skill records.
 let watched = null
@@ -73,6 +79,7 @@ export function register(on) {
     lastCheck = null
     offersCleanup = false
     pushedAt = 0
+    showStatus($)
     await $.tool.register({
       name: 'watch',
       description:
@@ -247,7 +254,9 @@ async function poll($, gen) {
   // before (gh pr create, the watch tool) looks for its file until one names it
   const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
   const recordedPush = await lastPushOf($, sessionFile)
-  const answer = await query($, pr, Math.max(pr.since, recordedPush)).then((data) => ({ data }), (error) => ({ error }))
+  // What an earlier poll of this watch paged through is not asked for again
+  const floor = Math.max(pr.since, recordedPush, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
+  const answer = await query($, pr, floor).then((data) => ({ data }), (error) => ({ error }))
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
   if (answer.error) {
@@ -257,7 +266,7 @@ async function poll($, gen) {
   }
   const { data } = answer
   lastCheck = { at: now }
-  if (sessionFile) watched = { ...watched, sessionFile }
+  watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
   const ended = data.state === 'MERGED' || data.state === 'CLOSED'
   if (ended) {
     stop()
@@ -536,7 +545,8 @@ async function prune($) {
   await Promise.all(
     keys.map(async (key) => {
       const record = await $.store.get(key)
-      if (!(record?.at >= cutoff)) await $.store.delete(key)
+      const limit = record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS)
+      if (!(record?.at >= limit)) await $.store.delete(key)
     }),
   )
 }
