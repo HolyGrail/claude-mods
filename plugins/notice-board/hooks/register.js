@@ -18,8 +18,9 @@ let seen = []
 // its refusals against the conversation that follows
 let generation = 0
 // The texts version 0.1 told this session of, from its $.state record, which vouch for its
-// unsigned rows
-let legacy = new Set()
+// unsigned rows. A promise, set along with sessionId and with no wait between, so a load that
+// takes the id takes the record of the same conversation, however long it takes to read
+let legacy = Promise.resolve(new Set())
 // Counts this module's posts, so two in the same millisecond get keys of their own
 let posts = 0
 
@@ -66,7 +67,7 @@ export function register(on) {
     notices = []
     forgetRefusals()
     sessionId = await $.session.id()
-    legacy = await legacyOf($)
+    legacy = legacyOf($)
     await prune($)
     await $.command.register({
       name: 'notice',
@@ -90,8 +91,8 @@ export function register(on) {
     forgetRefusals()
     const result = await next(e)
     sessionId = incoming
+    legacy = legacyOf($)
     forgetRefusals()
-    legacy = await legacyOf($)
     // A fork copies the conversation, and with it what was told before its window. In the queue,
     // so no load of either conversation writes its record meanwhile; one under the new id may have
     // written a record already, from the rows its window shows, so the two are merged. Not awaited:
@@ -108,8 +109,6 @@ export function register(on) {
         await $.store.set(RECORD_PREFIX + target, { at: isRecord(current) ? current.at : record.at, told: merged })
       }).catch(() => {})
     }
-    // Once more, for a load begun while the old version's record or the fork's was still loading
-    forgetRefusals()
     return result
   })
 
@@ -200,6 +199,7 @@ async function load($) {
   // Before any wait, so a restart or a switch that lands during one is seen
   const started = generation
   const id = sessionId
+  const known = legacy
   const repoKey = repoKeyOf(await $.session.repo())
   const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
@@ -221,7 +221,7 @@ async function load($) {
     seen = now
   }
   const secrets = await secretsOf($)
-  const { told, withdrawals } = await toldIn(messages, secrets)
+  const { told, withdrawals } = await toldIn(messages, secrets, await known)
   // A full window may have dropped rows this conversation was told: the record keeps those, less
   // what the window shows was withdrawn since
   const record = await $.store.get(RECORD_PREFIX + id)
@@ -298,7 +298,7 @@ function forgetRefusals() {
 
 // The notices the conversation tells the model of, by key, with their text: each row this module
 // added in order, a withdrawal taking back every notice of its text; and the texts withdrawn
-async function toldIn(messages, secrets) {
+async function toldIn(messages, secrets, legacy) {
   const signs = async (text, r) => {
     for (const secret of secrets) if (r === (await ref(secret, text))) return true
     return false
@@ -321,7 +321,7 @@ async function toldIn(messages, secrets) {
     }
     // A row of version 0.1 counts where that version's record says it told the text
     if (legacy.size === 0) continue
-    const parts = partsV1(message.text)
+    const parts = partsV1(message.text, legacy)
     if (parts === null) continue
     for (const part of parts) {
       const added = TOLD_V1.exec(part)
@@ -342,7 +342,7 @@ async function toldIn(messages, secrets) {
 // Splits a row of version 0.1 into its lines. A body may itself hold a new line that starts like
 // another line, so a body the record lists is taken whole first, the longest such; any other runs
 // to the next line start.
-function partsV1(text) {
+function partsV1(text, legacy) {
   const parts = []
   let rest = text
   while (rest !== '') {

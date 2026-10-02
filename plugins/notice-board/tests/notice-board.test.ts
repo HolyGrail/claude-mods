@@ -63,6 +63,8 @@ function stubHost(
     beforeId = async (): Promise<void> => {},
     // Holds a read of a store key back
     beforeGet = async (key: string): Promise<void> => {},
+    // Holds a read of version 0.1's record back
+    beforeState = async (): Promise<void> => {},
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
@@ -78,7 +80,10 @@ function stubHost(
     await beforeRepo()
     return { value: repo() }
   })
-  on('state.get', () => ({ value: { value: known(), version: 0 } }))
+  on('state.get', async () => {
+    await beforeState()
+    return { value: { value: known(), version: 0 } }
+  })
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
@@ -671,6 +676,37 @@ test("/resume reads the resumed session's version 0.1 record", async ($, on) => 
   host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 1h ago with /notice: CI is paused')]
   await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
   expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
+})
+
+test("a tick while /resume reads version 0.1's record reads the resumed rows with it", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  let known: { id: string; text: string }[] = []
+  let slowState = false
+  const host = stubHost(on, {
+    store,
+    known: () => known,
+    beforeState: async () => {
+      if (!slowState) return
+      slowState = false
+      // A tick lands while the record is read, and is given the time to finish
+      void clock.advance(MINUTE)
+      for (let i = 0; i < 20; i++) await settle()
+    },
+  })
+  on('classic.SessionStart', () => {
+    // The resumed conversation ran version 0.1, which told it the notice
+    known = [{ id: '1-a', text: 'CI is paused' }]
+    host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 1h ago with /notice: CI is paused')]
+    return {}
+  })
+  await $.session.start(START)
+  expect(host.passedOn).toHaveLength(1)
+
+  slowState = true
+  await $.classic.SessionStart({ source: 'resume' })
+  await settle()
+  expect(host.passedOn).toHaveLength(1)
 })
 
 test('a version 0.1 row whose body holds a line like a withdrawal is read whole', async ($, on) => {
