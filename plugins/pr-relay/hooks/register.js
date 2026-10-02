@@ -104,6 +104,8 @@ let offersCleanup = false
 // Notes hold the same objects, so a push that finishes after the session turned to another pull
 // request still updates the note it was in.
 let pushes = []
+// How many pushes this session started for each pull request
+const pushStarts = new Map()
 // The session id as last asked, so a push need not wait on it
 let sessionId = null
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
@@ -194,6 +196,7 @@ export function register(on) {
     let push = null
     if (pushing) {
       push = { at: startedAt, head: null, shas: null, running: true }
+      if (prId) pushStarts.set(prId, (pushStarts.get(prId) ?? 0) + 1)
       pushes.push(push)
       for (const note of notesOf(prId)) {
         note.pending = [...note.pending.filter((p) => p !== push), push]
@@ -452,6 +455,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     }
   }
 
+  let started = 0
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
     const writeAt = await $.clock.now()
@@ -463,6 +467,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // what its note said
     const owns = watched?.id === pr.id
     const noted = Math.max(othersSince, owns ? knownSince : note.since)
+    started = pushStarts.get(pr.id) ?? 0
     const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
@@ -471,6 +476,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     record.at = now
     if (data.headRefOid) record.headAt = seenAt
     await $.store.set(key, record)
+    // A write that landed past the lease may have gone over a session that took the round over and
+    // relayed the same, so this one sends nothing; $.store has no conditional write to stop it
+    if (lapsed(now, await $.clock.now())) return LATE
     // Pages are skipped next time only once what they held is in the record: a session that leaves
     // the waking to another goes through them again in case that one never writes it
     if (gen === generation) watched = { ...watched, pagedAt: now }
@@ -481,8 +489,10 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
-  // A push this session started meanwhile may be replacing the head they were read from
-  const current = (gen === generation || ended) && !(watched?.id === pr.id && pushes.some((push) => push.running))
+  // A push this session started meanwhile, running or already done, may have replaced the head
+  // they were read from
+  const pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
+  const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => push.running))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
   showStatus($)
 }
@@ -563,7 +573,9 @@ async function notePoll($, pr, gen) {
   }
   lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, serial: ++noteSerial }
   await writeNote($, lastNote, { strict: true })
-  return { ...lastNote }
+  // A note other sessions wrote while this one's was on its way may have been elected without
+  // seeing it, so the poll yields to those too
+  return { ...lastNote, landedAt: await $.clock.now() }
 }
 
 // Marks the note of a poll that has written what it relayed as finished, with what it now knows
@@ -731,7 +743,11 @@ async function readNotes($, pr, note) {
     }
     // A poll that left the round to another holds nothing back either: polls a few seconds apart
     // would otherwise each yield to the one before, round after round, and none would relay
-    if (other.idle || other.deferred || other.at > note.at) continue
+    if (other.idle || other.deferred) continue
+    if (other.at > note.at) {
+      if (other.at <= (note.landedAt ?? note.at)) defers = true
+      continue
+    }
     if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }

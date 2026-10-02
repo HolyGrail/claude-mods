@@ -2019,3 +2019,60 @@ test('a push before the first note goes out without waiting on the session id', 
   await clock.advance(MINUTE)
   await push
 })
+
+test('a push that started and finished while the record was written still holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const record = 'pr:' + URL.toLowerCase()
+  w.sets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  w.sets = undefined
+})
+
+test('a record write that lands past the lease sends nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  w.answers = () => clock.sleep(9 * MINUTE)
+  await $.session.start(START)
+  await clock.advance(1_000)
+  // GitHub answers in time, and the record is slow to land
+  w.sets = async (key) => {
+    if (key.startsWith('pr:')) await clock.sleep(MINUTE)
+  }
+  await clock.advance(10 * MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('poll outlasted its turn')
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  w.sets = undefined
+  w.answers = async () => {}
+  await clock.advance(10 * MINUTE)
+})
+
+test('a poll yields to a note written while its own was on its way', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  // The next poll's note is slow to land, and another session starts its poll meanwhile
+  let writes = 0
+  w.sets = async (key) => {
+    if (key === NOTE && ++writes === 1) await clock.sleep(20_000)
+  }
+  await clock.advance(MINUTE + 5_000)
+  w.store.set('poll:session-a', pollNote(NOW + MINUTE + 5_000))
+  await clock.advance(20_000)
+  expect(w.prompts).toEqual([])
+})
