@@ -817,8 +817,8 @@ test('a session that polls in the same round as an earlier one leaves the waking
   await clock.settle()
 
   expect(w.prompts).toEqual([])
-  // Its mark is left to the session that relays, so nothing is lost if that one never does
-  expect((w.store.get('pr:' + URL.toLowerCase()) as { reviews: number[] }).reviews).toEqual([])
+  // The record is left to the session that relays, so nothing is lost if that one never does
+  expect(w.store.has('pr:' + URL.toLowerCase())).toBe(false)
 })
 
 test('a session whose poll started at the same moment yields only to a smaller key', async ($, on) => {
@@ -852,7 +852,7 @@ test('a poll of another pull request holds nothing back', async ($, on) => {
   expect(w.prompts.length).toBe(1)
 })
 
-test('a push seen by a session that leaves the waking to another still moves the shared baseline', async ($, on) => {
+test('a push seen by a session that leaves the waking to another goes out in its note', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
@@ -865,7 +865,44 @@ test('a push seen by a session that leaves the waking to another still moves the
   w.pull.head = 'b2'
   w.store.set('poll:session-a', pollNote(NOW + MINUTE - 1_000))
   await clock.advance(40_000)
-  expect((w.store.get('pr:' + URL.toLowerCase()) as { since: number }).since).toBe(NOW + 20_000)
+  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW + MINUTE, since: NOW + 20_000 })
+})
+
+test('the session that relays takes the last push from the other sessions\' notes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Codex approved before a push only another session saw, which polled in an earlier round
+  const w = stubWorld(on, { pull: { thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: NOW - 2 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.prompts).toEqual([])
+  expect((w.store.get('pr:' + URL.toLowerCase()) as { since: number }).since).toBe(NOW - 2 * MINUTE)
+})
+
+test('a session that leaves the waking to another never writes over the record, even for a reopened pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The copy both sessions read, before the leader cleared ended and marked the review
+  const closed = { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'CLOSED', at: NOW - MINUTE }
+  w.store.set('pr:' + URL.toLowerCase(), closed)
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.store.get('pr:' + URL.toLowerCase())).toEqual(closed)
+  expect(w.prompts).toEqual([])
+})
+
+test('a tick that comes while a poll still waits on GitHub leaves that poll its note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { answers: () => clock.sleep(70_000) })
+  await $.session.start(START)
+  await clock.settle()
+
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(1)
+  expect(w.store.get('poll:session-b')).toMatchObject({ at: NOW })
 })
 
 test('a poll that could not ask GitHub takes its note back', async ($, on) => {
@@ -883,7 +920,7 @@ test('a session that ends takes its poll note away', async ($, on) => {
   on('session.end', () => ({ sessionId: 'session-b' }))
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.get('poll:session-b')).toEqual(pollNote(NOW))
+  expect(w.store.get('poll:session-b')).toMatchObject(pollNote(NOW))
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
   expect(w.store.has('poll:session-b')).toBe(false)

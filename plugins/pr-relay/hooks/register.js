@@ -12,9 +12,10 @@ const DEV_SESSIONS = '/.claude/dev-sessions'
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
 const KEY_PREFIX = 'pr:'
-// Each session notes under this prefix plus its id when it last started a poll, as { pr, at }, so
-// sessions polling the same pull request together let only the first of them relay. A session
-// writes only its own key, since $.store has no atomic update.
+// Each session notes under this prefix plus its id when it last started a poll, as { pr, at, since },
+// so sessions polling the same pull request together let only the first of them relay. since is the
+// last push the session knows of, which the session that relays takes from it. A session writes
+// only its own key, since $.store has no atomic update.
 const POLL_PREFIX = 'poll:'
 // Polls of one pull request that started this close together are one round: the one that started
 // first relays what is new, and the others leave it to that one. The query a poll waits on takes
@@ -70,6 +71,11 @@ let lastCheck = null
 let lookupFailure = null
 // The store key this session's poll note was last written under; /clear and /resume change the id
 let pollKey = null
+// The generation of the poll running now, so a tick that comes while one still waits on GitHub
+// leaves it its note rather than overwriting it with a later round's
+let polling = null
+// The last push this session knows of for the watched pull request, which its poll note carries
+let knownSince = 0
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
 // When this session last ran git push. It becomes the baseline only once the pull request's head
@@ -262,6 +268,7 @@ function watch($, { url, since, sessionFile = null }) {
   if (watched && !watched.ended && watched.id !== pr.id) pushedAt = 0
   watched = { ...pr, since, sessionFile }
   lookupFailure = null
+  knownSince = 0
   // The band may still offer the cleanup of the pull request watched before
   if (offersCleanup) {
     offersCleanup = false
@@ -279,6 +286,16 @@ function stop() {
 }
 
 async function poll($, gen) {
+  if (polling === gen) return
+  polling = gen
+  try {
+    await pollOnce($, gen)
+  } finally {
+    if (polling === gen) polling = null
+  }
+}
+
+async function pollOnce($, gen) {
   if (gen !== generation || !watched || watched.ended) return
   const pr = watched
   const key = KEY_PREFIX + pr.id
@@ -303,8 +320,8 @@ async function poll($, gen) {
   }
   const { data } = answer
   // Another session polling this pull request in the same round, ahead of this one, relays what is
-  // new; this one still records what it knows of the pull request, such as a push it saw
-  const defers = await yieldsTo($, pr, note)
+  // new; this one leaves the record to it and passes on what it knows through its note
+  const { defers, since: othersSince } = await readNotes($, pr, note)
   lastCheck = { at: now }
   watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
   const ended = data.state === 'MERGED' || data.state === 'CLOSED'
@@ -321,11 +338,17 @@ async function poll($, gen) {
     const record = normalize(await $.store.get(key))
     // A watch that began while this waited its turn owns pushedAt and the marks now
     if (gen !== generation && !ended) return null
-    const stored = JSON.stringify(record)
-    const sends = update($, pr, data, record, recordedPush, defers)
-    // The session that relays writes the record at about this moment; one leaving it the waking
-    // writes only what it adds, so that its copy, read before the marks, rarely lands over them
-    if (defers && JSON.stringify(record) === stored) return sends
+    const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), defers)
+    // The session that relays writes the record at about this moment, so a copy read before its
+    // marks must not land over them: one that leaves it the waking writes only its own note
+    if (defers) {
+      if (record.since > knownSince) {
+        knownSince = record.since
+        await $.store.set(note.key, { pr: note.pr, at: note.at, since: knownSince }).catch(() => {})
+      }
+      return sends
+    }
+    knownSince = Math.max(knownSince, record.since)
     record.at = now
     await $.store.set(key, record)
     return sends
@@ -340,12 +363,12 @@ async function poll($, gen) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush, defers) {
+function update($, pr, data, record, recordedPush, notedPush, defers) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
   const committedAt = Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0
-  record.since = Math.max(record.since, pr.since, recordedPush, committedAt)
+  record.since = Math.max(record.since, pr.since, recordedPush, committedAt, notedPush)
   if (pushedAt && data.headRefOid !== record.head) {
     record.since = Math.max(record.since, pushedAt)
     pushedAt = 0
@@ -369,23 +392,27 @@ async function notePoll($, pr, at) {
   // The note under the id before /clear or /resume would read as another session's
   if (pollKey && pollKey !== key) await $.store.delete(pollKey).catch(() => {})
   pollKey = key
-  const note = { pr: pr.id, at }
+  const note = { pr: pr.id, at, since: knownSince }
   await $.store.set(key, note).catch(() => {})
   return { key, ...note }
 }
 
-// Whether another session's poll of the same pull request started in the same round before this
-// one's (or at the same moment, under a smaller key), so that every session agrees on the one that
-// relays. One that stopped polling or failed drops out of the next round by itself.
-async function yieldsTo($, pr, note) {
+// What the other sessions' notes on the same pull request say: defers, whether one of them started
+// its poll in the same round before this one's (or at the same moment, under a smaller key), so
+// that every session agrees on the one that relays; and since, the latest push any of them knows.
+// One that stopped polling or failed drops out of the next round by itself.
+async function readNotes($, pr, note) {
   const keys = (await $.store.keys().catch(() => [])).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
+  let defers = false
+  let since = 0
   for (const key of keys) {
     const other = await $.store.get(key).catch(() => undefined)
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
+    if (typeof other.since === 'number') since = Math.max(since, other.since)
     if (other.at < note.at - ROUND_MS || other.at > note.at) continue
-    if (other.at < note.at || key < note.key) return true
+    if (other.at < note.at || key < note.key) defers = true
   }
-  return false
+  return { defers, since }
 }
 
 // Takes this session's poll note away, so it holds back no other session
