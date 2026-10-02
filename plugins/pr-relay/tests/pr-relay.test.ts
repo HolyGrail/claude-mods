@@ -102,6 +102,8 @@ type World = {
   sets?: (key: string) => Promise<void>
   // Whether reading a key of the store fails
   getFails?: (key: string) => boolean
+  // What asking for the session id waits for
+  ids?: () => Promise<void>
   // The pull requests other than the one in pull, by number
   pulls?: Record<number, Pull>
   // The argument vectors of the gh api calls
@@ -144,7 +146,10 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   mock.env(on, { HOME: '/home' })
   on('session.start', () => ({ cwd: WORKTREE }))
   on('session.cwd', () => ({ value: WORKTREE }))
-  on('session.id', () => ({ value: w.sessionId }))
+  on('session.id', async () => {
+    await w.ids?.()
+    return { value: w.sessionId }
+  })
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-relay__${e.name}` } }))
   on('fs.list', () => ({
     value: Object.keys(w.devSessions).map((name) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
@@ -1901,4 +1906,70 @@ test('a merge seen as the watch turns keeps the next pull request\'s baseline ou
   await clock.settle()
   expect((w.store.get(record) as { since: number; ended: string }).ended).toBe('MERGED')
   expect((w.store.get(record) as { since: number }).since).toBeLessThan(NOW + 30_000)
+})
+
+test('a poll note is timed once the session id is known', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  // The next poll waits on the session id while another session starts its poll and asks GitHub
+  let slow = true
+  w.ids = async () => {
+    if (!slow) return
+    slow = false
+    await clock.sleep(20_000)
+  }
+  await clock.advance(MINUTE + 5_000)
+  w.store.set('poll:session-a', pollNote(NOW + MINUTE + 5_000))
+  await clock.advance(30_000)
+  // That session started first, so it relays
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ at: NOW + MINUTE + 20_000 })
+})
+
+test('a push goes out running before its head is looked up', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // The record that holds the head is slow to read
+  const record = 'pr:' + URL.toLowerCase()
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(1_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW, running: true }] })
+  await clock.advance(10_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW, head: 'a1', running: true }] })
+  w.gets = undefined
+  await clock.advance(MINUTE)
+  await push
+})
+
+test('a push still running for the last pull request holds back nothing for the next', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pulls: { 9: { reviews: [{ id: 5, at: NOW + 30_000, comments: 1 }] } } })
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(5 * MINUTE)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(1_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9, since: iso(NOW) })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  await clock.advance(5 * MINUTE)
+  await push
 })

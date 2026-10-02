@@ -106,7 +106,6 @@ let offersCleanup = false
 let pushes = []
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
-let pushesRunning = 0
 // The read, change and write of a record in this session, one after another: a poll and a send
 // that takes its mark back would otherwise each write what they read before the other wrote
 let writes = Promise.resolve()
@@ -197,8 +196,6 @@ export function register(on) {
         note.pending = [...note.pending.filter((p) => p !== push), push]
         note.dirty = true
       }
-      pushesRunning += 1
-      push.head = await headBefore($, prId)
       // A pull request with no note yet (its first poll still reads the session file, or the watch
       // turned away first) gets an idle one, so the other sessions see the push run; the first poll
       // takes it up
@@ -206,16 +203,21 @@ export function register(on) {
         const key = `${POLL_PREFIX}${await $.session.id()}:${prId}`
         if (!notesOf(prId).length) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
       }
-      // The other sessions hold back their relays only if they can see the push; a store that
-      // will not take it is shown rather than holding up the push
-      await refreshNote($, { strict: true }).catch((error) => {
-        lastCheck = { at: startedAt, error: `push note: ${error?.message ?? error}` }
-        showStatus($)
-      })
+      // The other sessions hold back their relays only if they can see the push, so it goes out
+      // running before its head is looked up, and again with the head; a store that will not take
+      // it is shown rather than holding up the push
+      const publish = () =>
+        refreshNote($, { strict: true }).catch((error) => {
+          lastCheck = { at: startedAt, error: `push note: ${error?.message ?? error}` }
+          showStatus($)
+        })
+      await publish()
+      push.head = await headBefore($, prId)
+      for (const note of notesOf(prId)) note.dirty = true
+      await publish()
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null } = {}) => {
-      pushesRunning -= 1
       push.running = false
       if (dropped) push.dropped = true
       else push.shas = shas
@@ -370,8 +372,6 @@ async function pollOnce($, gen) {
   // before (gh pr create, the watch tool) looks for its file until one names it
   const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
   const recordedPush = await lastPushOf($, sessionFile)
-  // Read just before the note goes out, since the time is this poll's place in the election
-  const now = await $.clock.now()
   // A watch that began while this read the session file owns what the session knows now
   if (gen !== generation) return
   // What an earlier poll of this watch paged through is not asked for again
@@ -380,12 +380,13 @@ async function pollOnce($, gen) {
   // with the pushes known already, so a session that relays before this one finishes counts them
   knownSince = Math.max(knownSince, pr.since, recordedPush)
   // A poll the other sessions cannot see would relay beside the one they elect, so it waits a tick
-  const note = await notePoll($, pr, now, gen).catch((error) => {
-    lastCheck = { at: now, error: `poll note: ${error?.message ?? error}` }
+  const note = await notePoll($, pr, gen).catch(async (error) => {
+    lastCheck = { at: await $.clock.now(), error: `poll note: ${error?.message ?? error}` }
     showStatus($)
     return null
   })
   if (!note) return
+  const now = note.at
   try {
     await pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note })
   } finally {
@@ -525,14 +526,18 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   }
   // A reopened pull request ends again, and that end is news again
   record.ended = null
-  // A push running in any session may be replacing the head GitHub still shows
-  return pushesRunning > 0 || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
+  // A push running in any session may be replacing the head GitHub still shows; this session's
+  // own are those it bound to this pull request
+  const running = pushes.some((push) => push.running)
+  return running || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
 }
 
 // Notes that this session starts a poll of the pull request now, and returns the note
-async function notePoll($, pr, at, gen) {
+async function notePoll($, pr, gen) {
   // One note per pull request, so a session that turns to another leaves this one's push behind
   const key = `${POLL_PREFIX}${await $.session.id()}:${pr.id}`
+  // Read just before the note goes out, since the time is this poll's place in the election
+  const at = await $.clock.now()
   if (gen !== generation) return null
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
