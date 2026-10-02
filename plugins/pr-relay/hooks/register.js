@@ -12,15 +12,19 @@ const DEV_SESSIONS = '/.claude/dev-sessions'
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
 const KEY_PREFIX = 'pr:'
-// Each session notes under this prefix plus its id when it last started a poll, as { pr, at, since },
-// so sessions polling the same pull request together let only the first of them relay. since is the
-// last push the session knows of, which the session that relays takes from it. A session writes
-// only its own key, since $.store has no atomic update.
+// Each session notes under this prefix plus its id when it last started a poll, as { pr, at, since,
+// running }, so sessions polling the same pull request together let only the first of them relay.
+// since is the last push the session knows of, which the session that relays takes from it;
+// running stays set until the poll has written what it relayed. A session writes only its own key,
+// since $.store has no atomic update.
 const POLL_PREFIX = 'poll:'
 // Polls of one pull request that started this close together are one round: the one that started
 // first relays what is new, and the others leave it to that one. The query a poll waits on takes
 // far longer than a store write, so each of them sees the earlier one's note by the time it reads.
 const ROUND_MS = 30_000
+// A poll still running holds back the later ones of other sessions past its round, since it has not
+// written what it relayed yet; one this old is taken to belong to a session that died mid-poll
+const RUNNING_MS = 10 * 60_000
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // What gh pr view says when the branch has no pull request, as opposed to failing to ask
 const NO_PR = /no pull requests found/i
@@ -76,6 +80,8 @@ let pollKey = null
 let polling = null
 // The last push this session knows of for the watched pull request, which its poll note carries
 let knownSince = 0
+// When this session's latest poll note was written, so an older poll does not mark it finished
+let latestNoteAt = null
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
 // When this session last ran git push. It becomes the baseline only once the pull request's head
@@ -306,8 +312,18 @@ async function pollOnce($, gen) {
   const recordedPush = await lastPushOf($, sessionFile)
   // What an earlier poll of this watch paged through is not asked for again
   const floor = Math.max(pr.since, recordedPush, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
-  // Noted before asking, so a session that starts polling while this one waits on GitHub finds it
+  // Noted before asking, so a session that starts polling while this one waits on GitHub finds it,
+  // with the pushes known already, so a session that relays before this one finishes counts them
+  knownSince = Math.max(knownSince, pr.since, recordedPush)
   const note = await notePoll($, pr, now)
+  try {
+    await pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note })
+  } finally {
+    await finishNote($, note)
+  }
+}
+
+async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note }) {
   const answer = await query($, pr, floor).then((data) => ({ data }), (error) => ({ error }))
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
@@ -341,14 +357,8 @@ async function pollOnce($, gen) {
     const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), defers)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
-    if (defers) {
-      if (record.since > knownSince) {
-        knownSince = record.since
-        await $.store.set(note.key, { pr: note.pr, at: note.at, since: knownSince }).catch(() => {})
-      }
-      return sends
-    }
     knownSince = Math.max(knownSince, record.since)
+    if (defers) return sends
     record.at = now
     await $.store.set(key, record)
     return sends
@@ -392,15 +402,22 @@ async function notePoll($, pr, at) {
   // The note under the id before /clear or /resume would read as another session's
   if (pollKey && pollKey !== key) await $.store.delete(pollKey).catch(() => {})
   pollKey = key
-  const note = { pr: pr.id, at, since: knownSince }
+  latestNoteAt = at
+  const note = { pr: pr.id, at, since: knownSince, running: true }
   await $.store.set(key, note).catch(() => {})
   return { key, ...note }
 }
 
+// Marks the note of a poll that has written what it relayed as finished, with what it now knows
+async function finishNote($, note) {
+  if (pollKey !== note.key || latestNoteAt !== note.at) return
+  await $.store.set(note.key, { pr: note.pr, at: note.at, since: knownSince }).catch(() => {})
+}
+
 // What the other sessions' notes on the same pull request say: defers, whether one of them started
-// its poll in the same round before this one's (or at the same moment, under a smaller key), so
-// that every session agrees on the one that relays; and since, the latest push any of them knows.
-// One that stopped polling or failed drops out of the next round by itself.
+// its poll before this one's (or at the same moment, under a smaller key) in the same round, or is
+// still running it, so that every session agrees on the one that relays; and since, the latest push
+// any of them knows. One that stopped polling or failed drops out of the next round by itself.
 async function readNotes($, pr, note) {
   const keys = (await $.store.keys().catch(() => [])).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
   let defers = false
@@ -409,7 +426,8 @@ async function readNotes($, pr, note) {
     const other = await $.store.get(key).catch(() => undefined)
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
     if (typeof other.since === 'number') since = Math.max(since, other.since)
-    if (other.at < note.at - ROUND_MS || other.at > note.at) continue
+    if (other.at > note.at) continue
+    if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
   return { defers, since }

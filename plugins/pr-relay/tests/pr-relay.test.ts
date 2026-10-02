@@ -951,3 +951,34 @@ test('a session that leaves the waking to another and knows nothing new does not
   expect(w.store.get('pr:' + URL.toLowerCase())).toEqual(relayed)
   expect(w.prompts).toEqual([])
 })
+
+test('a poll of another session still running past its round keeps holding back later ones', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The other session's query has been waiting on GitHub for over a minute
+  w.store.set('poll:session-a', { ...pollNote(NOW - 70_000), since: 0, running: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a poll left running by a session that died holds nothing back for long', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 11 * MINUTE), since: 0, running: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a poll note carries the push the session file records from the start', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { answers: () => clock.sleep(10_000) })
+  await $.session.start(START)
+  await clock.settle()
+  // Still waiting on GitHub, so a session that relays meanwhile counts the push
+  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, running: true })
+
+  await clock.advance(10_000)
+  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+})
