@@ -26,19 +26,21 @@ const ENDED = { MERGED: 'マージ', CLOSED: 'クローズ' }
 // JST has no daylight saving time, so a fixed offset gives its clock
 const JST_OFFSET_MS = 9 * HOUR_MS
 
-// The newest events come last, and only those after the last push count, so the tail suffices
-const QUERY = `query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      state
-      headRefOid
-      commits(last: 1) { nodes { commit { committedDate } } }
-      reactionGroups { content reactors(last: 20) { edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }
-      reviews(last: 30) { nodes { databaseId submittedAt author { login } comments { totalCount } } }
-      comments(last: 50) { nodes { createdAt author { login } body } }
-    }
-  }
+// The newest events come last, and only those after the last push count. A page holds 100, the
+// most GraphQL gives; a connection whose oldest item on it is still after the push is followed
+// back a page at a time, up to MAX_PAGES.
+const PAGE = 'last: 100, before: $before'
+const PAGE_INFO = 'pageInfo { hasPreviousPage startCursor }'
+const CONNECTIONS = {
+  reactors: `reactionGroups { content reactors(${PAGE}) { ${PAGE_INFO} edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }`,
+  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { databaseId submittedAt author { login } comments { totalCount } } }`,
+  comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { createdAt author { login } body } }`,
+}
+const MAX_PAGES = 10
+const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int!, $before: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
+const QUERY = queryOf(`state headRefOid commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 
 // The pull request this session watches: { url, owner, name, number, since, sessionFile, ended? },
 // or null. since is the last push the watch started from; sessionFile the /dev session that
@@ -120,14 +122,20 @@ export function register(on) {
     const pushes = !creates && /\bgit\s+push\b/.test(command)
     if (!creates && !pushes) return next(e)
     const startedAt = await $.clock.now()
+    // Codex reviews what was pushed, so its earlier activity says nothing about this push. The time
+    // is set before the push runs, so a poll that sees the new head while it is still finishing
+    // already applies it, and put back if the push failed.
+    const before = pushedAt
+    if (pushes) pushedAt = startedAt
     const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError) return ran
+    if (ran.deny !== undefined || ran.isError) {
+      if (pushes && pushedAt === startedAt) pushedAt = before
+      return ran
+    }
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
     } else {
-      // Codex reviews what was pushed, so its earlier activity says nothing about this push
-      pushedAt = startedAt
       if (!watched || watched.ended) timers.push($.clock.after(0, () => discover($, { branchOnly: true })))
     }
     return ran
@@ -175,7 +183,10 @@ async function discover($, { branchOnly = false } = {}) {
   if (watched && !watched.ended) return
   const gen = generation
   if (!branchOnly) await prune($)
-  const found = (branchOnly ? null : await findInDevSessions($)) ?? (await findForBranch($))
+  // A /dev session that owns the cwd but has no pull request yet answers false: its own gh pr
+  // create starts the watch, not whatever the branch had before
+  const owned = branchOnly ? null : await findInDevSessions($)
+  const found = owned === false ? null : (owned ?? (await findForBranch($)))
   if ((watched && !watched.ended) || gen !== generation) return
   if (found) watch($, found)
   else if (found === undefined) timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
@@ -211,10 +222,8 @@ async function poll($, gen) {
   // /dev writes the session's pr_url only after the pull request exists, so a watch that began
   // before (gh pr create, the watch tool) looks for its file until one names it
   const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
-  const [answer, recordedPush] = await Promise.all([
-    query($, pr).then((data) => ({ data }), (error) => ({ error })),
-    lastPushOf($, sessionFile),
-  ])
+  const recordedPush = await lastPushOf($, sessionFile)
+  const answer = await query($, pr, Math.max(pr.since, recordedPush)).then((data) => ({ data }), (error) => ({ error }))
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
   if (answer.error) {
@@ -377,14 +386,52 @@ function read(data, since) {
   return { approvedAt, usageLimitAt, reviews }
 }
 
-async function query($, pr) {
+// The pull request, with every connection followed back until it reaches the last push: the
+// head commit's date, or since when that is later
+async function query($, pr, since) {
+  const data = await graphql($, pr, QUERY)
+  const floor = Math.max(since, Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0)
+  for (const kind of Object.keys(CONNECTIONS)) {
+    let page = pageOf(data, kind)
+    for (let n = 1; page?.pageInfo?.hasPreviousPage && oldest(kind, page) > floor && n < MAX_PAGES; n++) {
+      const older = pageOf(await graphql($, pr, queryOf(CONNECTIONS[kind]), page.pageInfo.startCursor), kind)
+      if (!older) break
+      const items = kind === 'reactors' ? 'edges' : 'nodes'
+      older[items] = [...(older[items] ?? []), ...(page[items] ?? [])]
+      setPage(data, kind, older)
+      page = older
+    }
+  }
+  return data
+}
+
+// One page of a connection; the reactors that matter are the thumbs-up's
+function pageOf(data, kind) {
+  if (kind !== 'reactors') return data[kind]
+  return data.reactionGroups?.find((group) => group.content === 'THUMBS_UP')?.reactors
+}
+
+function setPage(data, kind, page) {
+  if (kind !== 'reactors') data[kind] = page
+  else data.reactionGroups.find((group) => group.content === 'THUMBS_UP').reactors = page
+}
+
+// When the oldest item on a page happened
+function oldest(kind, page) {
+  if (kind === 'reactors') return Date.parse(page.edges?.[0]?.reactedAt ?? '') || 0
+  if (kind === 'reviews') return Date.parse(page.nodes?.[0]?.submittedAt ?? '') || 0
+  return Date.parse(page.nodes?.[0]?.createdAt ?? '') || 0
+}
+
+async function graphql($, pr, document, before) {
   const { exitCode, stdout, stderr } = await $.process.run([
     'gh', 'api', 'graphql',
-    '-f', `query=${QUERY}`,
+    '-f', `query=${document}`,
     // -f keeps a repository named like a number or a boolean a string; -F types the number
     '-f', `owner=${pr.owner}`,
     '-f', `name=${pr.name}`,
     '-F', `number=${pr.number}`,
+    ...(before ? ['-f', `before=${before}`] : []),
   ])
   if (exitCode !== 0) throw new Error(stderr.trim().split('\n')[0] || `gh exited ${exitCode}`)
   const data = JSON.parse(stdout)?.data?.repository?.pullRequest
@@ -392,8 +439,9 @@ async function query($, pr) {
   return data
 }
 
-// The /dev session whose worktree holds this session's cwd, with an open pull request; the
-// deepest worktree wins, so one nested in another repository's checkout is not taken for it
+// The pull request of the /dev session whose worktree holds this session's cwd: null when no
+// session does, false when the one that does has none open. The deepest worktree wins, so one
+// nested in another repository's checkout is not taken for it.
 async function findInDevSessions($) {
   const [{ files, sessions }, cwd] = await Promise.all([readDevSessions($), $.session.cwd()])
   let best = null
@@ -404,7 +452,8 @@ async function findInDevSessions($) {
   })
   // The session that owns the cwd decides, even when it has no pull request yet
   const session = best?.session
-  if (session?.status !== 'pr-open' || !PR_URL.test(session.pr_url ?? '')) return null
+  if (!session) return null
+  if (session.status !== 'pr-open' || !PR_URL.test(session.pr_url ?? '')) return false
   return { url: session.pr_url, since: lastPush(session), sessionFile: best.file }
 }
 

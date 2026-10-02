@@ -33,12 +33,27 @@ type Pull = {
   head?: string
   committedAt?: number
   thumbsUpAt?: number
-  reviews?: { id: number; at: number; comments: number }[]
+  reviews?: { id: number; at: number; comments: number; by?: string }[]
+  // Reviews on the page before the newest, which gh hands out for the cursor 'older'
+  olderReviews?: { id: number; at: number; comments: number; by?: string }[]
   comments?: { at: number; body: string }[]
 }
 
-// What gh api graphql answers for a pull request in this state
-function graphql(pull: Pull) {
+const reviewNodes = (reviews: NonNullable<Pull['reviews']>) =>
+  reviews.map((r) => ({
+    databaseId: r.id,
+    submittedAt: iso(r.at),
+    author: { login: r.by ?? 'chatgpt-codex-connector' },
+    comments: { totalCount: r.comments },
+  }))
+
+// What gh api graphql answers for a pull request in this state, or for the page before
+function graphql(pull: Pull, before?: string) {
+  if (before === 'older') {
+    return JSON.stringify({
+      data: { repository: { pullRequest: { reviews: { pageInfo: { hasPreviousPage: false }, nodes: reviewNodes(pull.olderReviews ?? []) } } } },
+    })
+  }
   const pullRequest = {
     state: pull.state ?? 'OPEN',
     headRefOid: pull.head ?? 'a1',
@@ -52,12 +67,8 @@ function graphql(pull: Pull) {
       },
     ],
     reviews: {
-      nodes: (pull.reviews ?? []).map((r) => ({
-        databaseId: r.id,
-        submittedAt: iso(r.at),
-        author: { login: 'chatgpt-codex-connector' },
-        comments: { totalCount: r.comments },
-      })),
+      pageInfo: { hasPreviousPage: Boolean(pull.olderReviews), startCursor: 'older' },
+      nodes: reviewNodes(pull.reviews ?? []),
     },
     comments: {
       nodes: (pull.comments ?? []).map((c) => ({ createdAt: iso(c.at), author: { login: 'chatgpt-codex-connector' }, body: c.body })),
@@ -129,7 +140,8 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     w.queries += 1
     w.queryArgv.push(e.argv)
     await w.answers()
-    return run(0, graphql(w.pull))
+    const before = e.argv.find((arg) => arg.startsWith('before='))?.slice('before='.length)
+    return run(0, graphql(w.pull, before))
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }))
   on('store.get', ($, e) => ({ value: w.store.get(e.key) }))
@@ -366,6 +378,8 @@ test('the worktree that holds the cwd decides, even before its pull request exis
       'parent.json': devSession({ worktree_path: '/repo', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/2' }),
       'feature.json': devSession({ status: 'in-progress', pr_url: null }),
     },
+    // The branch has an older pull request of its own
+    branchPr: { url: 'https://github.com/HolyGrail/claude-mods/pull/5', state: 'OPEN' },
   })
   await $.session.start(START)
   await clock.settle()
@@ -562,4 +576,42 @@ test('the cleanup button comes back when its prompt does not enter', async ($, o
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('/dev cleanup')])
   expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+})
+
+test('a push still running when a poll sees its head already counts as the baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  // The push takes over a minute, and GitHub has the new head before it returns
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30_000)
+    w.pull.head = 'b2'
+    await clock.sleep(60_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex approved the previous push, and the reaction keeps that time
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(MINUTE + 30_000)
+  await push
+  expect(w.prompts).toEqual([])
+})
+
+test('a Codex review pushed off the newest page by later reviews is still found', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: {
+      // The newest page is all other reviewers', still after the last push
+      reviews: [{ id: 2, at: NOW - 2 * MINUTE, comments: 0, by: 'someone' }],
+      olderReviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 4 }],
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.queries).toBe(2)
+  expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
 })
