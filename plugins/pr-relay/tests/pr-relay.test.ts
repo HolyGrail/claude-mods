@@ -88,6 +88,8 @@ type World = {
   turnStarts: () => Promise<void>
   // What gh api graphql waits for before it answers
   answers: () => Promise<void>
+  // What reading a /dev session file waits for
+  reads: () => Promise<void>
   // What gh api graphql fails with, when it does
   queryError?: string
   // The argument vectors of the gh api calls
@@ -124,6 +126,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     queryArgv: [],
     turnStarts: async () => {},
     answers: async () => {},
+    reads: async () => {},
     ...world,
   }
   mock.env(on, { HOME: '/home' })
@@ -134,7 +137,10 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   on('fs.list', () => ({
     value: Object.keys(w.devSessions).map((name) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
   }))
-  on('fs.read', ($, e) => ({ value: JSON.stringify(w.devSessions[e.path.split('/').pop() ?? '']) }))
+  on('fs.read', async ($, e) => {
+    await w.reads()
+    return { value: JSON.stringify(w.devSessions[e.path.split('/').pop() ?? '']) }
+  })
   on('process.run', async ($, e) => {
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
@@ -1058,4 +1064,54 @@ test('a poll note carries a push this session ran before GitHub has its head', a
   w.answers = () => clock.sleep(10_000)
   await clock.advance(40_000)
   expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW + 20_000, head: 'a1' }, running: true })
+})
+
+test('a poll note is timed when it goes out, not before a slow read of the session file', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.reads = () => clock.sleep(5_000)
+  w.answers = () => clock.sleep(10_000)
+  await clock.advance(MINUTE + 5_000)
+  expect(w.store.get(NOTE)).toMatchObject({ at: NOW + MINUTE + 5_000, running: true })
+})
+
+test('a push started while a poll waits on GitHub goes into that poll\'s note at once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.answers = () => clock.sleep(30_000)
+  await clock.advance(MINUTE)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW + MINUTE, head: 'a1' }, running: true })
+})
+
+test('turning to another pull request keeps the push the last one\'s note was handing on', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // GitHub has not shown the push's head when the session turns to another pull request
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
+  await clock.settle()
+  expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW + 20_000, head: 'a1' }, idle: true })
+})
+
+test('a push another session ran before it saw any head does not count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', thumbsUpAt: NOW - 5 * MINUTE } })
+  // The other session pushed before its first poll, so it cannot tell whether the push moved anything
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - 2 * MINUTE, head: null } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
 })
