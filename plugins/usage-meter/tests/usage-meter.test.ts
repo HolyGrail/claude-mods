@@ -510,15 +510,30 @@ test('/clear shows the emptied context before the next turn', async ($, on) => {
 })
 
 test('a session left idle past the longest window stops showing its own reading', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
+  // Not mock.clock: its advance and set run every 60 s tick on the way, and 8 days of them take
+  // longer than a test may run. Time jumps instead, as over a machine's sleep, and one tick runs.
+  let now = NOW
+  const ticks: (() => void)[] = []
+  on('clock.now', () => ({ value: now }))
+  on('clock.every', () => new Promise((resolve) => ticks.push(() => resolve({ value: undefined }))))
+  let redrawn = () => {}
+  on('ui.invalidate', () => {
+    redrawn()
+    return {}
+  })
   stubSession(on, new Map(), [])
   on('session.measure', ($, e) => ({ changed: e.changed }))
   await $.session.start(START)
   await $.session.measure({ context: CONTEXT, rateLimits: [{ kind: 'spend_limit', percentUsed: 90 }], changed: ['rateLimits'] })
 
-  // The mock clock runs at most 10,000 timer calls per advance, and 8 days is 11,520 ticks
-  await clock.advance(4 * 24 * HOUR)
-  await clock.advance(4 * 24 * HOUR + MINUTE)
+  now = NOW + 8 * 24 * HOUR + MINUTE
+  expect(ticks).toHaveLength(1)
+  // A tick ends by asking for a redraw
+  const ticked = new Promise<void>((resolve) => {
+    redrawn = resolve
+  })
+  ticks.pop()!()
+  await ticked
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
