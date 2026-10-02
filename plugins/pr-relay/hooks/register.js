@@ -248,6 +248,8 @@ export function register(on) {
       // counts from here; the notes take this time with the push's end, which is when it applies
       push.at = await $.clock.now()
       for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
+      // and the other sessions hold back from it too, so it goes out as Bash runs, not before
+      publish()
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {
@@ -335,7 +337,8 @@ function reset($) {
 async function discover($, { branchOnly = false } = {}) {
   if (watched && !watched.ended) return
   const gen = generation
-  if (!branchOnly) await prune($)
+  // Pruning is housekeeping: a store that fails it does not keep the pull request unwatched
+  if (!branchOnly) await prune($).catch(() => {})
   // A /dev session that owns the cwd but has no pull request yet answers false: its own gh pr
   // create starts the watch, not whatever the branch had before
   const owned = branchOnly ? null : await findInDevSessions($)
@@ -492,8 +495,10 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // One that leaves the waking to another session leaves the end to it too, and sees it next round
   // from the record, as the session that relays: only then does it stop and offer the cleanup
   const ended = !defers && (data.state === 'MERGED' || data.state === 'CLOSED')
+  let endedGen = null
   if (ended) {
     stop()
+    endedGen = generation
     watched = { ...watched, ended: data.state }
     if (data.state === 'MERGED') {
       offersCleanup = true
@@ -501,61 +506,92 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     }
   }
 
-  let noted = 0
-  const sends = await exclusive(async () => {
-    const record = normalize(await $.store.get(key))
-    const writeAt = await $.clock.now()
-    // A watch that began while this waited its turn owns the pushes and the marks now
-    if (gen !== generation && !ended) return null
-    // Checked once more just before the record is written, since the store may have kept it waiting
-    if (lapsed(now, writeAt)) return LATE
-    // An ended poll goes on past a new watch, whose baseline is not this pull request's: it goes by
-    // what its note said
-    const owns = watched?.id === pr.id
-    noted = Math.max(othersSince, owns ? knownSince : note.since)
-    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now, seenAt)
-    // The session that relays writes the record at about this moment, so a copy read before its
-    // marks must not land over them: one that leaves it the waking writes only its own note
-    if (owns) knownSince = Math.max(knownSince, record.since)
-    if (defers) return sends
-    record.at = now
-    if (data.headRefOid) record.headAt = seenAt
-    await $.store.set(key, record)
-    // A write that landed past the lease may have gone over a session that took the round over and
-    // relayed the same, so this one sends nothing; $.store has no conditional write to stop it
-    if (lapsed(now, await $.clock.now())) return LATE
-    // Pages are skipped next time only once what they held is in the record: a session that leaves
-    // the waking to another goes through them again in case that one never writes it
-    if (gen === generation) watched = { ...watched, pagedAt: now }
-    return sends
-  })
-  if (sends === null) return
-  if (sends === LATE) return late($, now, pr, note)
-  // Only once the record says they were relayed, so a send that fails can take its mark back. A
-  // watch that began during the write (an ended pull request stopped the timers itself) takes
-  // the marks back instead, and a later watch of this pull request sends them.
-  // A push this session started meanwhile, running or already done, may have replaced the head
-  // they were read from
-  let pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
-  // So may one another session started after its notes were read, which only they say
-  if (sends.length && !pushedSince) {
-    const again = await readNotes($, pr, note).catch(() => null)
-    const known = new Set(pending.map(pushKey))
-    pushedSince =
-      !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(pushKey(push)))
-    // A read the store kept waiting past the lease may have let another session take the round
-    // over; it read the marks, which this one wrote in time, so it sent nothing: they are taken back
-    // for the next round to send
-    if (lapsed(now, await $.clock.now())) {
-      takeBackAll($, key, sends, pr)
-      return late($, now, pr, note)
+  // The watch ends only once the end is told: one a push took back, or that never reached the
+  // record, polls on so a later round tells it
+  let told = !ended
+  try {
+    let noted = 0
+    const sends = await exclusive(async () => {
+      const record = normalize(await $.store.get(key))
+      const writeAt = await $.clock.now()
+      // A watch that began while this waited its turn owns the pushes and the marks now
+      if (gen !== generation && !ended) return null
+      // Checked once more just before the record is written, since the store may have kept it waiting
+      if (lapsed(now, writeAt)) return LATE
+      // An ended poll goes on past a new watch, whose baseline is not this pull request's: it goes by
+      // what its note said
+      const owns = watched?.id === pr.id
+      noted = Math.max(othersSince, owns ? knownSince : note.since)
+      const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now, seenAt)
+      // The session that relays writes the record at about this moment, so a copy read before its
+      // marks must not land over them: one that leaves it the waking writes only its own note
+      if (owns) knownSince = Math.max(knownSince, record.since)
+      if (defers) return sends
+      record.at = now
+      if (data.headRefOid) record.headAt = seenAt
+      await $.store.set(key, record)
+      // A write that landed past the lease may have gone over a session that took the round over and
+      // relayed the same, so this one sends nothing; $.store has no conditional write to stop it
+      if (lapsed(now, await $.clock.now())) return LATE
+      // Pages are skipped next time only once what they held is in the record: a session that leaves
+      // the waking to another goes through them again in case that one never writes it
+      if (gen === generation) watched = { ...watched, pagedAt: now }
+      return sends
+    })
+    if (sends === null) return
+    if (sends === LATE) return late($, now, pr, note)
+    // Only once the record says they were relayed, so a send that fails can take its mark back. A
+    // watch that began during the write (an ended pull request stopped the timers itself) takes
+    // the marks back instead, and a later watch of this pull request sends them.
+    // A push this session started meanwhile, running or already done, may have replaced the head
+    // they were read from
+    let pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
+    // So may one another session started after its notes were read, which only they say
+    if (sends.length && !pushedSince) {
+      // A push known already that has finished since, even one that had run past the time it holds
+      // the relays back, counts the same as a new one
+      const state = (push) => `${push.running ? 'running' : 'done'}:${push.doneAt ?? ''}`
+      const known = new Map(pending.map((push) => [pushKey(push), state(push)]))
+      const moved = (again) =>
+        !again ||
+        again.pushing ||
+        again.since > noted ||
+        again.pending.some((push) => known.get(pushKey(push)) !== state(push))
+      pushedSince = moved(await readNotes($, pr, note).catch(() => null))
+      // A read the store kept waiting past the lease may have let another session take the round
+      // over; it read the marks, which this one wrote in time, so it sent nothing: they are taken back
+      // for the next round to send
+      if (lapsed(now, await $.clock.now())) {
+        takeBackAll($, key, sends, pr)
+        return late($, now, pr, note)
+      }
+      // A push this session started while the clock was read counts too, and so does one another
+      // session started meanwhile, which a last read of the notes shows; the lease keeps ROUND_MS
+      // for it, and nothing waits between it and the sends
+      pushedSince ||= (pushStarts.get(pr.id) ?? 0) !== started
+      if (!pushedSince) pushedSince = moved(await readNotes($, pr, note).catch(() => null))
+      pushedSince ||= (pushStarts.get(pr.id) ?? 0) !== started
     }
-    // A push this session started while the clock was read counts too
-    pushedSince ||= (pushStarts.get(pr.id) ?? 0) !== started
+    const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => holds(push, now)))
+    if (current) {
+      told = true
+      for (const send of sends) deliver($, key, send)
+    } else takeBackAll($, key, sends, pr)
+    showStatus($)
+  } finally {
+    if (!told) reopen($, pr, endedGen)
   }
-  const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => holds(push, now)))
-  if (current) for (const send of sends) deliver($, key, send)
-  else takeBackAll($, key, sends, pr)
+}
+
+// Watches a pull request again whose end a poll could not tell, unless a new watch began since
+function reopen($, pr, gen) {
+  if (gen !== generation || watched?.id !== pr.id || !watched.ended) return
+  watched = { ...watched, ended: null }
+  if (offersCleanup) {
+    offersCleanup = false
+    $.ui.invalidate('ui.render')
+  }
+  timers.push($.clock.every(TICK_MS, () => poll($, gen)))
   showStatus($)
 }
 
@@ -619,9 +655,9 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // own are those it bound to this pull request
   const running = pushes.some((push) => holds(push, now))
   // So may one that finished after GitHub answered, which the head GitHub showed cannot tell from a
-  // push that moved nothing; the next poll sees what it left
-  // (one handed on with no end time counts from its start)
-  const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt > seenAt : push.at >= seenAt)
+  // push that moved nothing; the next poll sees what it left. One that finished in the same
+  // millisecond may have too, and one handed on with no end time counts from its start
+  const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt >= seenAt : push.at >= seenAt)
   const replaced =
     (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
   return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record)

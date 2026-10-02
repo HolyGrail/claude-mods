@@ -1556,7 +1556,9 @@ test('a quiet push made before any head was known does not move the baseline', a
   w.pull.thumbsUpAt = NOW + 10_000
   await clock.advance(20_000)
   await $.tool.call({ tool: 'Bash', command: 'git push -q origin HEAD' })
-  await clock.settle()
+  // The poll the push starts asks GitHub in the millisecond the push ended, so it leaves the relay
+  // to the next one
+  await clock.advance(MINUTE)
   expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
 })
 
@@ -2234,7 +2236,7 @@ test('a push of another branch to the head does not count when no head was known
   await clock.advance(20_000)
   await $.tool.call({ tool: 'Bash', command: 'git push origin other' })
   w.pull.head = 'b2b2b2b0123456789'
-  await clock.settle()
+  await clock.advance(MINUTE)
   expect(w.prompts).toEqual([expect.stringContaining('approved')])
 })
 
@@ -2502,6 +2504,107 @@ test('a push another session started and finished after GitHub answered holds ba
   expect(w.prompts).toEqual([])
   await clock.advance(MINUTE)
   // The push replaced the head the review was about
+  expect(w.prompts).toEqual([])
+})
+
+test('a store that fails the startup prune still leaves the pull request watched', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('junk', 1)
+  w.getFails = (key) => key === 'junk'
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+})
+
+test('a push whose last note is slow to go out is timed in its note as its Bash call runs', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(5 * MINUTE)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  w.sets = async (key) => {
+    if (key === NOTE) await clock.sleep(10_000)
+  }
+  await clock.advance(10_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  // Bash runs from NOW + 40 s, after three slow writes; the fourth says so to the other sessions
+  await clock.advance(45_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 40_000, running: true }] })
+  w.sets = undefined
+  await clock.advance(5 * MINUTE)
+  await push
+})
+
+test('a merge whose toast a push took back is told on a later poll', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { state: 'MERGED' } })
+  const record = 'pr:' + URL.toLowerCase()
+  let once = true
+  w.gets = async (key) => {
+    if (key !== record || !once || !w.queries) return
+    once = false
+    // Another session starts a push while the record is read
+    w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true, pending: [{ id: 'p', at: NOW, head: 'a1', running: true }] })
+  }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.toasts).toEqual([])
+
+  // Its push moved nothing
+  w.store.delete('poll:session-a')
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #7 がマージされました'])
+})
+
+test('a push another session starts during the last check of the notes holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true })
+  let reads = 0
+  w.gets = async (key) => {
+    if (key !== 'poll:session-a' || !w.queries) return
+    // Read once to elect and once once the record is written; the push starts right after that
+    reads += 1
+    if (reads === 2) w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true, pending: [{ id: 'p', at: NOW, head: 'a1', running: true }] })
+  }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push that finished in the millisecond GitHub answered holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a', {
+    ...pollNote(NOW - 2 * MINUTE),
+    idle: true,
+    pending: [{ id: 'p', at: NOW - 1_000, head: 'a1a1a1a0123456789', shas: ['b2b2b2b'], doneAt: NOW }],
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push run past its hold that finishes while the record is written holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  const pending = { id: 'p', at: NOW - 11 * MINUTE, head: 'a1', running: true }
+  w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true, pending: [pending] })
+  const record = 'pr:' + URL.toLowerCase()
+  let once = true
+  w.gets = async (key) => {
+    if (key !== record || !once || !w.queries) return
+    once = false
+    const { running, ...done } = pending
+    w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true, pending: [{ ...done, doneAt: NOW, shas: ['b2b2b2b'] }] })
+  }
+  await $.session.start(START)
+  await clock.settle()
   expect(w.prompts).toEqual([])
 })
 
