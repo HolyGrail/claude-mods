@@ -236,6 +236,10 @@ export function register(on) {
       push.head = await headBefore($, prId)
       for (const note of notesOf(prId)) note.dirty = true
       await publish()
+      // Codex activity that came while the notes went out is still about the head being replaced,
+      // so the push counts from when it actually runs; the notes take the time with its end
+      push.at = await $.clock.now()
+      for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {
@@ -437,6 +441,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
     await retire($)
+    // A watch that began while the note was left idle shows its own state
+    if (gen !== generation) return
     lastCheck = { at: now, error: String(answer.error?.message ?? answer.error) }
     showStatus($)
     return
@@ -451,6 +457,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   if (gen !== generation) return
   if (notes.error) {
     await retire($)
+    if (gen !== generation) return
     lastCheck = { at: now, error: `poll notes: ${notes.error?.message ?? notes.error}` }
     showStatus($)
     return
@@ -459,7 +466,11 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   if (lapsed(now, readAt)) return late($, now, pr, note)
   const { defers, since: othersSince, pending, pushing } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
-  if (defers && lastNote?.serial === note.serial) lastNote.deferred = true
+  if (defers && lastNote?.serial === note.serial) {
+    lastNote.deferred = true
+    // Written before the record is read, which the store may keep waiting
+    await writeNote($, lastNote)
+  }
   if (data.headRefOid) {
     lastHead = data.headRefOid
     lastHeadAt = seenAt
@@ -520,12 +531,19 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const known = new Set(pending.map(pushKey))
     pushedSince =
       !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(pushKey(push)))
-    // A read the store kept waiting past the lease may have let another session take the round over
-    // and relay the same, so this one leaves the marks as they are for it and sends nothing
-    if (lapsed(now, await $.clock.now())) return late($, now, pr, note)
+    // A read the store kept waiting past the lease may have let another session take the round
+    // over; it read the marks, which this one wrote in time, so it sent nothing: they are taken back
+    // for the next round to send
+    if (lapsed(now, await $.clock.now())) {
+      takeBackAll($, key, sends, pr)
+      return late($, now, pr, note)
+    }
+    // A push this session started while the clock was read counts too
+    pushedSince ||= (pushStarts.get(pr.id) ?? 0) !== started
   }
   const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => holds(push, now)))
-  for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
+  if (current) for (const send of sends) deliver($, key, send)
+  else takeBackAll($, key, sends, pr)
   showStatus($)
 }
 
@@ -569,8 +587,17 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
     if (!record.ended && !defers) {
-      record.ended = data.state
-      $.ui.toast(`PR #${pr.number} が${ENDED[data.state]}されました`)
+      const state = data.state
+      record.ended = state
+      // Raised once the record says so in time, like a prompt
+      return [
+        {
+          toast: `PR #${pr.number} が${ENDED[state]}されました`,
+          undo: (r) => {
+            if (r.ended === state) r.ended = null
+          },
+        },
+      ]
     }
     return []
   }
@@ -885,19 +912,40 @@ function relay($, pr, signals, record) {
     ]
   }
   if (signals.usageLimitAt > record.usageLimitAt) {
-    record.usageLimitAt = signals.usageLimitAt
-    $.ui.toast(`PR #${pr.number}: Codex の利用上限に達し、レビューが付きません`)
+    const usageLimitAt = signals.usageLimitAt
+    const previous = record.usageLimitAt
+    record.usageLimitAt = usageLimitAt
+    return [
+      {
+        toast: `PR #${pr.number}: Codex の利用上限に達し、レビューが付きません`,
+        undo: (r) => {
+          if (r.usageLimitAt === usageLimitAt) r.usageLimitAt = previous
+        },
+      },
+    ]
   }
   return []
 }
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, undo }) {
+function deliver($, key, { text, toast, undo }) {
+  if (toast) return $.ui.toast(toast)
   // A mark the store would not take back stays, and that prompt is not sent again
   submit($, text)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
+}
+
+// Takes marks back without waiting; a store that refuses it leaves them, and says so
+function takeBackAll($, key, sends, pr) {
+  for (const send of sends) {
+    takeBack($, key, send.undo).catch(async (error) => {
+      if (watched?.id !== pr.id) return
+      lastCheck = { at: await $.clock.now(), error: `mark: ${error?.message ?? error}` }
+      showStatus($)
+    })
+  }
 }
 
 function takeBack($, key, undo) {

@@ -1600,7 +1600,7 @@ test('a push belongs to the pull request watched as it starts, even if the watch
   await Promise.all([push, turned])
   w.gets = async () => {}
   await clock.advance(MINUTE)
-  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW }] })
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 5_000 }] })
   expect(w.store.get(NOTE9)).not.toHaveProperty('pending')
 })
 
@@ -1640,7 +1640,7 @@ test('a push started before the pull request had a note keeps one when the watch
   await Promise.all([push, turned])
   w.gets = async () => {}
   await clock.advance(MINUTE)
-  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: [{ at: NOW + 10_500 }] })
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: [{ at: NOW + 15_500 }] })
 })
 
 test('a note write the store answers late does not land over a later one', async ($, on) => {
@@ -2122,7 +2122,7 @@ test('a push made after a resume, before the first poll, goes under the resumed 
   await clock.advance(MINUTE)
   await Promise.all([turned, push])
   expect(w.store.has(NOTE9)).toBe(false)
-  expect(w.store.get('poll:session-c:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 1_000 }] })
+  expect(w.store.get('poll:session-c:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 11_000 }] })
   w.ids = undefined
 })
 
@@ -2421,4 +2421,156 @@ test('a poll yields to a note timed in the same millisecond while its own was on
   w.store.set('poll:session-z', pollNote(NOW + MINUTE))
   await clock.advance(25_000)
   expect(w.prompts).toEqual([])
+})
+
+test('a merge seen by a poll whose record lands past the lease raises no toast', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { state: 'MERGED' } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  w.sets = async (key) => {
+    if (key.startsWith('pr:')) await clock.sleep(10 * MINUTE)
+  }
+  await $.session.start(START)
+  await clock.advance(10 * MINUTE + 1_000)
+  expect(w.toasts).toEqual([])
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  w.sets = undefined
+})
+
+test('a usage limit seen before a push that started while the record was written raises no toast', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.comments = [{ at: NOW + 30_000, body: 'You have reached your Codex usage limits for code reviews.' }]
+  const record = 'pr:' + URL.toLowerCase()
+  w.sets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(15_000)
+  expect(w.toasts).toEqual([])
+  w.sets = undefined
+})
+
+test('a failed poll of the last pull request leaves the next one\'s status alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The next poll fails, and leaving its note idle is slow
+  w.queryError = 'HTTP 502'
+  let slow = false
+  w.answers = async () => {
+    slow = true
+  }
+  w.sets = async (key) => {
+    if (key === NOTE && slow) {
+      slow = false
+      await clock.sleep(30_000)
+    }
+  }
+  await clock.advance(MINUTE + 1_000)
+  w.queryError = undefined
+  // The next pull request's first poll is slow to hear from GitHub
+  w.answers = () => clock.sleep(MINUTE)
+  w.pulls = { 9: { head: 'c3c3c3c', branch: 'next' } }
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(40_000)
+  expect(w.status).not.toContain('HTTP 502')
+  w.sets = undefined
+  w.answers = async () => {}
+  await clock.advance(MINUTE)
+})
+
+test('a mark the store will not take back is shown in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const record = 'pr:' + URL.toLowerCase()
+  let writes = 0
+  w.sets = async (key) => {
+    if (key === record && ++writes === 1) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  // A push makes the poll take its mark back, and the store then refuses the record
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.getFails = (key) => key === record
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('mark:')
+  w.getFails = undefined
+  w.sets = undefined
+})
+
+test('a final read of the notes that outlasts the lease takes its marks back for the next round', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  const other = 'poll:session-a:' + URL.toLowerCase()
+  w.store.set(other, { ...pollNote(NOW - 5 * MINUTE), idle: true })
+  let slow = false
+  w.sets = async (key) => {
+    if (key.startsWith('pr:')) slow = true
+  }
+  w.gets = async (key) => {
+    if (slow && key === other) {
+      slow = false
+      await clock.sleep(9 * MINUTE + 30_000)
+    }
+  }
+  await $.session.start(START)
+  await clock.advance(9 * MINUTE + 31_000)
+  expect(w.prompts).toEqual([])
+  w.sets = undefined
+  w.gets = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a push counts from when its Bash call runs, not from when its notes started going out', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The head is slow to look up, and Codex reviews the old head meanwhile
+  await clock.advance(10_000)
+  w.gets = () => clock.sleep(20_000)
+  w.pull.reviews = [{ id: 1, at: NOW + 20_000, comments: 1 }]
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(25_000)
+  await push
+  w.gets = undefined
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a poll that yields says so before the record is read', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Another session started its poll a moment before this one's next, and the record is slow
+  const record = 'pr:' + URL.toLowerCase()
+  await clock.advance(MINUTE - 1_000)
+  w.store.set('poll:session-a', pollNote(NOW + MINUTE - 1_000))
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(20_000)
+  }
+  await clock.advance(5_000)
+  expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
+  w.gets = undefined
+  await clock.advance(20_000)
 })
