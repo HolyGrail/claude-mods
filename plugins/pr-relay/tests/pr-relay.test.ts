@@ -2076,3 +2076,68 @@ test('a poll yields to a note written while its own was on its way', async ($, o
   await clock.advance(20_000)
   expect(w.prompts).toEqual([])
 })
+
+test('a push started as the watch turns stays with the pull request watched as it started', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(20_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  const turned = $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(30_000)
+  await Promise.all([push, turned])
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW }] })
+  expect(w.store.get(NOTE9)).not.toHaveProperty('pending')
+})
+
+test('a push made after a resume, before the first poll, goes under the resumed conversation\'s id', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('classic.SessionStart', () => ({}))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The resumed conversation's id is slow to come
+  w.sessionId = 'session-c'
+  w.devSessions = {}
+  w.ids = () => clock.sleep(10_000)
+  await $.classic.SessionStart({ source: 'resume' })
+  const turned = $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(1_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(MINUTE)
+  await Promise.all([turned, push])
+  expect(w.store.has(NOTE9)).toBe(false)
+  expect(w.store.get('poll:session-c:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 1_000 }] })
+  w.ids = undefined
+})
+
+test('a push another session started while the record was written holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const record = 'pr:' + URL.toLowerCase()
+  w.sets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  // The other session's push note lands after this poll read the notes
+  w.store.set('poll:session-a:' + URL.toLowerCase(), {
+    ...pollNote(NOW + MINUTE + 1_000),
+    idle: true,
+    pending: [{ at: NOW + MINUTE + 1_000, head: null, running: true }],
+  })
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  w.sets = undefined
+})

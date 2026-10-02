@@ -108,6 +108,7 @@ let pushes = []
 const pushStarts = new Map()
 // The session id as last asked, so a push need not wait on it
 let sessionId = null
+let idAsks = 0
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
 // The read, change and write of a record in this session, one after another: a poll and a send
@@ -153,6 +154,10 @@ export function register(on) {
   // /resume can turn this process to another conversation without a new session.start, and that
   // conversation may belong to another worktree and pull request
   on('classic.SessionStart', { source: ['resume'] }, async ($, e, next) => {
+    // The resumed conversation has its own id, so a push before its first poll must not write
+    // under the last one's
+    sessionId = null
+    sessionIdOf($).catch(() => {})
     stop()
     await retire($)
     reset($)
@@ -197,7 +202,9 @@ export function register(on) {
     if (pushing) {
       push = { at: startedAt, head: null, shas: null, running: true }
       if (prId) pushStarts.set(prId, (pushStarts.get(prId) ?? 0) + 1)
-      pushes.push(push)
+      // A watch that turned to another pull request while the time was read cleared the last one's
+      // pushes: this one goes only into that pull request's notes
+      if (!prId || watched?.id === prId) pushes.push(push)
       for (const note of notesOf(prId)) {
         note.pending = [...note.pending.filter((p) => p !== push), push]
         note.dirty = true
@@ -491,7 +498,13 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // the marks back instead, and a later watch of this pull request sends them.
   // A push this session started meanwhile, running or already done, may have replaced the head
   // they were read from
-  const pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
+  let pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
+  // So may one another session started after its notes were read, which only they say
+  if (sends.length && !pushedSince) {
+    const again = await readNotes($, pr, note).catch(() => null)
+    const known = new Set(pending.map((push) => push.at))
+    pushedSince = !again || again.pushing || again.pending.some((push) => !known.has(push.at))
+  }
   const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => push.running))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
   showStatus($)
@@ -547,9 +560,12 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   return running || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
 }
 
+// The cache takes only the latest answer, so one asked before a /resume cannot land over it
 async function sessionIdOf($) {
-  sessionId = await $.session.id()
-  return sessionId
+  const ask = ++idAsks
+  const id = await $.session.id()
+  if (ask === idAsks) sessionId = id
+  return id
 }
 
 // Notes that this session starts a poll of the pull request now, and returns the note
