@@ -82,11 +82,14 @@ export function register(on) {
   // so a tick in between may tell the outgoing one, and the load after it tells the new one
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     const outgoing = sessionId
+    // The host has moved to the new id already; it is taken up only once the switch is done, with
+    // no wait in between, so a tick during the switch still reads the outgoing conversation and
+    // keeps its record and refusals to it, and one after it reads the new one under the new id
+    const incoming = await $.session.id()
     forgetRefusals()
     const result = await next(e)
-    // Only now: a tick during the switch still reads the outgoing conversation, and keeps its record
-    // and refusals to it
-    sessionId = await $.session.id()
+    sessionId = incoming
+    forgetRefusals()
     legacy = await legacyOf($)
     // A fork copies the conversation, and with it what was told before its window
     if (e.source === 'fork' && outgoing !== null && outgoing !== sessionId) {
@@ -95,6 +98,7 @@ export function register(on) {
         await $.store.set(RECORD_PREFIX + sessionId, record)
       }
     }
+    // Once more, for a load begun while the old version's record or the fork's was still loading
     forgetRefusals()
     return result
   })
@@ -239,10 +243,11 @@ async function load($) {
       ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text, line: 'This notice no longer applies: ' + text })),
     ]
     for (const row of rows) {
-      // A restart or a switch since this load read the conversation: its rows may not fit the one
-      // installed now, which the next load reads afresh
-      if (generation !== started) return
       const line = row.line + '\n(notice-board ref ' + (await ref(secret, row.text)) + ')'
+      // A restart or a switch since this load read the conversation: its rows may not fit the one
+      // installed now, which the next load reads afresh. Checked after the last wait before the
+      // append.
+      if (generation !== started) return
       const result = await $.session
         .append({ message: { type: 'user', content: [{ type: 'text', text: line }] } })
         .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))

@@ -59,10 +59,15 @@ function stubHost(
     known = (): { id: string; text: string }[] => [],
     // The session id now installed
     id = (): string => 'this',
+    // Holds a read of the session id back
+    beforeId = async (): Promise<void> => {},
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
-  on('session.id', () => ({ value: id() }))
+  on('session.id', async () => {
+    await beforeId()
+    return { value: id() }
+  })
   on('session.messages', async () => {
     await beforeRead()
     return { value: host.transcript }
@@ -532,6 +537,38 @@ test("a tick during /resume keeps the outgoing conversation's record to it", asy
   id = 'new'
   await $.classic.SessionStart({ source: 'resume' })
   expect(store.get('told:new')).toEqual(resumed)
+})
+
+test('a tick while the new session id is read keeps each record to its own conversation', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  let id = 'old'
+  let slowId = false
+  const host = stubHost(on, {
+    store,
+    id: () => id,
+    beforeId: async () => {
+      if (!slowId) return
+      slowId = false
+      // A tick lands while the id is read
+      await clock.advance(MINUTE)
+    },
+  })
+  on('classic.SessionStart', () => {
+    // The resumed conversation, installed by the switch, holds nothing
+    host.transcript = []
+    return {}
+  })
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  const outgoing = { at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] }
+  expect(store.get('told:old')).toEqual(outgoing)
+
+  id = 'new'
+  slowId = true
+  await $.classic.SessionStart({ source: 'resume' })
+  await settle()
+  expect(store.get('told:old')).toEqual(outgoing)
 })
 
 test("/branch carries the record of what the copied conversation was told", async ($, on) => {
