@@ -2414,6 +2414,97 @@ test('another session\'s stale note is kept while its pull request is open', asy
   expect(w.store.has('poll:session-c')).toBe(true)
 })
 
+test('a push counts from when its Bash call runs, even if its last note is slow to go out', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789' } })
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => {
+    w.pull.head = 'b2b2b2b0123456789'
+    return { result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Each note write takes 10 s, so the push runs 30 s after it was asked for
+  w.sets = async (key) => {
+    if (key === NOTE) await clock.sleep(10_000)
+  }
+  await clock.advance(10_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  // Codex reviewed the old head while the last note went out
+  w.pull.reviews = [{ id: 1, at: NOW + 35_000, comments: 1 }]
+  await clock.advance(2 * MINUTE)
+  await push
+  w.sets = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a poll that defers leaves a watch that began while its note went out alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pulls: { 9: { reviews: [{ id: 5, at: LAST_PUSH - 2 * MINUTE, comments: 1 }] } } })
+  // Another session polls the same round a moment earlier, so this one defers
+  w.store.set('poll:session-a', { ...pollNote(NOW - 1_000), running: true })
+  let slow = false
+  w.answers = async () => {
+    slow = true
+  }
+  w.sets = async (key) => {
+    if (slow && key === NOTE) await clock.sleep(10_000)
+  }
+  await $.session.start(START)
+  await clock.advance(1_000)
+  // The watch turns while the deferral is on its way to the store
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  w.answers = async () => {}
+  slow = false
+  await clock.advance(2 * MINUTE)
+  // PR #7's session file and its push are not PR #9's baseline
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a push made after a fork, before the first poll, goes under the fork\'s id', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('classic.SessionStart', () => ({}))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.sessionId = 'session-c'
+  await $.classic.SessionStart({ source: 'fork' })
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).not.toHaveProperty('pending')
+  expect(w.store.get('poll:session-c:' + URL.toLowerCase())).toMatchObject({ pending: [{ at: NOW }] })
+})
+
+test('a push another session started and finished after GitHub answered holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Read first among the other notes, and slow, so the other session's push lands in between
+  w.store.set('poll:session-c', { ...pollNote(NOW - 2 * MINUTE), idle: true })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 2 * MINUTE), idle: true })
+  let once = true
+  w.gets = async (key) => {
+    if (key !== 'poll:session-c' || !once || !w.queries) return
+    once = false
+    await clock.sleep(5_000)
+    w.pull.head = 'b2b2b2b0123456789'
+    w.store.set('poll:session-a', {
+      ...pollNote(NOW - 2 * MINUTE),
+      idle: true,
+      pending: [{ id: 'p', at: NOW + 1_000, head: 'a1a1a1a0123456789', shas: ['b2b2b2b'], doneAt: NOW + 2_000 }],
+    })
+  }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  await clock.advance(MINUTE)
+  // The push replaced the head the review was about
+  expect(w.prompts).toEqual([])
+})
+
 test('a push that started and finished while the record was read still holds back the relay', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)

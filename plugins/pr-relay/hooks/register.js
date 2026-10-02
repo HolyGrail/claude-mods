@@ -153,10 +153,12 @@ export function register(on) {
   })
 
   // /resume can turn this process to another conversation without a new session.start, and that
-  // conversation may belong to another worktree and pull request
-  on('classic.SessionStart', { source: ['resume'] }, async ($, e, next) => {
-    // The resumed conversation has its own id, so a push before its first poll must not write
-    // under the last one's
+  // conversation may belong to another worktree and pull request. /clear and /branch (fork) go on
+  // in the same one, but under a new id as well: the note under the last id is left idle, since
+  // that conversation no longer runs here, and the pull request is looked up again
+  on('classic.SessionStart', { source: ['resume', 'clear', 'fork'] }, async ($, e, next) => {
+    // The new conversation has its own id, so a push before its first poll must not write under
+    // the last one's
     sessionId = null
     sessionIdOf($).catch(() => {})
     stop()
@@ -242,9 +244,15 @@ export function register(on) {
       for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
       // The other sessions hold back for RUNNING_MS from the time they see, so they see this one
       await publish()
+      // Activity that came while that went out is still about the head being replaced, so the push
+      // counts from here; the notes take this time with the push's end, which is when it applies
+      push.at = await $.clock.now()
+      for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {
+      // A poll whose GitHub answer came before this may have seen the head the push replaced
+      push.doneAt = await $.clock.now()
       push.running = false
       if (dropped) push.dropped = true
       else {
@@ -472,6 +480,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     lastNote.deferred = true
     // Written before the record is read, which the store may keep waiting
     await writeNote($, lastNote)
+    // A watch that began while it went out owns the head and the session file now
+    if (gen !== generation) return
   }
   if (data.headRefOid) {
     lastHead = data.headRefOid
@@ -503,7 +513,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // what its note said
     const owns = watched?.id === pr.id
     noted = Math.max(othersSince, owns ? knownSince : note.since)
-    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now)
+    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now, seenAt)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
     if (owns) knownSince = Math.max(knownSince, record.since)
@@ -564,7 +574,7 @@ async function late($, now, pr, note) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing, now) {
+function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing, now, seenAt) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -608,7 +618,13 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // A push running in any session may be replacing the head GitHub still shows; this session's
   // own are those it bound to this pull request
   const running = pushes.some((push) => holds(push, now))
-  return running || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
+  // So may one that finished after GitHub answered, which the head GitHub showed cannot tell from a
+  // push that moved nothing; the next poll sees what it left
+  // (one handed on with no end time counts from its start)
+  const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt > seenAt : push.at >= seenAt)
+  const replaced =
+    (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
+  return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record)
 }
 
 // The cache takes only the latest answer, so one asked before a /resume cannot land over it
@@ -654,6 +670,7 @@ async function notePoll($, pr, gen) {
         head: push.head ?? null,
         shas: finished ? (push.shas ?? null) : null,
         refs: finished ? (push.refs ?? null) : null,
+        ...(finished && typeof push.doneAt === 'number' ? { doneAt: push.doneAt } : {}),
         running: false,
       })
     }
@@ -768,8 +785,16 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
 }
 
 // A push as a note hands it on, for the session that relays to apply
-function pushNote({ id, at, head, shas, refs, running }) {
-  return { ...(id ? { id } : {}), at, head, ...(shas ? { shas } : {}), ...(refs ? { refs } : {}), ...(running ? { running } : {}) }
+function pushNote({ id, at, head, shas, refs, running, doneAt }) {
+  return {
+    ...(id ? { id } : {}),
+    at,
+    head,
+    ...(shas ? { shas } : {}),
+    ...(refs ? { refs } : {}),
+    ...(running ? { running } : {}),
+    ...(typeof doneAt === 'number' ? { doneAt } : {}),
+  }
 }
 
 // Whether a push of this session still holds back a poll started at now: one whose Bash call hung
