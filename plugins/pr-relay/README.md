@@ -41,7 +41,7 @@ Codex の 👍 は PR に 1 つしか付かず、作成時刻が前の push の�
 最後の push の時刻には、次のうち最も新しいものを使います。
 
 - セッションファイルの `review.last_push_at`（確認のたびに読み直す。`gh pr create` などで先に監視を始めた PR も、その URL を書いたセッションファイルが現れたら追う）
-- このセッションで `git push` を始めた時刻（PR の head が変わったときだけ使う。`Everything up-to-date` の push では基準時刻を進めない）
+- このセッションで `git push` を始めた時刻（push が終わってから、PR の head がその push の出力にあるコミットになったときだけ使う。出力にコミットがなければ、push 開始時に分かっていた head から変わったときに使う。`Everything up-to-date` や別ブランチへの push では基準時刻を進めない）
 - PR の最新コミットのコミット時刻
 
 知らせたイベントは `$.store` に PR ごとに記録します。
