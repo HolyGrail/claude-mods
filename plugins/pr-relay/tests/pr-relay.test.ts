@@ -1236,3 +1236,37 @@ test('a poll note says a push is running only until it finishes', async ($, on) 
   expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW } })
   expect((w.store.get(NOTE) as { pending: object }).pending).not.toHaveProperty('running')
 })
+
+test('a push that finishes after its session\'s poll failed clears the push from the idle note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(90_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.queryError = 'HTTP 502'
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: { at: NOW, running: true } })
+  await clock.advance(30_000)
+  await push
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: { at: NOW } })
+  expect((w.store.get(NOTE) as { pending: object }).pending).not.toHaveProperty('running')
+})
+
+test('a poll cut short by a watch restarted at the same moment leaves the new poll running', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { answers: () => clock.sleep(10_000) })
+  await $.session.start(START)
+  await clock.settle()
+
+  // The same pull request is watched again before the clock moves, and GitHub answers slower now
+  w.answers = () => clock.sleep(60_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.advance(10_000)
+  expect(w.queries).toBe(2)
+  expect(w.store.get(NOTE)).toMatchObject({ at: NOW, running: true })
+})

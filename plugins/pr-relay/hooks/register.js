@@ -83,9 +83,13 @@ let polling = null
 let knownSince = 0
 // The head of the watched pull request as this session's last poll found it
 let lastHead = null
-// This session's latest poll note, { key, pr, at, since, pending, running }, as last written, so an
-// older poll does not mark it finished, a push can update it and a stop can leave it idle
+// This session's latest poll note, { key, pr, at, since, pending, running, serial }, as last written,
+// so an older poll does not mark it finished, a push can update it and a stop can leave it idle
 let lastNote = null
+// The note a stop left idle, which a push that finishes later still updates
+let idleNote = null
+// Tells apart the polls of one session, which may share a key and a time
+let noteSerial = 0
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
 // When this session last ran git push. It becomes the baseline only once the pull request's head
@@ -442,14 +446,15 @@ async function notePoll($, pr, at) {
   const key = `${POLL_PREFIX}${await $.session.id()}:${pr.id}`
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
-  lastNote = { key, pr: pr.id, at, since: knownSince, pending: pendingPush(), running: true }
+  lastNote = { key, pr: pr.id, at, since: knownSince, pending: pendingPush(), running: true, serial: ++noteSerial }
+  idleNote = null
   await writeNote($, lastNote, { strict: true })
   return { ...lastNote }
 }
 
 // Marks the note of a poll that has written what it relayed as finished, with what it now knows
 async function finishNote($, note) {
-  if (lastNote?.key !== note.key || lastNote.at !== note.at) return
+  if (lastNote?.serial !== note.serial) return
   catchUp(lastNote)
   lastNote.running = false
   await writeNote($, lastNote)
@@ -458,9 +463,10 @@ async function finishNote($, note) {
 // Puts a push this session just started into its running or finished note, so a session that
 // relays before this one polls again counts it
 async function refreshNote($) {
-  if (!lastNote || lastNote.pr !== watched?.id) return
-  catchUp(lastNote)
-  await writeNote($, lastNote)
+  const note = lastNote ?? idleNote
+  if (!note || note.pr !== watched?.id) return
+  catchUp(note)
+  await writeNote($, note)
 }
 
 // Leaves this session's note idle: it holds back no other session, and still hands on its push
@@ -471,7 +477,8 @@ async function retire($) {
   // What the session knows belongs to the watch, which may have moved on to another pull request;
   // then the note keeps what it last said
   catchUp(note)
-  await writeNote($, { ...note, running: false, idle: true })
+  idleNote = { ...note, running: false, idle: true }
+  await writeNote($, idleNote)
 }
 
 // Brings a note of the watched pull request up to what this session knows of its pushes
