@@ -81,10 +81,14 @@ test('leaves other results alone', async ($, on) => {
   await start($, on, {}, command =>
     command === 'fails'
       ? { text: 'Exit code 1\nmake: *** No rule to make target', isError: true }
-      : { text: 'zsh:1: command not found: timeout' },
+      : command === 'missing script'
+        ? { text: 'Exit code 127\n(eval):1: command not found: timeout.sh', isError: true }
+        : { text: 'zsh:1: command not found: timeout' },
   )
 
-  // Another failure, and output that only mentions the message
+  // Another failure, another missing command whose name starts with timeout, and output that
+  // only mentions the message
   expect((await run($, 'fails')).context).toBeUndefined()
+  expect((await run($, 'missing script')).context).toBeUndefined()
   expect((await run($, 'cat log.txt')).context).toBeUndefined()
 })

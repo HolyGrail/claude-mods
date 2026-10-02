@@ -13,7 +13,7 @@ zsh:1: no matches found: --include=*.ts
 ## 何をするか
 
 - **zsh のオプション**：Claude Code が起動する zsh で `setopt nonomatch noequals` を有効にします。一致するファイルがない glob は bash と同じく文字列のまま渡り（`nonomatch`）、語頭の `=` はコマンドのパスに展開されなくなります（`noequals`）。
-- **timeout**：コマンドが `command not found: timeout` で失敗したとき、Bash ツール自身の `timeout` パラメータを使うよう、モデルにだけ見える注記を結果に添えます。コマンドの実行には手を加えません。
+- **timeout**：コマンドが `command not found: timeout` で失敗したとき、モデルにだけ見える注記を結果に添えます。`timeout` がないことと、Bash ツール自身の `timeout` パラメータで代えられるのは期限がコマンド全体にかかるときだけであることを伝え、書き直し方はモデルに任せます。コマンドの実行には手を加えません。
 
 ## 仕組み
 
@@ -53,7 +53,20 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 ```
 
 効き始めるのは、次に起動する zsh からです。
-更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+### 更新
+
+marketplace の情報を取り込んでから、mod を更新します。
+更新は Claude Code の再起動後に反映されます。
+
+```bash
+claude plugin marketplace update claude-mods
+```
+
+```bash
+claude plugin update zsh-safe@claude-mods
+```
+
+注意点は、[リポジトリの README](../../README.md) にまとめてあります。
 
 ### インストールせずに試す
 

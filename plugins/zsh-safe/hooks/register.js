@@ -7,7 +7,8 @@
 
 // How zsh and bash report a missing timeout: `(eval):1: command not found: timeout`,
 // `bash: line 1: timeout: command not found`
-const TIMEOUT_MISSING = /command not found: timeout\b|\btimeout: command not found/
+// A name such as timeout.sh is another command, so the name must end there
+const TIMEOUT_MISSING = /command not found: timeout(?=\s|$)|(^|\s)timeout: command not found/
 
 export function register(on) {
   // Fires again on a reload. Sets ZDOTDIR before passing the event on, so the hooks beneath that
@@ -27,12 +28,11 @@ export function register(on) {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.isError !== true || !TIMEOUT_MISSING.test(ran.text)) return ran
+    // States what holds and leaves the rewrite to the model: no stand-in keeps every form of
+    // timeout's arguments (5m, 0.5, -k) and its exit status
     const fix =
       `${$.plugin.name}: timeout is not installed on this machine (macOS has none). ` +
-      `When the whole command may share one deadline, run it without timeout and set the Bash tool's ` +
-      `timeout parameter (in milliseconds). When the deadline must cover one part only, as in ` +
-      `\`timeout 5 build || cleanup\`, use \`perl -e 'alarm shift; exec @ARGV' 5 build\` instead, ` +
-      `which exits 142 rather than 124 when the time runs out.`
+      `The Bash tool's timeout parameter (in milliseconds) can stand in for it only when the deadline covers the whole command.`
     return { ...ran, context: [...(ran.context ?? []), fix] }
   })
 }
