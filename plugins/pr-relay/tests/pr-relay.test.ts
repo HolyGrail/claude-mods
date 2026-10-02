@@ -94,6 +94,8 @@ type World = {
   queryError?: string
   // What writing a poll note fails with, when it does
   noteError?: string
+  // What listing the store fails with, when it does
+  keysError?: string
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -158,7 +160,10 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     const before = e.argv.find((arg) => arg.startsWith('before='))?.slice('before='.length)
     return run(0, graphql(w.pull, before))
   })
-  on('store.keys', () => ({ value: [...w.store.keys()] }))
+  on('store.keys', () => {
+    if (w.keysError) throw new Error(w.keysError)
+    return { value: [...w.store.keys()] }
+  })
   on('store.get', ($, e) => ({ value: w.store.get(e.key) }))
   on('store.set', ($, e) => {
     if (w.noteError && e.key.startsWith('poll:')) throw new Error(w.noteError)
@@ -1169,4 +1174,65 @@ test('an old idle note is kept while it holds a push the record has not counted'
   await $.session.start(START)
   await clock.settle()
   expect(w.store.has('poll:session-a')).toBe(false)
+})
+
+test('a poll that cannot list the other sessions\' notes relays nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Listed fine for the prune at startup, then not once the poll has asked GitHub
+  w.answers = async () => {
+    w.keysError = 'store busy'
+  }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('PR #7 確認失敗 21:00: poll notes:')
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+
+  w.answers = async () => {}
+  w.keysError = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a push another session is still running holds back the relays until it finishes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - MINUTE, head: 'a1', running: true } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+
+  // It pushed nothing new after all
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - MINUTE, head: 'a1' } })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a push left running by a session that died holds nothing back for long', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - 11 * MINUTE, head: 'a1', running: true } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a poll note says a push is running only until it finishes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(20_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(10_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW, head: 'a1', running: true } })
+  await clock.advance(10_000)
+  await push
+  expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW } })
+  expect((w.store.get(NOTE) as { pending: object }).pending).not.toHaveProperty('running')
 })

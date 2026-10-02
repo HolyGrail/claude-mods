@@ -193,6 +193,8 @@ export function register(on) {
       }
       return ran
     }
+    // The other sessions hold back their relays only while the push runs
+    if (pushes) await refreshNote($)
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
@@ -356,7 +358,16 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   const { data } = answer
   // Another session polling this pull request in the same round, ahead of this one, relays what is
   // new; this one leaves the record to it and passes on what it knows through its note
-  const { defers, since: othersSince, pending } = await readNotes($, pr, note)
+  // Notes it could not read may hold an earlier poll, so this one then learned nothing either
+  const notes = await readNotes($, pr, note).catch((error) => ({ error }))
+  if (gen !== generation) return
+  if (notes.error) {
+    await retire($)
+    lastCheck = { at: now, error: `poll notes: ${notes.error?.message ?? notes.error}` }
+    showStatus($)
+    return
+  }
+  const { defers, since: othersSince, pending, pushing } = notes
   lastHead = data.headRefOid ?? lastHead
   lastCheck = { at: now }
   watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
@@ -376,7 +387,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const record = normalize(await $.store.get(key))
     // A watch that began while this waited its turn owns pushedAt and the marks now
     if (gen !== generation && !ended) return null
-    const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers)
+    const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
     knownSince = Math.max(knownSince, record.since)
@@ -395,7 +406,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush, notedPush, pending, defers) {
+function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -421,7 +432,8 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers) {
   }
   // A reopened pull request ends again, and that end is news again
   record.ended = null
-  return pushesRunning > 0 || defers ? [] : relay($, pr, read(data, record.since), record)
+  // A push running in any session may be replacing the head GitHub still shows
+  return pushesRunning > 0 || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
 }
 
 // Notes that this session starts a poll of the pull request now, and returns the note
@@ -475,31 +487,38 @@ function writeNote($, { key, pr, at, since, pending, running, idle }, { strict =
   return strict ? write : write.catch(() => {})
 }
 
-// What the other sessions' notes on the same pull request say: defers, whether one of them started
-// its poll before this one's (or at the same moment, under a smaller key) in the same round, or is
-// still running it, so that every session agrees on the one that relays; and since, the latest push
-// any of them knows. One that stopped polling or failed drops out of the next round by itself, or
-// at once when it left its note idle.
 // A push this session ran that has not counted yet, for the session that relays to apply
 function pendingPush() {
-  return pushedAt ? { at: pushedAt, head: lastHead } : null
+  return pushedAt ? { at: pushedAt, head: lastHead, ...(pushesRunning > 0 ? { running: true } : {}) } : null
 }
 
+// What the other sessions' notes on the same pull request say: defers, whether one of them started
+// its poll before this one's (or at the same moment, under a smaller key) in the same round, or is
+// still running it, so that every session agrees on the one that relays; since and pending, the
+// pushes they know; and pushing, whether one of them is running a push. One that stopped polling or
+// failed drops out of the next round by itself, or at once when it left its note idle. A store that
+// cannot be read throws, since a note it hides may be the one this poll should yield to.
+
 async function readNotes($, pr, note) {
-  const keys = (await $.store.keys().catch(() => [])).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
+  const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
   let defers = false
+  let pushing = false
   let since = 0
   const pending = []
   for (const key of keys) {
-    const other = await $.store.get(key).catch(() => undefined)
+    const other = await $.store.get(key)
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
     if (typeof other.since === 'number') since = Math.max(since, other.since)
-    if (typeof other.pending?.at === 'number') pending.push(other.pending)
+    if (typeof other.pending?.at === 'number') {
+      pending.push(other.pending)
+      // One left running by a session that died mid-push holds nothing back for long
+      if (other.pending.running && other.pending.at >= note.at - RUNNING_MS) pushing = true
+    }
     if (other.idle || other.at > note.at) continue
     if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
-  return { defers, since, pending }
+  return { defers, since, pending, pushing }
 }
 
 // Marks what is new since the last push as relayed, in poll-codex-review.sh's order: an approval,
