@@ -2241,6 +2241,34 @@ test('a push of another branch to the commit the pull request reached by itself 
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
 })
 
+test('a deferral the store refuses stops the poll as failed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('poll:session-a', { ...pollNote(NOW - 1_000), running: true })
+  w.answers = async () => {
+    w.noteError = 'store busy'
+  }
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toContain('poll note:')
+})
+
+test('a --porcelain push of another branch to the commit the pull request reached by itself does not count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789' } })
+  const pushed = 'To github.com:HolyGrail/claude-mods.git\n \tHEAD:refs/heads/other\tc3c3c3c..b2b2b2b\nDone\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: pushed, stderr: '', interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.head = 'b2b2b2b0123456789'
+  w.pull.reviews = [{ id: 1, at: NOW + 20_000, comments: 1 }]
+  await clock.advance(30_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push --porcelain origin other' })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
 test('a final read of the notes that outlasts the lease sends nothing', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })

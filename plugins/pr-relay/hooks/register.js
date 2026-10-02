@@ -197,6 +197,8 @@ export function register(on) {
     // Bound to the pull request watched as the push starts, before anything else can turn the
     // watch to another
     const prId = watched && !watched.ended ? watched.id : null
+    // A failure to publish is shown only while the watch the push started under lasts
+    const watchGen = generation
     // Codex reviews what was pushed, so its earlier activity says nothing about this push. The push
     // is counted as started before anything is awaited, so a poll finishing meanwhile holds back
     // what it read from the head being replaced; a watch that turns to another pull request while
@@ -231,6 +233,7 @@ export function register(on) {
       // it is shown rather than holding up the push
       const publish = () =>
         refreshNote($, { strict: true }).catch((error) => {
+          if (generation !== watchGen || (watched?.id ?? null) !== prId) return
           lastCheck = { at: startedAt, error: `push note: ${error?.message ?? error}` }
           showStatus($)
         })
@@ -481,10 +484,21 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) {
     lastNote.deferred = true
-    // Written before the record is read, which the store may keep waiting
-    await writeNote($, lastNote)
+    // Written before the record is read, which the store may keep waiting. One the store refused
+    // would leave the others yielding to a poll that relays nothing, so the poll stops as failed
+    const refused = await writeNote($, lastNote, { strict: true }).then(
+      () => null,
+      (error) => error,
+    )
     // A watch that began while it went out owns the head and the session file now
     if (gen !== generation) return
+    if (refused) {
+      await retire($)
+      if (gen !== generation) return
+      lastCheck = { at: now, error: `poll note: ${refused?.message ?? refused}` }
+      showStatus($)
+      return
+    }
   }
   if (data.headRefOid) {
     lastHead = data.headRefOid
@@ -886,12 +900,17 @@ function pushCounts(push, data, now, { recordHead = null } = {}) {
 function pushedCommits(ran) {
   const text = [ran.text, ran.result?.stdout, ran.result?.stderr].filter((t) => typeof t === 'string').join('\n')
   if (/Everything up-to-date/.test(text)) return { shas: [], refs: {} }
-  const moves = [...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s+(\S+)/g)]
-  if (!moves.length) return null
+  // The usual form (old..new  src -> dst) and --porcelain's (flag TAB src:dst TAB old..new)
+  const moves = [
+    ...[...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s+(\S+)/g)].map((m) => [m[1], m[2]]),
+    ...[...text.matchAll(/^[ +\-*!=]\t[^\t]*:(\S+)\t[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\b/gm)].map((m) => [m[2], m[1]]),
+  ]
+  // --porcelain says a ref already up to date with =, and nothing else for it
+  if (!moves.length) return /^=\t/m.test(text) ? { shas: [], refs: {} } : null
   // The branch each ref moved to its commit, so a push can be told to have moved the pull request's
   // own branch even with no head known before it
-  const refs = Object.fromEntries(moves.map((m) => [m[2].replace(/^refs\/heads\//, ''), m[1]]))
-  return { shas: [...new Set(moves.map((m) => m[1]))], refs }
+  const refs = Object.fromEntries(moves.map(([sha, ref]) => [ref.replace(/^refs\/heads\//, ''), sha]))
+  return { shas: [...new Set(moves.map(([sha]) => sha))], refs }
 }
 
 // The head the watched pull request had as lately as this session knows: its own last poll or the
