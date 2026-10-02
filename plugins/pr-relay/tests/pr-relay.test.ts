@@ -358,6 +358,10 @@ test('waiting for Codex with poll-codex-review.sh --watch is refused while the p
     // The /dev skill's documented form
     'SCRIPT="$REPO_ROOT/.claude/skills/dev/references/scripts/poll-codex-review.sh"\n' +
       '"$SCRIPT" "$OWNER/$REPO" "$PR_NUMBER" "$LAST_PUSH_AT" --watch --max-wait 540',
+    `2>/tmp/poll.err ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `</dev/null >>/tmp/poll.log ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // The delimiter is EOF once its quotes are removed, so the call after the body still counts
+    `cat <<'E'OF\nbody\nEOF\n${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toContain('End the turn')
@@ -379,6 +383,8 @@ test('poll-codex-review.sh run without --watch, or only mentioned, is let throug
     'gh pr create --title "Narrow the deny" --body "It denied any mention of poll-codex-review.sh --watch"',
     "gh pr create --body 'poll-codex-review.sh --watch' --base main",
     `echo done # then ${POLL} HolyGrail/claude-mods 7 now --watch`,
+    `SCRIPT=${POLL}; SCRIPT=/bin/echo; "$SCRIPT" --watch`,
+    `bash -n ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toBeUndefined()

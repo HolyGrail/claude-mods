@@ -605,23 +605,32 @@ const SCRIPT = /(^|\/)poll-codex-review\.sh$/
 // Words that may stand before the command word without being it
 const PREFIXES = new Set(['!', '{', 'do', 'then', 'else', 'if', 'elif', 'while', 'until', 'time',
   'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh'])
+const SHELLS = new Set(['bash', 'sh', 'zsh'])
+// A shell word: quoted parts, escapes and plain characters, up to an unquoted blank or operator
+const SHELL_WORD = /^(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>()'"\\])+/
 
 function runsWatch(command) {
   if (!command.includes('poll-codex-review.sh')) return false
   const scripts = new Set()
   for (const words of simpleCommands(command)) {
     let i = 0
+    let shell = false
+    let checksOnly = false
     for (; i < words.length; i++) {
       const { text } = words[i]
       const assigned = /^(?:export\s+)?([A-Za-z_]\w*)=(.*)$/s.exec(text)
       if (assigned) {
         if (SCRIPT.test(assigned[2])) scripts.add(assigned[1])
+        else scripts.delete(assigned[1])
         continue
       }
+      if (SHELLS.has(text)) shell = true
+      // `bash -n` reads the script without running it
+      if (shell && /^-[A-Za-z]*n/.test(text)) checksOnly = true
       if (PREFIXES.has(text) || text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
       break
     }
-    if (i >= words.length) continue
+    if (i >= words.length || checksOnly) continue
     const variable = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(words[i].text)
     const isScript = variable ? scripts.has(variable[1]) : SCRIPT.test(words[i].text)
     if (isScript && words.slice(i + 1).some((w) => w.text === '--watch')) return true
@@ -635,15 +644,27 @@ function simpleCommands(command) {
   const commands = []
   let words = []
   let word = null
+  let quoted = false
   const heredocs = []
+  // The next word is a redirection's target, not part of the command
+  let target = false
   const endWord = () => {
-    if (word !== null) words.push({ text: word })
+    if (word !== null && !target) words.push({ text: word })
+    if (word !== null) target = false
     word = null
+    quoted = false
+  }
+  // Drops a file descriptor number written right before a redirection (`2>`)
+  const redirect = () => {
+    if (word !== null && /^\d+$/.test(word) && !quoted) word = null
+    endWord()
+    target = true
   }
   const endCommand = () => {
     endWord()
     if (words.length) commands.push(words)
     words = []
+    target = false
   }
   let i = 0
   while (i < command.length) {
@@ -667,6 +688,7 @@ function simpleCommands(command) {
       const end = command.indexOf("'", i + 1)
       const stop = end < 0 ? command.length : end
       word = (word ?? '') + command.slice(i + 1, stop)
+      quoted = true
       i = stop + 1
     } else if (c === '"') {
       let text = ''
@@ -677,32 +699,39 @@ function simpleCommands(command) {
         i += 1
       }
       word = (word ?? '') + text
+      quoted = true
       i += 1
     } else if (c === '#' && word === null) {
       const eol = command.indexOf('\n', i)
       i = eol < 0 ? command.length : eol
     } else if (command.startsWith('<<<', i)) {
-      endWord()
+      redirect()
       i += 3
     } else if (command.startsWith('<<', i)) {
       endWord()
-      const m = /^<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|<>()]+))/.exec(command.slice(i))
-      if (!m) {
+      const m = /^<<(-?)[ \t]*/.exec(command.slice(i))
+      const delimiter = SHELL_WORD.exec(command.slice(i + m[0].length))
+      if (!delimiter) {
         i += 2
         continue
       }
-      heredocs.push({ delimiter: m[2] ?? m[3] ?? m[4], stripTabs: m[1] === '-' })
-      i += m[0].length
+      // Quote removal, as Bash does to the delimiter word
+      const unquoted = delimiter[0].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+        (_, single, double, escaped) => single ?? escaped ?? double.replace(/\\(.)/g, '$1'))
+      heredocs.push({ delimiter: unquoted, stripTabs: m[1] === '-' })
+      i += m[0].length + delimiter[0].length
     } else if (c === '&' && command[i + 1] === '>') {
-      endWord()
-      i += 2
+      redirect()
+      i += command[i + 2] === '>' ? 3 : 2
     } else if (';&|()'.includes(c)) {
       endCommand()
       i += 1
     } else if (c === '<' || c === '>') {
-      endWord()
-      // `2>&1` and `&>` are redirections, not a background `&`
-      i += command[i + 1] === '&' ? 2 : 1
+      redirect()
+      // `>>`, `<>` and the `&` of `2>&1` belong to the redirection, not a background `&`
+      i += 1
+      if (command[i] === '>' || (c === '<' && command[i] === '>')) i += 1
+      if (command[i] === '&') i += 1
     } else if (c === ' ' || c === '\t') {
       endWord()
       i += 1
