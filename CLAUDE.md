@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. The repo root is also a plugin marketplace: `.claude-plugin/marketplace.json` lists every plugin, so a new plugin needs an entry there, and a user-visible change should bump `version` in that plugin's `plugin.json` so `claude plugin update` treats it as a new release. There is no package.json or build step; the module runs as plain JS inside Claude Code. The plugins are `plugins/usage-meter` and `plugins/zsh-safe`.
+A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. The repo root is also a plugin marketplace: `.claude-plugin/marketplace.json` lists every plugin, so a new plugin needs an entry there, and a user-visible change should bump `version` in that plugin's `plugin.json` so `claude plugin update` treats it as a new release. There is no package.json or build step; the module runs as plain JS inside Claude Code. The plugins are `plugins/usage-meter`, `plugins/pr-relay` and `plugins/zsh-safe`.
 
 User-facing docs (README.md) are written in Japanese; code comments, commit messages and test names are in English.
 
@@ -24,7 +24,7 @@ To try the mod in a live session, run `claude --plugin-dir ./plugins/usage-meter
 
 ## Testing approach
 
-Tests import `test`, `expect` and `mock` from `claude-code/testing`. Each test gets `$` (drives events into the module: `$.session.start`, `$.session.measure`, `$.ui.mount`, …) and `on` (stubs the host side: `session.usage`, `session.id`, `store.*`, `ui.render`). `mock.clock(on, { now })` fixes time. Shared helpers `stubSession` / `stubStore` back `$.store` with a `Map` so tests can assert on, or pre-seed, what other sessions saved. Assertions find rendered nodes with `ui.find({ type, text })`.
+Tests import `test`, `expect` and `mock` from `claude-code/testing`. Each test gets `$` (drives events into the module: `$.session.start`, `$.session.measure`, `$.tool.call`, `$.ui.mount`, …) and `on` (stubs the host side: `session.usage`, `session.id`, `store.*`, `process.run`, `fs.*`, `prompt.submit`, `ui.render`). `mock.clock(on, { now })` fixes time. Shared helpers `stubSession` / `stubStore` back `$.store` with a `Map` so tests can assert on, or pre-seed, what other sessions saved. Assertions find rendered nodes with `ui.find({ type, text })`.
 
 ## usage-meter architecture
 
@@ -41,6 +41,17 @@ Rate limits are per account, so readings are shared across all sessions on the m
 - `/clear`, `/resume` and `/branch` (fork) switch session id mid-module, handled in `classic.SessionStart`: the old key is released as if ended and writes move to the new id. Compaction keeps the same key.
 
 Rendering: SVG gauge when `e.surface === 'desktop'`, otherwise a text bar sized against `props.bodyColumns` (dropped entirely when the line won't fit). Color rules and thresholds are in the README and the constants at the top of `register.js`.
+
+## pr-relay architecture
+
+`hooks/register.js` polls the session's pull request every 60 s with one `gh api graphql` query (`$.process.run`) and wakes the session with `$.prompt.submit` when Codex reviews or approves it; a merge raises a toast and a `cleanup` button in the band instead, and a merged or closed pull request stops the polling. CI is left to the desktop app.
+
+- The pull request comes from `~/.claude/dev-sessions/*.json` (the `/dev` skill's session with the deepest `worktree_path` holding the cwd), else `gh pr view`, else the URL a `gh pr create` Bash call printed.
+- Codex events count only after the last push (the newest of the session file's `review.last_push_at`, re-read every poll; the start of a `git push` this session ran, once the head has moved; and the head commit's date). Nothing is relayed while a `git push` runs. Each connection is followed back a page at a time while its oldest item is still after the last push: Codex's thumbs-up is one reaction per pull request whose time can stay at an older push. The rules are ported from the skill's `poll-codex-review.sh`; the GraphQL login has no `[bot]` suffix.
+- `/resume` can switch the conversation without a new `session.start`, so `classic.SessionStart` with `source: 'resume'` drops the watch and looks for the pull request again.
+- Polls run on `$.clock` timers, never inside a hook: a prompt `$.prompt.submit` queues resolves only when its turn starts, so awaiting one inside `tool.call` would wait on the running turn. `generation` lets a poll or lookup started before the latest watch or stop leave the state alone.
+- What was relayed is kept per pull request under `pr:<id>` (the URL in lower case) in `$.store`, so a second session on the same pull request, or a restart, is not woken again; two sessions polling it at the same moment can both be, since `$.store` has no atomic update. The record is marked before the prompt is sent, and a prompt that did not enter (rejected, or dropped by a hook) takes its mark back for the next poll to resend.
+- The tool `mcp__pr-relay__watch` is how the skill tells the mod runs (and can set the pull request and baseline); while a pull request is watched, a Bash call running `poll-codex-review.sh --watch` is denied.
 
 ## zsh-safe architecture
 
