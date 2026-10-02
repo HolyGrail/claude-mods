@@ -130,8 +130,9 @@ export function register(on) {
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const command = e.command ?? ''
-    // A stopgap until the /dev skill's Phase 5.5 ends the turn after a push by itself: its waiting
-    // loop would otherwise poll for what this module already watches
+    // The /dev skill's Phase 5.5 ends the turn after a push when the watch tool is there; this
+    // stops a session that polls anyway (an older copy of the skill, or a model off its steps)
+    // from watching what this module already watches
     if (watched && !watched.ended && /poll-codex-review\.sh/.test(command) && /--watch\b/.test(command)) {
       return {
         deny:
