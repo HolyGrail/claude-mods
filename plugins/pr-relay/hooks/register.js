@@ -318,12 +318,16 @@ function watch($, { url, since, sessionFile = null }) {
   stop()
   const gen = generation
   const pr = parse(url)
+  // The note of the pull request watched before must not hold back the sessions still watching it
+  // while this watch's first poll reads the session file
+  if (lastNote && lastNote.pr !== pr.id) retire($)
   // A push still waiting for its head to move belongs to the pull request watched before; with
   // none watched, or the one watched ended, it is the push that led here
   if (watched && !watched.ended && watched.id !== pr.id) pushes = []
+  // Watching the same pull request again keeps the baseline its polls learned
+  if (watched?.id !== pr.id) knownSince = 0
   watched = { ...pr, since, sessionFile }
   lookupFailure = null
-  knownSince = 0
   lastHead = null
   lastHeadAt = 0
   // The band may still offer the cleanup of the pull request watched before
@@ -390,6 +394,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   const seenAt = await $.clock.now()
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
+  // A query that outlasted the time the others wait on a running note may have seen another
+  // session take the round over, which this one's election cannot tell: it relays nothing
+  if (!answer.error && seenAt >= now + RUNNING_MS - ROUND_MS) answer.error = new Error('GitHub answered too late')
   if (answer.error) {
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
@@ -438,7 +445,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
-    knownSince = Math.max(knownSince, record.since)
+    // An ended poll goes on past a new watch, whose baseline is not this pull request's
+    if (watched?.id === pr.id) knownSince = Math.max(knownSince, record.since)
     if (defers) return sends
     record.at = now
     if (data.headRefOid) record.headAt = seenAt
@@ -495,6 +503,8 @@ async function notePoll($, pr, at, gen) {
   if (gen !== generation) return null
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
+  // Watching the same pull request again starts from what its note last said
+  if (lastNote?.key === key) knownSince = Math.max(knownSince, lastNote.since)
   // Coming back to a pull request this session left, its note still holds pushes the record may
   // not have counted yet
   const left = retired.get(key)
@@ -529,8 +539,8 @@ async function refreshNote($, { strict = false } = {}) {
 }
 
 // Rewrites the notes this session left until the store has taken each as idle and with its pushes
-// as they stand; a write the store refused is tried again on the next poll. A note of a pull
-// request the session turned from is forgotten once no push in it runs.
+// as they stand; a write the store refused is tried again on the next poll. Each is kept for as
+// long as the session runs, since coming back to its pull request takes up what it held.
 async function settleRetired($) {
   await Promise.all(
     [...retired.values()].map(async (note) => {
@@ -538,8 +548,6 @@ async function settleRetired($) {
         catchUp(note)
         await writeNote($, note, { strict: true }).catch(() => {})
       }
-      if (note.dirty || !note.writtenIdle || note.pr === watched?.id) return
-      if (!note.pending.some((push) => push.running)) retired.delete(note.key)
     }),
   )
 }

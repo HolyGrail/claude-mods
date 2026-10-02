@@ -1651,3 +1651,72 @@ test('pruning leaves a note its session wrote again while it was deciding', asyn
   await started
   expect(w.store.get('poll:session-a')).toEqual(pollNote(NOW + 2_000))
 })
+
+test('watching the same pull request again keeps the push its note was handing on', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Codex reviewed before the push only the session file records
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: LAST_PUSH - 2 * MINUTE, comments: 1 }] } })
+  // This session's first poll leaves the round to another, so no record holds the push yet
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.get(NOTE)).toMatchObject({ since: LAST_PUSH })
+
+  // The session file cannot be read when the watch starts over
+  w.devSessions = {}
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ since: LAST_PUSH })
+})
+
+test('turning to another pull request frees the last one\'s round at once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The next poll waits on GitHub, and the watch turns while it does
+  w.answers = () => clock.sleep(5 * MINUTE)
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  w.reads = () => clock.sleep(20_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(1_000)
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+  expect(w.store.get(NOTE)).not.toHaveProperty('running')
+})
+
+test('a merge seen as the watch turns leaves the next pull request\'s baseline alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The record of the merged pull request knows of a later push, and is slow to read
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(record, { ...(w.store.get(record) as object), since: NOW + 30_000 })
+  w.pull.state = 'MERGED'
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  w.gets = undefined
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(2 * MINUTE)
+  expect(w.store.get(NOTE9)).toMatchObject({ pr: PR9.toLowerCase() })
+  expect((w.store.get(NOTE9) as { since: number }).since).toBeLessThan(NOW + 30_000)
+})
+
+test('a poll whose query outlasted its turn relays nothing beside the one that took it over', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.answers = () => clock.sleep(11 * MINUTE)
+  await $.session.start(START)
+  // Another session stops waiting on this one and polls itself
+  await clock.advance(10 * MINUTE + 30_000)
+  w.store.set('poll:session-a', { ...pollNote(NOW + 10 * MINUTE + 30_000), running: true })
+  await clock.advance(30_000)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('GitHub answered too late')
+})
