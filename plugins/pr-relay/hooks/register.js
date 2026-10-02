@@ -93,14 +93,14 @@ const retired = new Map()
 let noteSerial = 0
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
-// When this session last ran git push. It becomes the baseline only once the pull request's head
-// has moved, since a push that changed nothing ("Everything up-to-date", another branch) must not
-// hide the events that came before it.
-let pushedAt = 0
-// The head the pull request had as far as this session knew when that push started, and the
-// commits the push moved refs to once it has finished (null while unknown)
-let pushHead = null
-let pushShas = null
+// The git push calls this session ran for the watched pull request that have not counted yet, each
+// { at, head, shas, running }: when it started, the head the pull request had as far as the session
+// knew then, and once it has finished, the commits it moved refs to (null when its output does not
+// say). A push becomes the baseline only once GitHub shows what it pushed, since one that changed
+// nothing ("Everything up-to-date", another branch) must not hide the events that came before it.
+// Notes hold the same objects, so a push that finishes after the session turned to another pull
+// request still updates the note it was in.
+let pushes = []
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
 let pushesRunning = 0
@@ -177,17 +177,16 @@ export function register(on) {
     // Best effort: a push or a pull request made any other way is caught by the head commit's date,
     // the /dev session file and session.start
     const creates = /\bgh\s+pr\s+create\b/.test(command)
-    const pushes = !creates && /\bgit\s+push\b/.test(command)
-    if (!creates && !pushes) return next(e)
+    const pushing = !creates && /\bgit\s+push\b/.test(command)
+    if (!creates && !pushing) return next(e)
     const startedAt = await $.clock.now()
     // Codex reviews what was pushed, so its earlier activity says nothing about this push. The time
     // is set before the push runs, so a poll that sees the new head while it is still finishing
     // already applies it, and put back if the push failed.
-    const before = { at: pushedAt, head: pushHead, shas: pushShas }
-    if (pushes) {
-      pushHead = await headBefore($)
-      pushedAt = startedAt
-      pushShas = null
+    let push = null
+    if (pushing) {
+      push = { at: startedAt, head: await headBefore($), shas: null, running: true }
+      pushes.push(push)
       pushesRunning += 1
       // The other sessions hold back their relays only if they can see the push; a store that
       // will not take it is shown rather than holding up the push
@@ -200,18 +199,22 @@ export function register(on) {
     try {
       ran = await next(e)
     } finally {
-      if (pushes) pushesRunning -= 1
+      if (push) {
+        pushesRunning -= 1
+        push.running = false
+      }
     }
-    // A push that moved nothing says nothing about what Codex reviewed
-    const shas = pushes && !(ran.deny !== undefined || ran.isError) ? pushedCommits(ran) : null
-    if (ran.deny !== undefined || ran.isError || shas?.length === 0) {
-      if (pushes && pushedAt === startedAt) ({ at: pushedAt, head: pushHead, shas: pushShas } = before)
-      if (pushes) await refreshNote($)
-      return ran
+    // A push that failed or moved nothing says nothing about what Codex reviewed
+    const failed = ran.deny !== undefined || ran.isError
+    const shas = push && !failed ? pushedCommits(ran) : null
+    if (push) {
+      if (failed || shas?.length === 0) push.dropped = true
+      else push.shas = shas
+      pushes = pushes.filter((p) => !p.dropped)
+      // The other sessions hold back their relays only while the push runs
+      await refreshNote($)
     }
-    if (pushes && pushedAt === startedAt) pushShas = shas
-    // The other sessions hold back their relays only while the push runs
-    if (pushes) await refreshNote($)
+    if (failed) return ran
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
@@ -263,7 +266,7 @@ function reset($) {
   lastCheck = null
   lookupFailure = null
   offersCleanup = false
-  pushedAt = 0
+  pushes = []
   showStatus($)
 }
 
@@ -300,7 +303,7 @@ function watch($, { url, since, sessionFile = null }) {
   const pr = parse(url)
   // A push still waiting for its head to move belongs to the pull request watched before; with
   // none watched, or the one watched ended, it is the push that led here
-  if (watched && !watched.ended && watched.id !== pr.id) pushedAt = 0
+  if (watched && !watched.ended && watched.id !== pr.id) pushes = []
   watched = { ...pr, since, sessionFile }
   lookupFailure = null
   knownSince = 0
@@ -334,6 +337,7 @@ async function poll($, gen) {
 
 async function pollOnce($, gen) {
   if (gen !== generation || !watched || watched.ended) return
+  await settleRetired($)
   const pr = watched
   const key = KEY_PREFIX + pr.id
   // /dev writes the session's pr_url only after the pull request exists, so a watch that began
@@ -365,6 +369,8 @@ async function pollOnce($, gen) {
 
 async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note }) {
   const answer = await query($, pr, floor).then((data) => ({ data }), (error) => ({ error }))
+  // When GitHub showed the head, which is what tells a fresher head from a staler one
+  const seenAt = await $.clock.now()
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
   if (answer.error) {
@@ -388,9 +394,11 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     return
   }
   const { defers, since: othersSince, pending, pushing } = notes
+  // Said in the note, so a later poll of another session does not yield to this one in turn
+  if (defers && lastNote?.serial === note.serial) lastNote.deferred = true
   if (data.headRefOid) {
     lastHead = data.headRefOid
-    lastHeadAt = now
+    lastHeadAt = seenAt
   }
   lastCheck = { at: now }
   watched = { ...watched, ...(sessionFile ? { sessionFile } : {}) }
@@ -408,7 +416,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
 
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
-    // A watch that began while this waited its turn owns pushedAt and the marks now
+    // A watch that began while this waited its turn owns the pushes and the marks now
     if (gen !== generation && !ended) return null
     const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
@@ -416,6 +424,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     knownSince = Math.max(knownSince, record.since)
     if (defers) return sends
     record.at = now
+    if (data.headRefOid) record.headAt = seenAt
     await $.store.set(key, record)
     // Pages are skipped next time only once what they held is in the record: a session that leaves
     // the waking to another goes through them again in case that one never writes it
@@ -438,12 +447,11 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // presence would read as an approval of every later push.
   const committedAt = Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0
   record.since = Math.max(record.since, pr.since, recordedPush, committedAt, notedPush)
-  const own = pendingPush()
-  if (own && pushCounts(own, data, { own: true, recordHead: record.head })) {
-    record.since = Math.max(record.since, own.at)
-    pushedAt = 0
-    pushShas = null
-  }
+  pushes = pushes.filter((push) => {
+    if (!pushCounts(push, data, { own: true, recordHead: record.head })) return true
+    record.since = Math.max(record.since, push.at)
+    return false
+  })
   // Another session's push counts by the same rule; one that knew no head before it cannot tell a
   // push that moved nothing from one that did, so it waits for that session's own poll
   for (const push of pending) {
@@ -470,7 +478,7 @@ async function notePoll($, pr, at, gen) {
   if (gen !== generation) return null
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
-  lastNote = { key, pr: pr.id, at, since: knownSince, pending: pendingPush(), running: true, serial: ++noteSerial }
+  lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, serial: ++noteSerial }
   retired.delete(key)
   await writeNote($, lastNote, { strict: true })
   return { ...lastNote }
@@ -488,22 +496,31 @@ async function finishNote($, note) {
 // relays before this one polls again counts it
 async function refreshNote($, { strict = false } = {}) {
   const writes = []
-  for (const note of [lastNote, ...retired.values()]) {
-    if (!note) continue
+  if (lastNote && lastNote.pr === watched?.id) {
+    catchUp(lastNote)
+    writes.push(writeNote($, lastNote, { strict }))
+  }
+  for (const note of retired.values()) {
     if (note.pr === watched?.id) {
       catchUp(note)
       writes.push(writeNote($, note, { strict }))
-      continue
     }
-    // A note left for a pull request the session turned from still says whether the push runs
-    if (note.pending?.running && pushesRunning === 0) {
-      const { running, ...pending } = note.pending
-      note.pending = pending
-      writes.push(writeNote($, note, { strict }))
-    }
-    if (note.idle && !note.pending?.running) retired.delete(note.key)
   }
-  await Promise.all(writes)
+  await Promise.all([...writes, settleRetired($)])
+}
+
+// Rewrites the notes left for pull requests the session turned from while a push in them ran,
+// until one says the push has finished; a write the store refused is tried again on the next poll
+async function settleRetired($) {
+  await Promise.all(
+    [...retired.values()].map(async (note) => {
+      if (note.pr === watched?.id || !note.written?.some((push) => push.running)) {
+        if (note.pr !== watched?.id) retired.delete(note.key)
+        return
+      }
+      await writeNote($, note, { strict: true }).catch(() => {})
+    }),
+  )
 }
 
 // Leaves this session's note idle: it holds back no other session, and still hands on its push
@@ -523,19 +540,32 @@ async function retire($) {
 function catchUp(note) {
   if (note.pr !== watched?.id) return
   note.since = Math.max(note.since, knownSince)
-  note.pending = pendingPush()
+  note.pending = [...pushes]
 }
 
-function writeNote($, { key, pr, at, since, pending, running, idle }, { strict = false } = {}) {
-  const value = { pr, at, since, ...(pending ? { pending } : {}), ...(running ? { running } : {}), ...(idle ? { idle } : {}) }
-  const write = $.store.set(key, value)
+// Writes a note as it stands, its pushes included; written keeps what the store was last told of
+// them once it took it
+function writeNote($, note, { strict = false } = {}) {
+  const { key, pr, at, since, running, idle, deferred } = note
+  const pending = (note.pending ?? []).filter((push) => !push.dropped).map(pushNote)
+  const value = {
+    pr,
+    at,
+    since,
+    ...(pending.length ? { pending } : {}),
+    ...(running ? { running } : {}),
+    ...(idle ? { idle } : {}),
+    ...(deferred ? { deferred } : {}),
+  }
+  const write = $.store.set(key, value).then(() => {
+    note.written = pending
+  })
   return strict ? write : write.catch(() => {})
 }
 
-// A push this session ran that has not counted yet, for the session that relays to apply
-function pendingPush() {
-  if (!pushedAt) return null
-  return { at: pushedAt, head: pushHead, ...(pushShas ? { shas: pushShas } : {}), ...(pushesRunning > 0 ? { running: true } : {}) }
+// A push as a note hands it on, for the session that relays to apply
+function pushNote({ at, head, shas, running }) {
+  return { at, head, ...(shas ? { shas } : {}), ...(running ? { running } : {}) }
 }
 
 // Whether a push moved the pull request to the head GitHub shows now: once it has finished, by the
@@ -556,7 +586,7 @@ function pushedCommits(ran) {
   const text = [ran.text, ran.result?.stdout, ran.result?.stderr].filter((t) => typeof t === 'string').join('\n')
   if (/Everything up-to-date/.test(text)) return []
   const shas = [...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s/g)].map((m) => m[1])
-  return shas.length ? shas : null
+  return shas.length ? [...new Set(shas)] : null
 }
 
 // The head the watched pull request had as lately as this session knows: its own last poll or the
@@ -564,7 +594,7 @@ function pushedCommits(ran) {
 async function headBefore($) {
   if (!watched || watched.ended) return null
   const record = await $.store.get(KEY_PREFIX + watched.id).catch(() => undefined)
-  return record?.head && (record.at ?? 0) > lastHeadAt ? record.head : lastHead
+  return record?.head && (record.headAt ?? record.at ?? 0) > lastHeadAt ? record.head : lastHead
 }
 
 // What the other sessions' notes on the same pull request say: defers, whether one of them started
@@ -584,12 +614,15 @@ async function readNotes($, pr, note) {
     const other = await $.store.get(key)
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
     if (typeof other.since === 'number') since = Math.max(since, other.since)
-    if (typeof other.pending?.at === 'number') {
-      pending.push(other.pending)
+    for (const push of [].concat(other.pending ?? [])) {
+      if (typeof push?.at !== 'number') continue
+      pending.push(push)
       // One left running by a session that died mid-push holds nothing back for long
-      if (other.pending.running && other.pending.at >= note.at - RUNNING_MS) pushing = true
+      if (push.running && push.at >= note.at - RUNNING_MS) pushing = true
     }
-    if (other.idle || other.at > note.at) continue
+    // A poll that left the round to another holds nothing back either: polls a few seconds apart
+    // would otherwise each yield to the one before, round after round, and none would relay
+    if (other.idle || other.deferred || other.at > note.at) continue
     if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
@@ -840,13 +873,14 @@ async function prune($) {
 // Whether the pushes a poll note hands on are in its pull request's record already
 async function counted($, note) {
   const since = normalize(await $.store.get(KEY_PREFIX + note?.pr)).since
-  return !(note?.since > since) && !(note?.pending?.at > since)
+  return !(note?.since > since) && ![].concat(note?.pending ?? []).some((push) => push?.at > since)
 }
 
 function normalize(record) {
   return {
     since: record?.since ?? 0,
     head: record?.head ?? null,
+    headAt: record?.headAt ?? 0,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
     reviews: Array.isArray(record?.reviews) ? record.reviews : [],
