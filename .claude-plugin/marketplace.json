@@ -14,6 +14,11 @@
       "name": "notice-board",
       "source": "./plugins/notice-board",
       "description": "Shares notices with every session in the same repository, or on the machine"
+    },
+    {
+      "name": "pr-relay",
+      "source": "./plugins/pr-relay",
+      "description": "Watches the session's pull request and wakes the session when it is merged or Codex reviews it"
     }
   ]
 }
