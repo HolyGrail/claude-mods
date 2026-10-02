@@ -775,6 +775,26 @@ test('a notice told before a full window dropped its row is still withdrawn when
   expect(store.has('told:this')).toBe(false)
 })
 
+test('a notice a compaction folded away is still withdrawn when cleared', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  on('classic.SessionStart', () => {
+    // The summary that replaces the conversation holds no row
+    host.transcript = [said('user', 'Summary of the conversation so far.')]
+    return {}
+  })
+  on('prompt.submit', ($, e) => e as never)
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(1)
+
+  await $.classic.SessionStart({ source: 'compact' })
+  store.delete('notice:1-a')
+  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
+})
+
 test('a refusal met by a tick during a conversation switch is not held against the new one', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])

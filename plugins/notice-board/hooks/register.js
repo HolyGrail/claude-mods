@@ -222,12 +222,13 @@ async function load($) {
   }
   const secrets = await secretsOf($)
   const { told, withdrawals } = await toldIn(messages, secrets, await known)
-  // A full window may have dropped rows this conversation was told: the record keeps those, less
-  // what the window shows was withdrawn since
+  // Rows this conversation was told may be gone from what is read, dropped by a full window or
+  // folded into a compaction's summary: the record keeps those, less what the conversation shows
+  // was withdrawn since. They only count for withdrawing; a notice still shown whose row is gone is
+  // told again
   const record = await $.store.get(RECORD_PREFIX + id)
   const recorded = isRecord(record) ? record.told : []
-  const earlier =
-    messages.length < WINDOW ? [] : recorded.filter((r) => !told.has(r.key) && !withdrawals.has(r.text))
+  const earlier = recorded.filter((r) => !told.has(r.key) && !withdrawals.has(r.text))
   const shownTexts = new Set(shown.map((notice) => notice.text))
   // This session's own posts too: a command's output is not part of what the model reads. Oldest
   // first, and one row for notices that read the same
