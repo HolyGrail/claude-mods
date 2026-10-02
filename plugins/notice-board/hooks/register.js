@@ -9,17 +9,23 @@ let sessionId = null
 let ticker = null
 // Loads run one at a time, so a tick and a command can't pass the same notice on twice
 let queue = Promise.resolve()
-// Set when the conversation was replaced, so the next tick tells the new one every notice
-let forgetNext = false
+// The lines the host refused to add, by key, so a refusal is not retried every tick. Forgotten
+// when the conversation is replaced or shrinks (/rewind), which may want them again.
+const refused = new Set()
+// How many messages the conversation held at the last load
+let lastLength = 0
 // Counts this module's posts, so two in the same millisecond get keys of their own
 let posts = 0
 
 // $.store has no atomic update, so each notice has a key of its own: posting never overwrites
 // another session's notice, and clearing deletes keys instead of rewriting a shared list
 const KEY_PREFIX = 'notice:'
-// The notices this session has passed on to the model, kept by the host so a hot reload or a
-// worker respawn does not pass them on again. Only load writes it.
-const KNOWN = { plugin: 'notice-board', key: 'known' }
+// What the model was told is read back from the conversation itself, so a reload, /clear,
+// compaction, /resume, /rewind and /branch each leave it right: the lines this module added start
+// with these, and a row made of nothing else is one of them
+const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)$/
+const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)$/
+const LINE_START = /\n(?=Notice to every Claude Code session |This notice no longer applies: )/
 // How often to pick up notices other sessions posted or cleared
 const TICK_MS = 60_000
 // The band shows this many notices, newest first, and counts the rest
@@ -36,7 +42,7 @@ export function register(on) {
     ticker?.cancel()
     // The queue stays: a load the previous start began may still be running
     notices = []
-    forgetNext = false
+    refused.clear()
     sessionId = await $.session.id()
     await $.command.register({
       name: 'notice',
@@ -48,22 +54,20 @@ export function register(on) {
     return next(e)
   })
 
-  // /clear, /resume and /branch (fork) switch to another session id, which later posts carry.
-  // /clear, compaction and /resume leave a conversation that may not hold the notices, so the next
-  // tick passes them on again; not now, since /resume installs its conversation only after this
-  // hook. A fork copies the conversation, the notices with it.
+  // /clear, /resume and /branch (fork) switch to another session id, which later posts carry. The
+  // conversation they leave is read at the next load: /resume installs its own only after this hook,
+  // so a tick in between may tell the outgoing one, and the load after it tells the new one
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
-    const result = await next(e)
-    // Only now, so a tick during the switch can't spend the flag on the outgoing conversation
-    if (e.source !== 'fork') forgetNext = true
-    return result
+    refused.clear()
+    return next(e)
   })
 
-  // A prompt or a /notice comes from the conversation that is now installed, so the notices are
-  // retold there; a tick may still run against the outgoing one, and what it tells is retold here
+  // Before the model reads a prompt, the conversation it reads is brought up to date: /rewind
+  // raises no event of its own, and the lines it took back are retold here
   on('prompt.submit', async ($, e, next) => {
-    if (forgetNext) await refresh($, { consume: true })
+    // A load that fails must not hold the prompt back; the next tick tries again
+    await refresh($).catch(() => {})
     return next(e)
   })
 
@@ -114,13 +118,13 @@ async function post($, text, all) {
   const postedAt = await $.clock.now()
   posts += 1
   await $.store.set(KEY_PREFIX + postedAt + '-' + sessionId + '-' + posts, { text, repo: all ? null : repoKey, postedAt })
-  await refresh($, { consume: true })
+  await refresh($)
   return all ? 'Posted to every session on this machine.' : 'Posted to every session in this repository.'
 }
 
 // Takes down every notice this session shows; each other session tells its model at its next tick
 async function clear($) {
-  await refresh($, { consume: true })
+  await refresh($)
   const cleared = notices
   await Promise.all(cleared.map((notice) => $.store.delete(KEY_PREFIX + notice.id)))
   await refresh($)
@@ -129,20 +133,16 @@ async function clear($) {
 }
 
 // Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws
-function refresh($, { consume = false } = {}) {
-  const run_ = () => {
-    const forget = consume && forgetNext
-    if (forget) forgetNext = false
-    return load($, { forget })
-  }
+function refresh($) {
+  const run_ = () => load($)
   const run = queue.then(run_, run_)
   queue = run.catch(() => {})
   return run.then(() => $.ui.invalidate('ui.render'))
 }
 
-// Reads the notices meant for this session, and tells the model about the ones it has not seen
-// and the ones it saw that have since been cleared. forget starts from a model that has seen none.
-async function load($, { forget = false } = {}) {
+// Reads the notices meant for this session, and tells the model about the ones its conversation
+// does not hold and the ones it holds that have since been cleared
+async function load($) {
   const repoKey = repoKeyOf(await $.session.repo())
   const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
@@ -157,22 +157,24 @@ async function load($, { forget = false } = {}) {
   shown.sort((a, b) => b.postedAt - a.postedAt || (a.id < b.id ? 1 : -1))
   notices = shown
 
-  const known = forget ? [] : ((await $.state.get(KNOWN)).value ?? [])
-  const knownIds = new Set(known.map((k) => k.id))
-  const shownIds = new Set(shown.map((notice) => notice.id))
-  // This session's own posts too: a command's output is not part of what the model reads
-  const fresh = shown.filter((notice) => !knownIds.has(notice.id)).reverse()
+  const messages = await $.session.messages()
+  if (messages.length < lastLength) refused.clear()
+  lastLength = messages.length
+  const told = toldIn(messages)
+  const toldTexts = new Set(told.values())
+  const shownTexts = new Set(shown.map((notice) => notice.text))
+  // This session's own posts too: a command's output is not part of what the model reads. Oldest
+  // first, and one line for notices that read the same
+  const fresh = []
+  for (const notice of [...shown].reverse()) {
+    const key = toldKey(notice)
+    if (!told.has(key) && !refused.has(key) && !fresh.some((f) => toldKey(f) === key)) fresh.push(notice)
+  }
   // Cleared, or meant for a repository this session has left; one whose text another notice shown
   // here still carries still applies
-  const withdrawn = known.filter((k) => !shownIds.has(k.id) && !shown.some((notice) => notice.text === k.text))
-  if (!forget && fresh.length === 0 && withdrawn.length === 0) return
-
-  // Known before the append: a run that refuses it refuses it every time, so it is not retried
-  await $.state.set(KNOWN, [
-    ...known.filter((k) => shownIds.has(k.id)),
-    ...fresh.map((notice) => ({ id: notice.id, text: notice.text })),
-  ])
+  const withdrawn = [...toldTexts].filter((text) => !shownTexts.has(text) && !refused.has('withdrawn\n' + text))
   if (fresh.length === 0 && withdrawn.length === 0) return
+
   const now = await $.clock.now()
   const lines = [
     ...fresh.map(
@@ -181,14 +183,43 @@ async function load($, { forget = false } = {}) {
         (notice.repo === null ? 'on this machine' : 'in this repository') +
         ', posted ' + ago(now - notice.postedAt) + ' ago with /notice: ' + notice.text,
     ),
-    ...withdrawn.map((k) => 'This notice no longer applies: ' + k.text),
+    ...withdrawn.map((text) => 'This notice no longer applies: ' + text),
   ]
   const text = lines.join('\n')
   const result = await $.session
     .append({ message: { type: 'user', content: [{ type: 'text', text }] } })
     .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
+  if (result.deny === undefined) return
   // A run no plugin may shape refuses the row; the band still shows the notices
-  if (result.deny !== undefined) $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + text, { to: 'debug' })
+  for (const notice of fresh) refused.add(toldKey(notice))
+  for (const text of withdrawn) refused.add('withdrawn\n' + text)
+  $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + text, { to: 'debug' })
+}
+
+// The notices the conversation tells the model of, by key, with their text: each line this module
+// added in order, a withdrawal taking back every notice of its text
+function toldIn(messages) {
+  const told = new Map()
+  for (const message of messages) {
+    if (message.role !== 'user') continue
+    const parts = message.text.split(LINE_START)
+    if (!parts.every((part) => TOLD.test(part) || WITHDRAWN.test(part))) continue
+    for (const part of parts) {
+      const added = TOLD.exec(part)
+      if (added) {
+        told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
+        continue
+      }
+      const text = WITHDRAWN.exec(part)[1]
+      for (const [key, value] of told) if (value === text) told.delete(key)
+    }
+  }
+  return told
+}
+
+// Notices of one scope that read the same are told once
+function toldKey(notice) {
+  return (notice.repo === null ? 'all' : 'repo') + '\n' + notice.text
 }
 
 // Names a repository the same in each of its worktrees and clones: the origin remote as
