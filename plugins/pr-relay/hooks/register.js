@@ -703,8 +703,10 @@ async function notePoll($, pr, gen) {
     for (const push of [].concat(stored.pending ?? [])) {
       if (typeof push?.at !== 'number' || pushes.some((p) => pushKey(p) === pushKey(push))) continue
       // Whether a push the last module saw running pushed anything is unknown, so it counts once
-      // the head moves
+      // the head moves; one that may still run (the worker went, not the Bash call) holds the
+      // relays back as long as another session's would
       const finished = !push.running
+      const live = !finished && push.at >= at - RUNNING_MS
       pushes.push({
         id: push.id ?? null,
         pr: pr.id,
@@ -713,7 +715,7 @@ async function notePoll($, pr, gen) {
         shas: finished ? (push.shas ?? null) : null,
         refs: finished ? (push.refs ?? null) : null,
         ...(finished && typeof push.doneAt === 'number' ? { doneAt: push.doneAt } : {}),
-        running: false,
+        running: live,
       })
     }
   }
@@ -866,11 +868,15 @@ function pushCounts(push, data, now, { recordHead = null } = {}) {
   if (holds(push, now) || !head) return false
   const before = push.head ?? recordHead
   if (Array.isArray(push.shas)) {
-    if (before != null) return before !== head && push.shas.some((sha) => head.startsWith(sha))
-    // Without the head before it, a pushed commit the head has may be another ref moved to it: only
-    // the pull request's own branch moving to it says the push moved the head
-    const sha = data.headRefName ? push.refs?.[data.headRefName] : null
-    return typeof sha === 'string' && head.startsWith(sha)
+    // A pushed commit the head has may be another ref moved to it, where the pull request's branch
+    // got by itself: when the output says which branch moved where, only its own branch counts
+    const own = data.headRefName ? push.refs?.[data.headRefName] : null
+    const named = push.refs && Object.keys(push.refs).length > 0
+    const moved = named ? typeof own === 'string' && head.startsWith(own) : push.shas.some((sha) => head.startsWith(sha))
+    if (before != null) return before !== head && moved
+    // Without the head before it, only the pull request's own branch moving to it says the push
+    // moved the head
+    return typeof own === 'string' && head.startsWith(own)
   }
   return before != null && head !== before
 }

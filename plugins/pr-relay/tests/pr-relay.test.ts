@@ -2214,6 +2214,33 @@ test('a module started afresh for the same session keeps what its note in the st
   expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW - 10_000 })
 })
 
+test('a module started afresh while its push still runs holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', reviews: [{ id: 1, at: NOW - 20_000, comments: 1 }] } })
+  // The worker went while the Bash call it started went on
+  w.store.set(NOTE, { ...pollNote(NOW - MINUTE), idle: true, pending: [{ id: 'p', at: NOW - 30_000, head: 'a1', running: true }] })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push of another branch to the commit the pull request reached by itself does not count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789' } })
+  const pushed = '   c3c3c3c..b2b2b2b  other -> other\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The pull request moved to b2 and Codex reviewed it before this session polled again
+  w.pull.head = 'b2b2b2b0123456789'
+  w.pull.reviews = [{ id: 1, at: NOW + 20_000, comments: 1 }]
+  await clock.advance(30_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin other' })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
 test('a final read of the notes that outlasts the lease sends nothing', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
