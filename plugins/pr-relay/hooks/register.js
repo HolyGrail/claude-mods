@@ -62,7 +62,7 @@ const MAX_PAGES = 10
 const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int!, $before: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
-const QUERY = queryOf(`state headRefOid commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
+const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 
 // The pull request this session watches: { url, id, owner, name, number, since, sessionFile,
 // pagedAt?, ended? },
@@ -231,10 +231,13 @@ export function register(on) {
       await publish()
     }
     // The other sessions hold back their relays only while the push runs
-    const finish = async ({ dropped = false, shas = null } = {}) => {
+    const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {
       push.running = false
       if (dropped) push.dropped = true
-      else push.shas = shas
+      else {
+        push.shas = shas
+        push.refs = refs
+      }
       pushes = pushes.filter((p) => !p.dropped)
       for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
       await refreshNote($)
@@ -249,8 +252,8 @@ export function register(on) {
     }
     // A push that failed or moved nothing says nothing about what Codex reviewed
     const failed = ran.deny !== undefined || ran.isError
-    const shas = push && !failed ? pushedCommits(ran) : null
-    if (push) await finish({ dropped: failed || shas?.length === 0, shas })
+    const moved = push && !failed ? pushedCommits(ran) : null
+    if (push) await finish({ dropped: failed || moved?.shas.length === 0, shas: moved?.shas, refs: moved?.refs })
     if (failed) return ran
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
@@ -507,6 +510,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const known = new Set(pending.map((push) => push.at))
     pushedSince =
       !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(push.at))
+    // A read the store kept waiting past the lease may have let another session take the round over
+    // and relay the same, so this one leaves the marks as they are for it and sends nothing
+    if (lapsed(now, await $.clock.now())) return late($, now, pr, note)
   }
   const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => push.running))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
@@ -598,7 +604,14 @@ async function notePoll($, pr, gen) {
       if (typeof push?.at !== 'number' || pushes.some((p) => p.at === push.at)) continue
       // Whether a push the last module saw running pushed anything is unknown, so it counts once
       // the head moves
-      pushes.push({ at: push.at, head: push.head ?? null, shas: push.running ? null : (push.shas ?? null), running: false })
+      const finished = !push.running
+      pushes.push({
+        at: push.at,
+        head: push.head ?? null,
+        shas: finished ? (push.shas ?? null) : null,
+        refs: finished ? (push.refs ?? null) : null,
+        running: false,
+      })
     }
   }
   lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, serial: ++noteSerial }
@@ -711,8 +724,8 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
 }
 
 // A push as a note hands it on, for the session that relays to apply
-function pushNote({ at, head, shas, running }) {
-  return { at, head, ...(shas ? { shas } : {}), ...(running ? { running } : {}) }
+function pushNote({ at, head, shas, refs, running }) {
+  return { at, head, ...(shas ? { shas } : {}), ...(refs ? { refs } : {}), ...(running ? { running } : {}) }
 }
 
 // Whether a push moved the pull request to the head GitHub shows now: once it has finished, by the
@@ -723,18 +736,28 @@ function pushNote({ at, head, shas, running }) {
 function pushCounts(push, data, { recordHead = null } = {}) {
   const head = data.headRefOid
   if (push.running || !head) return false
-  if (Array.isArray(push.shas)) return push.head !== head && push.shas.some((sha) => head.startsWith(sha))
   const before = push.head ?? recordHead
+  if (Array.isArray(push.shas)) {
+    if (before != null) return before !== head && push.shas.some((sha) => head.startsWith(sha))
+    // Without the head before it, a pushed commit the head has may be another ref moved to it: only
+    // the pull request's own branch moving to it says the push moved the head
+    const sha = data.headRefName ? push.refs?.[data.headRefName] : null
+    return typeof sha === 'string' && head.startsWith(sha)
+  }
   return before != null && head !== before
 }
 
-// The commits a finished git push moved refs to, [] when it moved none, or null when its output
-// does not say (a new branch, a quiet push)
+// The commits a finished git push moved refs to, and the commit each branch moved to: none when it
+// moved nothing, or null when its output does not say (a new branch, a quiet push)
 function pushedCommits(ran) {
   const text = [ran.text, ran.result?.stdout, ran.result?.stderr].filter((t) => typeof t === 'string').join('\n')
-  if (/Everything up-to-date/.test(text)) return []
-  const shas = [...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s/g)].map((m) => m[1])
-  return shas.length ? [...new Set(shas)] : null
+  if (/Everything up-to-date/.test(text)) return { shas: [], refs: {} }
+  const moves = [...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s+(\S+)/g)]
+  if (!moves.length) return null
+  // The branch each ref moved to its commit, so a push can be told to have moved the pull request's
+  // own branch even with no head known before it
+  const refs = Object.fromEntries(moves.map((m) => [m[2].replace(/^refs\/heads\//, ''), m[1]]))
+  return { shas: [...new Set(moves.map((m) => m[1]))], refs }
 }
 
 // The head the watched pull request had as lately as this session knows: its own last poll or the
@@ -1028,7 +1051,11 @@ async function prune($) {
         // counted what it hands on, or once stale; the delete waits for any write still going out
         if (notesOf(record?.pr).some((note) => note.key === key)) return
         if (record?.at >= ((await counted($, record)) ? now - HOUR_MS : cutoff)) return
-        const removal = (noteWrites.get(key) ?? Promise.resolve()).then(() => $.store.delete(key))
+        // A watch this session started meanwhile may have queued its note under the key, so the
+        // delete looks again once the writes before it are out
+        const removal = (noteWrites.get(key) ?? Promise.resolve()).then(() =>
+          notesOf(record?.pr).some((note) => note.key === key) ? undefined : $.store.delete(key),
+        )
         const tail = removal.catch(() => {})
         noteWrites.set(key, tail)
         tail.then(() => {

@@ -32,6 +32,8 @@ type On = Parameters<typeof mock.clock>[0]
 type Pull = {
   state?: 'OPEN' | 'MERGED' | 'CLOSED'
   head?: string
+  // The pull request's branch
+  branch?: string
   committedAt?: number
   thumbsUpAt?: number
   reviews?: { id: number; at: number; comments: number; by?: string; pending?: true }[]
@@ -58,6 +60,7 @@ function graphql(pull: Pull, before?: string) {
   const pullRequest = {
     state: pull.state ?? 'OPEN',
     headRefOid: pull.head ?? 'a1',
+    headRefName: pull.branch ?? 'feature',
     commits: { nodes: [{ commit: { committedDate: iso(pull.committedAt ?? LAST_PUSH - 5 * MINUTE) } }] },
     reactionGroups: [
       {
@@ -109,6 +112,8 @@ type World = {
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
+  // The keys deleted from the store, in order
+  deleted: string[]
   prompts: string[]
   toasts: string[]
   status: string | undefined
@@ -132,6 +137,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     devSessions: { 'feature.json': devSession() },
     branchPr: null,
     store: new Map(),
+    deleted: [],
     prompts: [],
     toasts: [],
     status: undefined,
@@ -191,6 +197,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { value: undefined }
   })
   on('store.delete', ($, e) => {
+    w.deleted.push(e.key)
     w.store.delete(e.key)
     return { value: undefined }
   })
@@ -763,7 +770,7 @@ test('a push after the watched pull request ended is the baseline of the next on
 
   // The next branch's pull request carries an approval from before this push
   pushed = '   a1a1a1a..b2b2b2b  next -> next\n'
-  w.pull = { state: 'OPEN', head: 'b2b2b2b0123456789', thumbsUpAt: NOW + 70_000 }
+  w.pull = { state: 'OPEN', head: 'b2b2b2b0123456789', branch: 'next', thumbsUpAt: NOW + 70_000 }
   w.branchPr = { url: 'https://github.com/HolyGrail/claude-mods/pull/9', state: 'OPEN' }
   await clock.advance(20_000)
   await $.tool.call({ tool: 'Bash', command: 'git push -u origin next' })
@@ -2184,4 +2191,69 @@ test('a module started afresh for the same session keeps what its note in the st
   await clock.settle()
   expect(w.prompts).toEqual([])
   expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW - 10_000 })
+})
+
+test('a final read of the notes that outlasts the lease sends nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  const other = 'poll:session-a:' + URL.toLowerCase()
+  w.store.set(other, { ...pollNote(NOW - 5 * MINUTE), idle: true })
+  // Once the record is written, the store keeps the next read of the other note waiting
+  let slow = false
+  w.sets = async (key) => {
+    if (key.startsWith('pr:')) slow = true
+  }
+  w.gets = async (key) => {
+    if (slow && key === other) {
+      slow = false
+      await clock.sleep(9 * MINUTE + 30_000)
+    }
+  }
+  await $.session.start(START)
+  await clock.advance(9 * MINUTE + 31_000)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('poll outlasted its turn')
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  w.sets = undefined
+  w.gets = undefined
+})
+
+test('a push of another branch to the head does not count when no head was known before it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {} })
+  const pushed = '   a1a1a1a..b2b2b2b  other -> other\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The pull request's own branch is at the same commit already, and Codex approved it
+  w.branchPr = { url: URL, state: 'OPEN' }
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin other' })
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved')])
+})
+
+test('pruning leaves this session\'s note a watch took up while it was deciding', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {} })
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(NOTE, { ...pollNote(NOW - 2 * 60 * MINUTE), idle: true, since: LAST_PUSH })
+  w.store.set(record, { at: NOW - MINUTE, since: LAST_PUSH })
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(5_000)
+  }
+  const started = $.session.start(START)
+  await clock.advance(1_000)
+  // The pull request is watched while the prune still reads the record
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.advance(1_000)
+  w.gets = undefined
+  await clock.advance(20_000)
+  await started
+  expect(w.deleted).not.toContain(NOTE)
+  expect(w.store.has(NOTE)).toBe(true)
 })
