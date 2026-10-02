@@ -531,8 +531,10 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
       if (data.headRefOid) record.headAt = seenAt
       await $.store.set(key, record)
       // A write that landed past the lease may have gone over a session that took the round over and
-      // relayed the same, so this one sends nothing; $.store has no conditional write to stop it
-      if (lapsed(now, await $.clock.now())) return LATE
+      // relayed the same, so this one sends nothing; $.store has no conditional write to stop it.
+      // Its marks are taken back, since a session that has not taken the round over yet would read
+      // them as sent, and nothing would send them
+      if (lapsed(now, await $.clock.now())) return { late: sends }
       // Pages are skipped next time only once what they held is in the record: a session that leaves
       // the waking to another goes through them again in case that one never writes it
       if (gen === generation) watched = { ...watched, pagedAt: now }
@@ -540,6 +542,10 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     })
     if (sends === null) return
     if (sends === LATE) return late($, now, pr, note)
+    if (sends.late) {
+      takeBackAll($, key, sends.late, pr)
+      return late($, now, pr, note)
+    }
     // Only once the record says they were relayed, so a send that fails can take its mark back. A
     // watch that began during the write (an ended pull request stopped the timers itself) takes
     // the marks back instead, and a later watch of this pull request sends them.

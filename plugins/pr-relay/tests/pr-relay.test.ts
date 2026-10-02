@@ -2069,6 +2069,24 @@ test('a record write that lands past the lease sends nothing', async ($, on) => 
   await clock.advance(10 * MINUTE)
 })
 
+test('a merge whose record write lands past the lease is told on a later poll', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { state: 'MERGED' } })
+  w.answers = () => clock.sleep(9 * MINUTE)
+  await $.session.start(START)
+  await clock.advance(1_000)
+  let slow = true
+  w.sets = async (key) => {
+    if (slow && key.startsWith('pr:')) await clock.sleep(MINUTE)
+  }
+  await clock.advance(10 * MINUTE)
+  expect(w.toasts).toEqual([])
+  slow = false
+  w.answers = async () => {}
+  await clock.advance(2 * MINUTE)
+  expect(w.toasts).toEqual(['PR #7 がマージされました'])
+})
+
 test('a poll yields to a note written while its own was on its way', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
