@@ -2295,3 +2295,45 @@ test('a module started afresh keeps every push its note held, even two started a
   await clock.settle()
   expect(w.prompts).toEqual([])
 })
+
+test('a push whose Bash call hangs holds back this session\'s relays only as long as another session\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30 * MINUTE)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.reviews = [{ id: 1, at: NOW + MINUTE, comments: 1 }]
+  await clock.advance(5 * MINUTE)
+  expect(w.prompts).toEqual([])
+  await clock.advance(7 * MINUTE)
+  expect(w.prompts.length).toBe(1)
+  await clock.advance(20 * MINUTE)
+  await push
+})
+
+test('a push made while none was watched stays with the pull request that took it up', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {} })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // A quiet push with no head known stays pending for the pull request found after it
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.branchPr = { url: URL, state: 'OPEN' }
+  await clock.advance(2 * MINUTE)
+
+  // The next pull request was approved before that push, and its head has moved since another
+  // session last saw it
+  w.store.set('pr:' + PR9.toLowerCase(), { at: NOW - MINUTE, since: 0, head: 'c3c3c3c' })
+  w.pulls = { 9: { head: 'd4d4d4d', branch: 'next', thumbsUpAt: NOW + 10_000 } }
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved')])
+})

@@ -350,6 +350,8 @@ function watch($, { url, since, sessionFile = null }) {
   // A push still waiting for its head to move stays with the pull request it was bound to, even one
   // that ended; one made while none was watched is the push that led here
   if (watched?.id !== pr.id) pushes = pushes.filter((push) => !push.pr)
+  // The pull request that takes up a push made while none was watched keeps it
+  for (const push of pushes) push.pr ??= pr.id
   // Watching the same pull request again keeps the baseline its polls learned
   if (watched?.id !== pr.id) knownSince = 0
   watched = { ...pr, since, sessionFile }
@@ -482,7 +484,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const owns = watched?.id === pr.id
     noted = Math.max(othersSince, owns ? knownSince : note.since)
     started = pushStarts.get(pr.id) ?? 0
-    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing)
+    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
     if (owns) knownSince = Math.max(knownSince, record.since)
@@ -516,7 +518,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // and relay the same, so this one leaves the marks as they are for it and sends nothing
     if (lapsed(now, await $.clock.now())) return late($, now, pr, note)
   }
-  const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => push.running))
+  const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => holds(push, now)))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
   showStatus($)
 }
@@ -536,7 +538,7 @@ async function late($, now, pr, note) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing) {
+function update($, pr, data, record, recordedPush, notedPush, pending, defers, pushing, now) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -567,7 +569,7 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   record.ended = null
   // A push running in any session may be replacing the head GitHub still shows; this session's
   // own are those it bound to this pull request
-  const running = pushes.some((push) => push.running)
+  const running = pushes.some((push) => holds(push, now))
   return running || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
 }
 
@@ -730,6 +732,12 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
 // A push as a note hands it on, for the session that relays to apply
 function pushNote({ id, at, head, shas, refs, running }) {
   return { ...(id ? { id } : {}), at, head, ...(shas ? { shas } : {}), ...(refs ? { refs } : {}), ...(running ? { running } : {}) }
+}
+
+// Whether a push of this session still holds back a poll started at now: one whose Bash call hung
+// holds nothing back for long, the same as another session's in readNotes
+function holds(push, now) {
+  return push.running && push.at >= now - RUNNING_MS
 }
 
 function pushId(at) {
