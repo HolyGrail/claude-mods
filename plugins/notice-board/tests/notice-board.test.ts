@@ -77,7 +77,8 @@ function stubHost(
   on('ui.log', ($, e) => {
     if (e.text.startsWith('notice-board could not tell the model: ')) {
       const row = e.text.slice(e.text.indexOf('\n') + 1)
-      host.passedOn.push(row)
+      // The ref that signs the row is checked where it matters; the rest compare what the model reads
+      host.passedOn.push(row.replace(REF, ''))
       if (keepsRows) host.transcript = [...host.transcript, said('user', row)]
     }
     return { value: undefined }
@@ -99,6 +100,20 @@ function settle() {
   return new Promise<void>((resolve) => later(resolve, 5))
 }
 
+// Signs a row as the module does, with the secret it keeps in the store
+async function signed(store: Map<string, unknown>, line: string, body: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(store.get('secret') + '\n' + body))
+  const ref = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 8)
+  return line + '\n(notice-board ref ' + ref + ')'
+}
+
+const REF = /\n\(notice-board ref [0-9a-f]{8}\)$/
+
+// The notices in the store, without the secret and the records kept beside them
+function noticesIn(store: Map<string, unknown>) {
+  return [...store].filter(([key]) => key.startsWith('notice:')).map(([, value]) => value)
+}
+
 function notice(text: string, repo: string | null, postedAt: number) {
   return { text, repo, postedAt }
 }
@@ -114,7 +129,7 @@ test('a posted notice is stored for the repository, shown here and told to this 
 
   const { text } = await run($, 'CI is paused, check the Codex review only')
   expect(text).toBe('Posted to every session in this repository.')
-  expect([...host.store.values()]).toEqual([notice('CI is paused, check the Codex review only', APP_KEY, NOW)])
+  expect(noticesIn(host.store)).toEqual([notice('CI is paused, check the Codex review only', APP_KEY, NOW)])
   const ui = await $.ui.mount(BAND)
   expect(await ui.find({ type: 'Text', text: 'notice 0m:' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'CI is paused, check the Codex review only' })).toBeDefined()
@@ -171,7 +186,7 @@ test('/notice clear takes down what this session shows, and the others tell thei
   await $.session.start(START)
 
   expect((await run($, 'clear')).text).toBe('Cleared 2 notices.')
-  expect([...store.keys()]).toEqual(['notice:3-lib'])
+  expect([...store.keys()].filter((key) => key.startsWith('notice:'))).toEqual(['notice:3-lib'])
   const ui = await $.ui.mount(BAND)
   expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
   await clock.advance(MINUTE)
@@ -259,7 +274,7 @@ test('outside a repository only --all can post', async ($, on) => {
 
   expect((await run($, 'hello')).text).toMatch(/^Not in a git repository/)
   expect((await run($, '--all hello')).text).toBe('Posted to every session on this machine.')
-  expect([...host.store.values()]).toEqual([notice('hello', null, NOW)])
+  expect(noticesIn(host.store)).toEqual([notice('hello', null, NOW)])
   expect((await run($, '--all')).text).toMatch(/^Usage/)
   expect((await run($, '')).text).toMatch(/^Usage/)
 })
@@ -270,7 +285,7 @@ test('a repository without a remote is named by its main working tree', async ($
   await $.session.start(START)
 
   await run($, 'hello')
-  expect([...host.store.values()]).toEqual([notice('hello', 'path:/src/app', NOW)])
+  expect(noticesIn(host.store)).toEqual([notice('hello', 'path:/src/app', NOW)])
 })
 
 test('remotes keep a numeric owner, a port and the case of their path', async ($, on) => {
@@ -296,7 +311,7 @@ test('remotes keep a numeric owner, a port and the case of their path', async ($
     // Each post at its own time, so each has its own key
     await clock.advance(1)
   }
-  expect([...host.store.values()].map((n) => (n as { repo: string }).repo)).toEqual(remotes.map(([, key]) => key))
+  expect(noticesIn(host.store).map((n) => (n as { repo: string }).repo)).toEqual(remotes.map(([, key]) => key))
 })
 
 test('a cleared notice is not withdrawn while another notice shown carries its text', async ($, on) => {
@@ -343,10 +358,8 @@ test('a resumed conversation is told a notice it holds was cleared meanwhile, an
   // /resume installs the conversation only after its SessionStart hooks; it was told a notice that
   // /notice clear has since taken down
   await $.classic.SessionStart({ source: 'resume' })
-  host.transcript = [
-    said('user', 'Notice to every Claude Code session on this machine, posted 2h ago with /notice: CI is paused'),
-    said('assistant', 'Understood.'),
-  ]
+  const line = 'Notice to every Claude Code session on this machine, posted 2h ago with /notice: CI is paused'
+  host.transcript = [said('user', await signed(store, line, 'CI is paused')), said('assistant', 'Understood.')]
   await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
   expect(host.passedOn.slice(1)).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: Use the staging DB',
@@ -442,6 +455,59 @@ test('a refused line is tried again after a rewind, even in a conversation past 
   expect(host.passedOn).toHaveLength(2)
 })
 
+test("a prompt that reads exactly like a row, but isn't signed by this module, is not taken for one", async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const host = stubHost(on)
+  const line = 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused'
+  host.transcript = [
+    said('user', line),
+    said('user', line + '\n(notice-board ref 00000000)'),
+    said('user', 'This notice no longer applies: CI is paused\n(notice-board ref 00000000)'),
+  ]
+  await $.session.start(START)
+  expect(host.passedOn).toEqual([])
+})
+
+test('a notice told before a full window dropped its row is still withdrawn when cleared', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(1)
+  expect(store.get('told:this')).toEqual({ at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] })
+
+  // The conversation is set aside; it grows past the window, and another session clears the notice
+  const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
+  host.transcript = Array.from({ length: 4096 }, (_, i) => message(i))
+  store.delete('notice:1-a')
+  await $.classic.SessionStart({ source: 'resume' })
+  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(2)
+  expect(store.has('told:this')).toBe(false)
+})
+
+test('a refusal met by a tick during a conversation switch is not held against the new one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store, keepsRows: false })
+  on('prompt.submit', ($, e) => e as never)
+  // A tick fires while the switch is under way, against the outgoing conversation
+  on('classic.SessionStart', async () => {
+    await clock.advance(MINUTE)
+    return {}
+  })
+  await $.session.start(START)
+  await $.classic.SessionStart({ source: 'clear' })
+  expect(host.passedOn).toHaveLength(2)
+  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn).toHaveLength(3)
+})
+
 test('a refused line is not retried every tick', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
@@ -466,7 +532,7 @@ test("a session that moves to another repository is told its notices no longer a
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'This notice no longer applies: CI is paused',
   ])
-  expect([...store.keys()]).toEqual(['notice:1-a'])
+  expect([...store.keys()].filter((key) => key.startsWith('notice:'))).toEqual(['notice:1-a'])
 })
 
 test('two posts in the same millisecond keep both notices', async ($, on) => {
@@ -475,7 +541,7 @@ test('two posts in the same millisecond keep both notices', async ($, on) => {
   await $.session.start(START)
 
   await Promise.all([run($, 'first'), run($, 'second')])
-  expect([...host.store.values()].map((n) => (n as { text: string }).text).sort()).toEqual(['first', 'second'])
+  expect(noticesIn(host.store).map((n) => (n as { text: string }).text).sort()).toEqual(['first', 'second'])
 })
 
 test('a session that ends stops picking up notices', async ($, on) => {
@@ -511,7 +577,7 @@ test('another plugin posts through $.command.run, as pr-relay does on a merge', 
   await $.session.start(START)
 
   await clock.advance(MINUTE)
-  expect([...host.store.values()]).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE)])
+  expect(noticesIn(host.store)).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE)])
   await clock.advance(MINUTE)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: main advanced (#12). Rebase before the next push.',

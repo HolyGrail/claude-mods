@@ -26,11 +26,19 @@ const KEY_PREFIX = 'notice:'
 // What the model was told is read back from the conversation itself, so a reload, /clear,
 // compaction, /resume, /rewind and /branch each leave it right. Each notice or withdrawal is a row
 // of its own, whose whole text is one of these, so a notice's body may hold anything, new lines
-// that look like another row included
-const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)$/
-const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)$/
+// that look like another row included. The ref that ends a row is a hash of its body under a
+// secret kept in $.store, so a prompt that only reads like a row is not taken for one.
+const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
+const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
+const SECRET_KEY = 'secret'
 // $.session.messages() returns at most this many, the newest
 const WINDOW = 4096
+// What each conversation was told, under the session id, for the rows a full window no longer
+// returns: { at, told: [{ key, text }] }
+const RECORD_PREFIX = 'told:'
+// A record not written for this long is deleted
+const DAY_MS = 24 * 60 * 60 * 1000
+const STALE_MS = 8 * DAY_MS
 // How often to pick up notices other sessions posted or cleared
 const TICK_MS = 60_000
 // The band shows this many notices, newest first, and counts the rest
@@ -49,6 +57,7 @@ export function register(on) {
     notices = []
     forgetRefusals()
     sessionId = await $.session.id()
+    await prune($)
     await $.command.register({
       name: 'notice',
       description: 'Post a notice to every session in this repository (--all: on this machine), or clear them',
@@ -65,7 +74,10 @@ export function register(on) {
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
     forgetRefusals()
-    return next(e)
+    const result = await next(e)
+    // Again, for a tick that began during the switch and met a refusal in the outgoing conversation
+    forgetRefusals()
+    return result
   })
 
   // Before the model reads a prompt, the conversation it reads is brought up to date: /rewind
@@ -163,14 +175,21 @@ async function load($) {
   notices = shown
 
   const started = generation
+  const id = sessionId
   const messages = await $.session.messages()
   if (refused.size > 0) {
     const now = messages.map(fingerprint)
     if (!continues(seen, now)) refused.clear()
     seen = now
   }
-  const told = toldIn(messages)
-  const toldTexts = new Set(told.values())
+  const secret = await secretOf($)
+  const { told, withdrawals } = await toldIn(messages, secret)
+  // A full window may have dropped rows this conversation was told: the record keeps those, less
+  // what the window shows was withdrawn since
+  const record = await $.store.get(RECORD_PREFIX + id)
+  const recorded = isRecord(record) ? record.told : []
+  const earlier =
+    messages.length < WINDOW ? [] : recorded.filter((r) => !told.has(r.key) && !withdrawals.has(r.text))
   const shownTexts = new Set(shown.map((notice) => notice.text))
   // This session's own posts too: a command's output is not part of what the model reads. Oldest
   // first, and one row for notices that read the same
@@ -181,33 +200,52 @@ async function load($) {
   }
   // Cleared, or meant for a repository this session has left; one whose text another notice shown
   // here still carries still applies
+  const toldTexts = new Set([...told.values(), ...earlier.map((r) => r.text)])
   const withdrawn = [...toldTexts].filter((text) => !shownTexts.has(text) && !refused.has('withdrawn\n' + text))
-  if (fresh.length === 0 && withdrawn.length === 0) return
 
-  const now = await $.clock.now()
-  const rows = [
-    ...fresh.map((notice) => ({
-      key: toldKey(notice),
-      text:
-        'Notice to every Claude Code session ' +
-        (notice.repo === null ? 'on this machine' : 'in this repository') +
-        ', posted ' + ago(now - notice.postedAt) + ' ago with /notice: ' + notice.text,
-    })),
-    ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text: 'This notice no longer applies: ' + text })),
-  ]
-  for (const row of rows) {
-    const result = await $.session
-      .append({ message: { type: 'user', content: [{ type: 'text', text: row.text }] } })
-      .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
-    if (result.deny === undefined) continue
-    // A run no plugin may shape refuses the row; the band still shows the notices. A refusal met
-    // before a restart or a switch is not held against what follows it.
-    if (generation === started) {
-      if (refused.size === 0) seen = messages.map(fingerprint)
-      refused.add(row.key)
+  // What the conversation holds once this load's rows are in
+  const holds = new Map([...earlier.map((r) => [r.key, r.text]), ...told])
+  if (fresh.length > 0 || withdrawn.length > 0) {
+    const now = await $.clock.now()
+    const rows = [
+      ...fresh.map((notice) => ({
+        key: toldKey(notice),
+        text: notice.text,
+        line:
+          'Notice to every Claude Code session ' +
+          (notice.repo === null ? 'on this machine' : 'in this repository') +
+          ', posted ' + ago(now - notice.postedAt) + ' ago with /notice: ' + notice.text,
+      })),
+      ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text, line: 'This notice no longer applies: ' + text })),
+    ]
+    for (const row of rows) {
+      const line = row.line + '\n(notice-board ref ' + (await ref(secret, row.text)) + ')'
+      const result = await $.session
+        .append({ message: { type: 'user', content: [{ type: 'text', text: line }] } })
+        .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
+      if (result.deny === undefined) {
+        if (row.key.startsWith('withdrawn\n')) {
+          for (const [key, text] of holds) if (text === row.text) holds.delete(key)
+        } else holds.set(row.key, row.text)
+        continue
+      }
+      // A run no plugin may shape refuses the row; the band still shows the notices. A refusal met
+      // before a restart or a switch is not held against what follows it.
+      if (generation === started) {
+        if (refused.size === 0) seen = messages.map(fingerprint)
+        refused.add(row.key)
+      }
+      $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + line, { to: 'debug' })
     }
-    $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + row.text, { to: 'debug' })
   }
+  // Only a load the switch didn't overtake writes, so the record stays the conversation's own
+  if (generation !== started) return
+  const holding = [...holds].map(([key, text]) => ({ key, text }))
+  const now = await $.clock.now()
+  // Unchanged, it is still written now and then, so prune keeps a conversation still in use
+  if (JSON.stringify(holding) === JSON.stringify(recorded) && (holding.length === 0 || now - record.at < DAY_MS)) return
+  if (holding.length === 0) await $.store.delete(RECORD_PREFIX + id)
+  else await $.store.set(RECORD_PREFIX + id, { at: now, told: holding })
 }
 
 function forgetRefusals() {
@@ -217,20 +255,63 @@ function forgetRefusals() {
 }
 
 // The notices the conversation tells the model of, by key, with their text: each row this module
-// added in order, a withdrawal taking back every notice of its text
-function toldIn(messages) {
+// added in order, a withdrawal taking back every notice of its text; and the texts withdrawn
+async function toldIn(messages, secret) {
   const told = new Map()
+  const withdrawals = new Set()
   for (const message of messages) {
     if (message.role !== 'user') continue
     const added = TOLD.exec(message.text)
-    if (added) {
+    if (added && added[3] === (await ref(secret, added[2]))) {
       told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
+      withdrawals.delete(added[2])
       continue
     }
     const withdrawn = WITHDRAWN.exec(message.text)
-    if (withdrawn) for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
+    if (!withdrawn || withdrawn[2] !== (await ref(secret, withdrawn[1]))) continue
+    for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
+    withdrawals.add(withdrawn[1])
   }
-  return told
+  return { told, withdrawals }
+}
+
+// The secret every session on this machine signs its rows with, made by the first that needs it.
+// Two made at once leave one; rows signed with the other are told again, once.
+async function secretOf($) {
+  const stored = await $.store.get(SECRET_KEY)
+  if (typeof stored === 'string') return stored
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  await $.store.set(SECRET_KEY, hex(bytes))
+  const kept = await $.store.get(SECRET_KEY)
+  return typeof kept === 'string' ? kept : hex(bytes)
+}
+
+async function ref(secret, text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret + '\n' + text))
+  return hex(new Uint8Array(digest)).slice(0, 8)
+}
+
+function hex(bytes) {
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function isRecord(value) {
+  return (
+    value != null &&
+    typeof value.at === 'number' &&
+    Array.isArray(value.told) &&
+    value.told.every((r) => r != null && typeof r.key === 'string' && typeof r.text === 'string')
+  )
+}
+
+// Deletes the records of conversations not loaded for STALE_MS
+async function prune($) {
+  const now = await $.clock.now()
+  const keys = (await $.store.keys()).filter((key) => key.startsWith(RECORD_PREFIX))
+  for (const key of keys) {
+    const record = await $.store.get(key)
+    if (!isRecord(record) || now - record.at > STALE_MS) await $.store.delete(key)
+  }
 }
 
 // Notices of one scope that read the same are told once
