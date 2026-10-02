@@ -104,6 +104,8 @@ let offersCleanup = false
 // Notes hold the same objects, so a push that finishes after the session turned to another pull
 // request still updates the note it was in.
 let pushes = []
+// The session id as last asked, so a push need not wait on it
+let sessionId = null
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
 // The read, change and write of a record in this session, one after another: a poll and a send
@@ -113,6 +115,7 @@ let writes = Promise.resolve()
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
+    sessionIdOf($).catch(() => {})
     stop()
     await retire($)
     reset($)
@@ -181,15 +184,15 @@ export function register(on) {
     const creates = /\bgh\s+pr\s+create\b/.test(command)
     const pushing = !creates && /\bgit\s+push\b/.test(command)
     if (!creates && !pushing) return next(e)
+    // Bound to the pull request watched as the push starts, before anything else can turn the
+    // watch to another
+    const prId = watched && !watched.ended ? watched.id : null
     const startedAt = await $.clock.now()
     // Codex reviews what was pushed, so its earlier activity says nothing about this push. The time
     // is set before the push runs, so a poll that sees the new head while it is still finishing
     // already applies it, and put back if the push failed.
     let push = null
     if (pushing) {
-      // Bound to the pull request watched as the push starts, before anything else can turn the
-      // watch to another
-      const prId = watched && !watched.ended ? watched.id : null
       push = { at: startedAt, head: null, shas: null, running: true }
       pushes.push(push)
       for (const note of notesOf(prId)) {
@@ -200,7 +203,8 @@ export function register(on) {
       // turned away first) gets an idle one, so the other sessions see the push run; the first poll
       // takes it up
       if (prId && !notesOf(prId).length) {
-        const key = `${POLL_PREFIX}${await $.session.id()}:${prId}`
+        // The id is known from the start, so the push goes out without waiting on it
+        const key = `${POLL_PREFIX}${sessionId ?? (await sessionIdOf($))}:${prId}`
         if (!notesOf(prId).length) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
       }
       // The other sessions hold back their relays only if they can see the push, so it goes out
@@ -477,7 +481,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
-  const current = gen === generation || ended
+  // A push this session started meanwhile may be replacing the head they were read from
+  const current = (gen === generation || ended) && !(watched?.id === pr.id && pushes.some((push) => push.running))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
   showStatus($)
 }
@@ -532,10 +537,15 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   return running || pushing || defers ? [] : relay($, pr, read(data, record.since), record)
 }
 
+async function sessionIdOf($) {
+  sessionId = await $.session.id()
+  return sessionId
+}
+
 // Notes that this session starts a poll of the pull request now, and returns the note
 async function notePoll($, pr, gen) {
   // One note per pull request, so a session that turns to another leaves this one's push behind
-  const key = `${POLL_PREFIX}${await $.session.id()}:${pr.id}`
+  const key = `${POLL_PREFIX}${await sessionIdOf($)}:${pr.id}`
   // Read just before the note goes out, since the time is this poll's place in the election
   const at = await $.clock.now()
   if (gen !== generation) return null
@@ -957,7 +967,7 @@ function readJson($, file) {
 async function prune($) {
   const now = await $.clock.now()
   const cutoff = now - STALE_MS
-  const own = `${POLL_PREFIX}${await $.session.id()}:`
+  const own = `${POLL_PREFIX}${await sessionIdOf($)}:`
   const keys = await $.store.keys()
   await Promise.all(
     keys.map(async (key) => {
