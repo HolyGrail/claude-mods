@@ -133,7 +133,7 @@ export function register(on) {
     // The /dev skill's Phase 5.5 ends the turn after a push when the watch tool is there; this
     // stops a session that polls anyway (an older copy of the skill, or a model off its steps)
     // from watching what this module already watches
-    if (watched && !watched.ended && /poll-codex-review\.sh/.test(command) && /--watch\b/.test(command)) {
+    if (watched && !watched.ended && runsWatch(command)) {
       return {
         deny:
           `pr-relay is watching ${watched.url} and will send a prompt when Codex reviews it, approves it ` +
@@ -594,4 +594,203 @@ function describe() {
 function clock(ms) {
   const d = new Date(ms + JST_OFFSET_MS)
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+}
+
+// Whether a Bash command runs poll-codex-review.sh with --watch, as opposed to merely mentioning it
+// in a commit message, a pull request body or a comment. Only a simple command whose command word
+// is the script (or a variable this command set to it, as the /dev skill's `"$SCRIPT" ... --watch`
+// does) counts. Quoted strings stay one word and here-document bodies and comments are dropped, so
+// prose never reads as a command. Anything less plain (`bash -c '...'`, `$(...)`) is let through:
+// a missed deny only lets the skill wait the old way, while a wrong one blocks unrelated work.
+const SCRIPT = /(^|\/)poll-codex-review\.sh$/
+// Words that may stand before the command word without being it
+// (matched by basename, so `/bin/bash` counts too)
+const PREFIXES = new Set(['!', '{', 'do', 'then', 'else', 'if', 'elif', 'while', 'until', 'time',
+  'export', 'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh', 'source', '.'])
+const SHELLS = new Set(['bash', 'sh', 'zsh'])
+// Options of those prefixes that take the next word as their value (`timeout -s TERM 600`)
+const OPTION_VALUES = {
+  env: ['-u', '--unset', '-C', '--chdir', '-S', '--split-string'],
+  timeout: ['-s', '--signal', '-k', '--kill-after'],
+}
+// A shell word: quoted parts, escapes and plain characters, up to an unquoted blank or operator
+const SHELL_WORD = /^(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>()'"\\])+/
+
+function runsWatch(command) {
+  if (!command.includes('poll-codex-review')) return false
+  // Variables set to the script, one set per subshell: an assignment inside `( )` ends with it
+  const scopes = [new Set()]
+  for (const entry of simpleCommands(command)) {
+    if (entry === OPEN) {
+      scopes.push(new Set(scopes.at(-1)))
+      continue
+    }
+    if (entry === CLOSE) {
+      if (scopes.length > 1) scopes.pop()
+      continue
+    }
+    const words = entry
+    const scripts = scopes.at(-1)
+    let i = 0
+    let prefix = null
+    let notRun = false
+    // Assignments last past this command only when no command word follows them
+    const assignments = []
+    for (; i < words.length; i++) {
+      const { text } = words[i]
+      const assigned = /^([A-Za-z_]\w*)=(.*)$/s.exec(text)
+      if (assigned) {
+        assignments.push(assigned)
+        continue
+      }
+      const name = text.slice(text.lastIndexOf('/') + 1)
+      if (PREFIXES.has(name)) {
+        prefix = name
+        continue
+      }
+      // `bash -n` reads the script without running it, and `command -v` only looks it up
+      if (SHELLS.has(prefix) && /^-[A-Za-z]*n/.test(text)) notRun = true
+      if (prefix === 'command' && /^-[A-Za-z]*[vV]/.test(text)) notRun = true
+      if (OPTION_VALUES[prefix]?.includes(text)) i += 1
+      if (text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
+      break
+    }
+    if (i >= words.length) {
+      for (const [, name, value] of assignments) {
+        if (SCRIPT.test(value)) scripts.add(name)
+        else scripts.delete(name)
+      }
+      continue
+    }
+    if (notRun) continue
+    // A `$` that was quoted or escaped is a literal, not a variable
+    const variable = !words[i].literal && /^\$\{?([A-Za-z_]\w*)\}?$/.exec(words[i].text)
+    const isScript = variable ? scripts.has(variable[1]) : SCRIPT.test(words[i].text)
+    if (isScript && words.slice(i + 1).some((w) => w.text === '--watch')) return true
+  }
+  return false
+}
+
+const OPEN = Symbol('(')
+const CLOSE = Symbol(')')
+
+// Splits a command into simple commands (on newlines, `;`, `&`, `|`, `(` and `)` outside quotes),
+// each a list of words with their quotes removed, with OPEN and CLOSE where a `(` or `)` stood.
+// Here-document bodies and comments are skipped.
+function simpleCommands(command) {
+  const commands = []
+  let words = []
+  let word = null
+  let quoted = false
+  // Whether the word holds a `$` that cannot expand
+  let literal = false
+  const heredocs = []
+  // The next word is a redirection's target, not part of the command
+  let target = false
+  const endWord = () => {
+    if (word !== null && !target) words.push({ text: word, literal })
+    if (word !== null) target = false
+    word = null
+    quoted = false
+    literal = false
+  }
+  // Drops a file descriptor number written right before a redirection (`2>`)
+  const redirect = () => {
+    if (word !== null && /^\d+$/.test(word) && !quoted) word = null
+    endWord()
+    target = true
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length) commands.push(words)
+    words = []
+    target = false
+  }
+  let i = 0
+  while (i < command.length) {
+    const c = command[i]
+    if (c === '\n') {
+      endCommand()
+      i += 1
+      // Skips each pending here-document's body, up to and including its delimiter line
+      for (const { delimiter, stripTabs } of heredocs.splice(0)) {
+        while (i < command.length) {
+          const eol = command.indexOf('\n', i)
+          const line = command.slice(i, eol < 0 ? command.length : eol)
+          i = eol < 0 ? command.length : eol + 1
+          if ((stripTabs ? line.replace(/^\t+/, '') : line) === delimiter) break
+        }
+      }
+    } else if (c === '\\') {
+      if (command[i + 1] !== '\n') word = (word ?? '') + (command[i + 1] ?? '')
+      if (command[i + 1] === '$') literal = true
+      i += 2
+    } else if (c === "'") {
+      const end = command.indexOf("'", i + 1)
+      const stop = end < 0 ? command.length : end
+      word = (word ?? '') + command.slice(i + 1, stop)
+      quoted = true
+      if (command.slice(i + 1, stop).includes('$')) literal = true
+      i = stop + 1
+    } else if (c === '"') {
+      let text = ''
+      i += 1
+      while (i < command.length && command[i] !== '"') {
+        if (command[i] === '\\' && command[i + 1] === '\n') {
+          i += 2
+          continue
+        }
+        if (command[i] === '\\' && '"\\$`'.includes(command[i + 1] ?? '')) {
+          i += 1
+          if (command[i] === '$') literal = true
+        }
+        text += command[i] ?? ''
+        i += 1
+      }
+      word = (word ?? '') + text
+      quoted = true
+      i += 1
+    } else if (c === '#' && word === null) {
+      const eol = command.indexOf('\n', i)
+      i = eol < 0 ? command.length : eol
+    } else if (command.startsWith('<<<', i)) {
+      redirect()
+      i += 3
+    } else if (command.startsWith('<<', i)) {
+      endWord()
+      const m = /^<<(-?)[ \t]*/.exec(command.slice(i))
+      const delimiter = SHELL_WORD.exec(command.slice(i + m[0].length))
+      if (!delimiter) {
+        i += 2
+        continue
+      }
+      // Quote removal, as Bash does to the delimiter word
+      const unquoted = delimiter[0].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+        (_, single, double, escaped) => single ?? escaped ?? double.replace(/\\([$`"\\\n])/g, '$1'))
+      heredocs.push({ delimiter: unquoted, stripTabs: m[1] === '-' })
+      i += m[0].length + delimiter[0].length
+    } else if (c === '&' && command[i + 1] === '>') {
+      redirect()
+      i += command[i + 2] === '>' ? 3 : 2
+    } else if (';&|()'.includes(c)) {
+      endCommand()
+      if (c === '(') commands.push(OPEN)
+      if (c === ')') commands.push(CLOSE)
+      i += 1
+    } else if (c === '<' || c === '>') {
+      redirect()
+      // `>>`, `<>` and the `&` of `2>&1` belong to the redirection, not a background `&`
+      i += 1
+      if (command[i] === '>' || (c === '<' && command[i] === '>')) i += 1
+      if (command[i] === '&') i += 1
+    } else if (c === ' ' || c === '\t') {
+      endWord()
+      i += 1
+    } else {
+      word = (word ?? '') + c
+      i += 1
+    }
+  }
+  endCommand()
+  return commands
 }
