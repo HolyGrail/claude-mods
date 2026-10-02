@@ -510,15 +510,23 @@ test('/clear shows the emptied context before the next turn', async ($, on) => {
 })
 
 test('a session left idle past the longest window stops showing its own reading', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
+  // Hand-driven clock: 8 days of 60 s ticks on the mock clock take longer than a test may run, so
+  // time jumps the way it does over a machine's sleep, and one tick runs after it
+  let now = NOW
+  const ticks: (() => void)[] = []
+  on('clock.now', () => ({ value: now }))
+  on('clock.every', () => new Promise((resolve) => ticks.push(() => resolve({ value: undefined }))))
   stubSession(on, new Map(), [])
   on('session.measure', ($, e) => ({ changed: e.changed }))
   await $.session.start(START)
   await $.session.measure({ context: CONTEXT, rateLimits: [{ kind: 'spend_limit', percentUsed: 90 }], changed: ['rateLimits'] })
 
-  // The mock clock runs at most 10,000 timer calls per advance, and 8 days is 11,520 ticks
-  await clock.advance(4 * 24 * HOUR)
-  await clock.advance(4 * 24 * HOUR + MINUTE)
+  now = NOW + 8 * 24 * HOUR + MINUTE
+  expect(ticks).toHaveLength(1)
+  ticks.pop()!()
+  // The ticker asks for its next tick once this one has run
+  for (let i = 0; i < 100 && ticks.length === 0; i++) await new Promise((r) => setTimeout(r, 0))
+  expect(ticks).toHaveLength(1)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '90%' })).toBeUndefined()
