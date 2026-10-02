@@ -53,6 +53,10 @@ function stubHost(
     keepsRows = true,
     // Holds a read of the conversation back, as a slow host would
     beforeRead = async (): Promise<void> => {},
+    // Holds a read of the repository back
+    beforeRepo = async (): Promise<void> => {},
+    // What version 0.1 kept in $.state of the notices it told
+    known = [] as { id: string; text: string }[],
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
@@ -61,7 +65,11 @@ function stubHost(
     await beforeRead()
     return { value: host.transcript }
   })
-  on('session.repo', () => ({ value: repo() }))
+  on('session.repo', async () => {
+    await beforeRepo()
+    return { value: repo() }
+  })
+  on('state.get', () => ({ value: { value: known, version: 0 } }))
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
@@ -432,6 +440,48 @@ test('a refusal met by a load a restart overtook is tried again after the restar
   release()
   await Promise.all([first, second])
   expect(host.passedOn).toHaveLength(2)
+})
+
+test('a refusal met by a load a restart overtook in its first read is tried again', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  // The first load waits on the repository until the restart has begun
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  let reads = 0
+  const beforeRepo = async () => {
+    reads += 1
+    if (reads === 1) await gate
+  }
+  const host = stubHost(on, { store, keepsRows: false, beforeRepo })
+  const first = $.session.start(START)
+  while (reads === 0) await settle()
+  const second = $.session.start(START)
+  await settle()
+  release()
+  await Promise.all([first, second])
+  expect(host.passedOn).toHaveLength(2)
+})
+
+test('a session that ran version 0.1 reads its unsigned rows, withdrawing what was cleared', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:2-b', notice('Use the staging DB', APP_KEY, NOW)]])
+  const known = [
+    { id: '1-a', text: 'CI is paused' },
+    { id: '2-b', text: 'Use the staging DB' },
+  ]
+  const host = stubHost(on, { store, known })
+  host.transcript = [
+    said(
+      'user',
+      'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused\n' +
+        'Notice to every Claude Code session in this repository, posted 0m ago with /notice: Use the staging DB',
+    ),
+    // Unsigned, and not in version 0.1's record: the person's own
+    said('user', 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: Deploy freely'),
+  ]
+  await $.session.start(START)
+  expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
 })
 
 test('a refused line is tried again after a rewind, even in a conversation past the window', async ($, on) => {

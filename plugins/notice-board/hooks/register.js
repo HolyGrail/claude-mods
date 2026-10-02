@@ -17,6 +17,9 @@ let seen = []
 // Bumped by every session.start and conversation switch, so a load begun before one doesn't record
 // its refusals against the conversation that follows
 let generation = 0
+// The texts version 0.1 told this session of, from its $.state record, which vouch for its
+// unsigned rows
+let legacy = new Set()
 // Counts this module's posts, so two in the same millisecond get keys of their own
 let posts = 0
 
@@ -31,6 +34,11 @@ const KEY_PREFIX = 'notice:'
 const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
 const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
 const SECRET_KEY = 'secret'
+// Version 0.1 joined its lines into one row, unsigned
+const TOLD_V1 = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)$/
+const WITHDRAWN_V1 = /^This notice no longer applies: ([\s\S]*)$/
+const LINE_START_V1 = /\n(?=Notice to every Claude Code session |This notice no longer applies: )/
+const KNOWN_V1 = { plugin: 'notice-board', key: 'known' }
 // $.session.messages() returns at most this many, the newest
 const WINDOW = 4096
 // What each conversation was told, under the session id, for the rows a full window no longer
@@ -57,6 +65,7 @@ export function register(on) {
     notices = []
     forgetRefusals()
     sessionId = await $.session.id()
+    legacy = await legacyOf($)
     await prune($)
     await $.command.register({
       name: 'notice',
@@ -160,6 +169,8 @@ function refresh($) {
 // Reads the notices meant for this session, and tells the model about the ones its conversation
 // does not hold and the ones it holds that have since been cleared
 async function load($) {
+  // Before any wait, so a restart that lands during one is seen
+  const started = generation
   const repoKey = repoKeyOf(await $.session.repo())
   const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
@@ -174,7 +185,6 @@ async function load($) {
   shown.sort((a, b) => b.postedAt - a.postedAt || (a.id < b.id ? 1 : -1))
   notices = shown
 
-  const started = generation
   const id = sessionId
   const messages = await $.session.messages()
   if (refused.size > 0) {
@@ -268,11 +278,39 @@ async function toldIn(messages, secret) {
       continue
     }
     const withdrawn = WITHDRAWN.exec(message.text)
-    if (!withdrawn || withdrawn[2] !== (await ref(secret, withdrawn[1]))) continue
-    for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
-    withdrawals.add(withdrawn[1])
+    if (withdrawn && withdrawn[2] === (await ref(secret, withdrawn[1]))) {
+      for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
+      withdrawals.add(withdrawn[1])
+      continue
+    }
+    // A row of version 0.1 counts where that version's record says it told the text
+    if (legacy.size === 0) continue
+    const parts = message.text.split(LINE_START_V1)
+    if (!parts.every((part) => TOLD_V1.test(part) || WITHDRAWN_V1.test(part))) continue
+    for (const part of parts) {
+      const added = TOLD_V1.exec(part)
+      if (added && legacy.has(added[2])) {
+        told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
+        withdrawals.delete(added[2])
+      }
+      const withdrawnV1 = WITHDRAWN_V1.exec(part)
+      if (withdrawnV1 && legacy.has(withdrawnV1[1])) {
+        for (const [key, value] of told) if (value === withdrawnV1[1]) told.delete(key)
+        withdrawals.add(withdrawnV1[1])
+      }
+    }
   }
   return { told, withdrawals }
+}
+
+// The texts version 0.1's record holds, if this session ran it
+async function legacyOf($) {
+  try {
+    const known = (await $.state.get(KNOWN_V1)).value
+    return new Set(Array.isArray(known) ? known.map((k) => k?.text).filter((t) => typeof t === 'string') : [])
+  } catch {
+    return new Set()
+  }
 }
 
 // The secret every session on this machine signs its rows with, made by the first that needs it.

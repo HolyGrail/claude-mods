@@ -2,5 +2,8 @@
   "name": "notice-board",
   "version": "0.2.0",
   "description": "Shares notices with every session in the same repository, or on the machine",
-  "author": { "name": "HolyGrail" }
+  "author": {
+    "name": "HolyGrail"
+  },
+  "types": "./types/index.d.ts"
 }
