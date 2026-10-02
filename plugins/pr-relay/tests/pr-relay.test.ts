@@ -88,6 +88,8 @@ type World = {
   turnStarts: () => Promise<void>
   // What gh api graphql waits for before it answers
   answers: () => Promise<void>
+  // What gh api graphql fails with, when it does
+  queryError?: string
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -95,6 +97,7 @@ type World = {
   toasts: string[]
   status: string | undefined
   queries: number
+  sessionId: string
 }
 
 function devSession(overrides: Record<string, unknown> = {}) {
@@ -117,6 +120,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     toasts: [],
     status: undefined,
     queries: 0,
+    sessionId: 'session-b',
     queryArgv: [],
     turnStarts: async () => {},
     answers: async () => {},
@@ -125,6 +129,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   mock.env(on, { HOME: '/home' })
   on('session.start', () => ({ cwd: WORKTREE }))
   on('session.cwd', () => ({ value: WORKTREE }))
+  on('session.id', () => ({ value: w.sessionId }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-relay__${e.name}` } }))
   on('fs.list', () => ({
     value: Object.keys(w.devSessions).map((name) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
@@ -141,6 +146,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     w.queries += 1
     w.queryArgv.push(e.argv)
     await w.answers()
+    if (w.queryError) return run(1, '', w.queryError)
     const before = e.argv.find((arg) => arg.startsWith('before='))?.slice('before='.length)
     return run(0, graphql(w.pull, before))
   })
@@ -336,6 +342,8 @@ test('a pull request gh could not look up at startup is looked up again', async 
   await $.session.start(START)
   await clock.settle()
   expect(w.queries).toBe(0)
+  // The status line says the watch has not started, rather than staying empty
+  expect(w.status).toBe('PR 検索失敗 21:00: error connecting to api.github.com')
 
   w.branchPr = { url: URL, state: 'OPEN' }
   await clock.advance(MINUTE)
@@ -545,7 +553,7 @@ test('the same pull request spelled in another case is one pull request', async 
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/holygrail/Claude-Mods/pull/7' })
   await clock.settle()
   expect(w.prompts.length).toBe(1)
-  expect([...w.store.keys()]).toEqual(['pr:' + URL.toLowerCase()])
+  expect([...w.store.keys()].filter((key) => key.startsWith('pr:'))).toEqual(['pr:' + URL.toLowerCase()])
 })
 
 test('taking back a prompt that did not enter leaves what a later approval settled', async ($, on) => {
@@ -795,4 +803,114 @@ test('watching the next pull request takes the last one\'s cleanup button away',
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
   await clock.settle()
   expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+})
+
+// Another session's poll note, as that session writes it before asking GitHub
+const pollNote = (at: number, pr = URL.toLowerCase()) => ({ pr, at })
+
+test('a session that polls in the same round as an earlier one leaves the waking to it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The other session started its poll a moment earlier and has not written what it relayed yet
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.prompts).toEqual([])
+  // Its mark is left to the session that relays, so nothing is lost if that one never does
+  expect((w.store.get('pr:' + URL.toLowerCase()) as { reviews: number[] }).reviews).toEqual([])
+})
+
+test('a session whose poll started at the same moment yields only to a smaller key', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-c', pollNote(NOW))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a session that polled earlier but stopped holds back no later round', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The other session went away before relaying
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a poll of another pull request holds nothing back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a', pollNote(NOW - 1_000, 'https://github.com/holygrail/claude-mods/pull/3'))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a push seen by a session that leaves the waking to another still moves the shared baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // This session pushes; the other session, which did not see the push, polls just before it
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2'
+  w.store.set('poll:session-a', pollNote(NOW + MINUTE - 1_000))
+  await clock.advance(40_000)
+  expect((w.store.get('pr:' + URL.toLowerCase()) as { since: number }).since).toBe(NOW + 20_000)
+})
+
+test('a poll that could not ask GitHub takes its note back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { queryError: 'HTTP 502' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 確認失敗 21:00: HTTP 502')
+  expect(w.store.has('poll:session-b')).toBe(false)
+})
+
+test('a session that ends takes its poll note away', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.get('poll:session-b')).toEqual(pollNote(NOW))
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.has('poll:session-b')).toBe(false)
+})
+
+test('a lookup that succeeds after failing clears the failure from the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {}, branchPr: 'error' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR 検索失敗 21:00: error connecting to api.github.com')
+
+  w.branchPr = null
+  await clock.advance(MINUTE)
+  expect(w.status).toBeUndefined()
+})
+
+test('a session that leaves the waking to another and knows nothing new does not write the record', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // What the other session wrote when it relayed the review, which this one may have read too early
+  const relayed = { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [1], ended: null, at: NOW - 1_000 }
+  w.store.set('pr:' + URL.toLowerCase(), relayed)
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.store.get('pr:' + URL.toLowerCase())).toEqual(relayed)
+  expect(w.prompts).toEqual([])
 })

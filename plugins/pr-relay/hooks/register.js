@@ -12,6 +12,14 @@ const DEV_SESSIONS = '/.claude/dev-sessions'
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
 const KEY_PREFIX = 'pr:'
+// Each session notes under this prefix plus its id when it last started a poll, as { pr, at }, so
+// sessions polling the same pull request together let only the first of them relay. A session
+// writes only its own key, since $.store has no atomic update.
+const POLL_PREFIX = 'poll:'
+// Polls of one pull request that started this close together are one round: the one that started
+// first relays what is new, and the others leave it to that one. The query a poll waits on takes
+// far longer than a store write, so each of them sees the earlier one's note by the time it reads.
+const ROUND_MS = 30_000
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // What gh pr view says when the branch has no pull request, as opposed to failing to ask
 const NO_PR = /no pull requests found/i
@@ -58,6 +66,10 @@ let timers = []
 let generation = 0
 // The last poll: { at, error? }, for the status line
 let lastCheck = null
+// The last lookup of the pull request when gh could not answer it, { at, error }, for the status line
+let lookupFailure = null
+// The store key this session's poll note was last written under; /clear and /resume change the id
+let pollKey = null
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
 // When this session last ran git push. It becomes the baseline only once the pull request's head
@@ -75,11 +87,7 @@ export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
     stop()
-    watched = null
-    lastCheck = null
-    offersCleanup = false
-    pushedAt = 0
-    showStatus($)
+    reset($)
     await $.tool.register({
       name: 'watch',
       description:
@@ -102,7 +110,10 @@ export function register(on) {
   })
 
   on('session.end', async ($, e, next) => {
-    if (FINAL_REASONS.includes(e.reason)) stop()
+    if (FINAL_REASONS.includes(e.reason)) {
+      stop()
+      await release($)
+    }
     return next(e)
   })
 
@@ -110,11 +121,7 @@ export function register(on) {
   // conversation may belong to another worktree and pull request
   on('classic.SessionStart', { source: ['resume'] }, async ($, e, next) => {
     stop()
-    watched = null
-    lastCheck = null
-    offersCleanup = false
-    pushedAt = 0
-    showStatus($)
+    reset($)
     timers.push($.clock.after(0, () => discover($)))
     return next(e)
   })
@@ -210,6 +217,15 @@ export function register(on) {
   })
 }
 
+function reset($) {
+  watched = null
+  lastCheck = null
+  lookupFailure = null
+  offersCleanup = false
+  pushedAt = 0
+  showStatus($)
+}
+
 // Looks for the pull request to watch, and asks again a tick later when gh could not answer
 async function discover($, { branchOnly = false } = {}) {
   if (watched && !watched.ended) return
@@ -219,9 +235,20 @@ async function discover($, { branchOnly = false } = {}) {
   // create starts the watch, not whatever the branch had before
   const owned = branchOnly ? null : await findInDevSessions($)
   const found = owned === false ? null : (owned ?? (await findForBranch($)))
+  const at = await $.clock.now()
   if ((watched && !watched.ended) || gen !== generation) return
+  if (found?.error !== undefined) {
+    // Shown in place of the watch's line, or of the ended pull request's when a push looks again
+    lookupFailure = { at, error: found.error }
+    showStatus($)
+    timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
+    return
+  }
+  if (lookupFailure) {
+    lookupFailure = null
+    showStatus($)
+  }
   if (found) watch($, found)
-  else if (found === undefined) timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
 }
 
 // Starts watching. The first poll runs on the clock, never inside the caller's hook: a prompt it
@@ -234,6 +261,7 @@ function watch($, { url, since, sessionFile = null }) {
   // none watched, or the one watched ended, it is the push that led here
   if (watched && !watched.ended && watched.id !== pr.id) pushedAt = 0
   watched = { ...pr, since, sessionFile }
+  lookupFailure = null
   // The band may still offer the cleanup of the pull request watched before
   if (offersCleanup) {
     offersCleanup = false
@@ -261,15 +289,22 @@ async function poll($, gen) {
   const recordedPush = await lastPushOf($, sessionFile)
   // What an earlier poll of this watch paged through is not asked for again
   const floor = Math.max(pr.since, recordedPush, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
+  // Noted before asking, so a session that starts polling while this one waits on GitHub finds it
+  const note = await notePoll($, pr, now)
   const answer = await query($, pr, floor).then((data) => ({ data }), (error) => ({ error }))
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
   if (answer.error) {
+    // A poll that learned nothing relays nothing, so it must not hold back the others' this round
+    await release($)
     lastCheck = { at: now, error: String(answer.error?.message ?? answer.error) }
     showStatus($)
     return
   }
   const { data } = answer
+  // Another session polling this pull request in the same round, ahead of this one, relays what is
+  // new; this one still records what it knows of the pull request, such as a push it saw
+  const defers = await yieldsTo($, pr, note)
   lastCheck = { at: now }
   watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
   const ended = data.state === 'MERGED' || data.state === 'CLOSED'
@@ -286,7 +321,11 @@ async function poll($, gen) {
     const record = normalize(await $.store.get(key))
     // A watch that began while this waited its turn owns pushedAt and the marks now
     if (gen !== generation && !ended) return null
-    const sends = update($, pr, data, record, recordedPush)
+    const stored = JSON.stringify(record)
+    const sends = update($, pr, data, record, recordedPush, defers)
+    // The session that relays writes the record at about this moment; one leaving it the waking
+    // writes only what it adds, so that its copy, read before the marks, rarely lands over them
+    if (defers && JSON.stringify(record) === stored) return sends
     record.at = now
     await $.store.set(key, record)
     return sends
@@ -301,7 +340,7 @@ async function poll($, gen) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, recordedPush) {
+function update($, pr, data, record, recordedPush, defers) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -321,7 +360,40 @@ function update($, pr, data, record, recordedPush) {
   }
   // A reopened pull request ends again, and that end is news again
   record.ended = null
-  return pushesRunning > 0 ? [] : relay($, pr, read(data, record.since), record)
+  return pushesRunning > 0 || defers ? [] : relay($, pr, read(data, record.since), record)
+}
+
+// Notes that this session starts a poll of the pull request now, and returns the note
+async function notePoll($, pr, at) {
+  const key = POLL_PREFIX + (await $.session.id())
+  // The note under the id before /clear or /resume would read as another session's
+  if (pollKey && pollKey !== key) await $.store.delete(pollKey).catch(() => {})
+  pollKey = key
+  const note = { pr: pr.id, at }
+  await $.store.set(key, note).catch(() => {})
+  return { key, ...note }
+}
+
+// Whether another session's poll of the same pull request started in the same round before this
+// one's (or at the same moment, under a smaller key), so that every session agrees on the one that
+// relays. One that stopped polling or failed drops out of the next round by itself.
+async function yieldsTo($, pr, note) {
+  const keys = (await $.store.keys().catch(() => [])).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
+  for (const key of keys) {
+    const other = await $.store.get(key).catch(() => undefined)
+    if (other?.pr !== pr.id || typeof other.at !== 'number') continue
+    if (other.at < note.at - ROUND_MS || other.at > note.at) continue
+    if (other.at < note.at || key < note.key) return true
+  }
+  return false
+}
+
+// Takes this session's poll note away, so it holds back no other session
+async function release($) {
+  if (!pollKey) return
+  const key = pollKey
+  pollKey = null
+  await $.store.delete(key).catch(() => {})
 }
 
 // Marks what is new since the last push as relayed, in poll-codex-review.sh's order: an approval,
@@ -499,16 +571,19 @@ async function findInDevSessions($) {
   return { url: session.pr_url, since: lastPush(session), sessionFile: best.file }
 }
 
-// The open pull request of the branch checked out here: null when there is none, undefined when gh
+// The open pull request of the branch checked out here: null when there is none, { error } when gh
 // could not tell
 async function findForBranch($) {
   try {
     const ran = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'])
-    if (ran.exitCode !== 0) return NO_PR.test(ran.stderr) ? null : undefined
+    if (ran.exitCode !== 0) {
+      if (NO_PR.test(ran.stderr)) return null
+      return { error: ran.stderr.trim().split('\n')[0] || `gh exited ${ran.exitCode}` }
+    }
     const { url, state } = JSON.parse(ran.stdout)
     return state === 'OPEN' && PR_URL.test(url) ? { url, since: 0 } : null
-  } catch {
-    return undefined
+  } catch (error) {
+    return { error: String(error?.message ?? error) }
   }
 }
 
@@ -545,12 +620,17 @@ function readJson($, file) {
 }
 
 async function prune($) {
-  const cutoff = (await $.clock.now()) - STALE_MS
-  const keys = (await $.store.keys()).filter((key) => key.startsWith(KEY_PREFIX))
+  const now = await $.clock.now()
+  const cutoff = now - STALE_MS
+  const keys = await $.store.keys()
   await Promise.all(
     keys.map(async (key) => {
       const record = await $.store.get(key)
-      const limit = record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS)
+      let limit
+      if (key.startsWith(KEY_PREFIX)) limit = record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS)
+      // A poll note matters for one round; one left by a session that did not end cleanly goes later
+      else if (key.startsWith(POLL_PREFIX)) limit = now - HOUR_MS
+      else return
       if (!(record?.at >= limit)) await $.store.delete(key)
     }),
   )
@@ -576,7 +656,11 @@ function parse(url) {
 }
 
 function showStatus($) {
-  if (!watched) return $.ui.status(undefined)
+  // A lookup gh could not answer says so, rather than leaving the line empty or naming an ended one
+  if (!watched || (watched.ended && lookupFailure)) {
+    if (!lookupFailure) return $.ui.status(undefined)
+    return $.ui.status(`PR 検索失敗 ${clock(lookupFailure.at)}: ${lookupFailure.error}`)
+  }
   const label = `PR #${watched.number}`
   if (watched.ended) return $.ui.status(`${label} ${ENDED[watched.ended]}済み`)
   if (lastCheck?.error) return $.ui.status(`${label} 確認失敗 ${clock(lastCheck.at)}: ${lastCheck.error}`)
