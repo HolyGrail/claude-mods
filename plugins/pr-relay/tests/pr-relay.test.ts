@@ -727,3 +727,19 @@ test('what was relayed for an open pull request outlasts two weeks unwatched', a
 
   expect(w.prompts).toEqual([])
 })
+
+test('watching the next pull request takes the last one\'s cleanup button away', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+  w.pull.state = 'OPEN'
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
+  await clock.settle()
+  expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+})

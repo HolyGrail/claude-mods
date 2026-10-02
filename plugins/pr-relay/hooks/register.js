@@ -233,7 +233,11 @@ function watch($, { url, since, sessionFile = null }) {
   // none watched, or the one watched ended, it is the push that led here
   if (watched && !watched.ended && watched.id !== pr.id) pushedAt = 0
   watched = { ...pr, since, sessionFile }
-  offersCleanup = false
+  // The band may still offer the cleanup of the pull request watched before
+  if (offersCleanup) {
+    offersCleanup = false
+    $.ui.invalidate('ui.render')
+  }
   // Ask at once: a review or a merge may have come while no session watched
   timers.push($.clock.after(0, () => poll($, gen)))
   timers.push($.clock.every(TICK_MS, () => poll($, gen)))
