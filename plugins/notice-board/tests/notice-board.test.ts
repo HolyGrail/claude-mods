@@ -61,6 +61,8 @@ function stubHost(
     id = (): string => 'this',
     // Holds a read of the session id back
     beforeId = async (): Promise<void> => {},
+    // Holds a read of a store key back
+    beforeGet = async (key: string): Promise<void> => {},
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
@@ -80,7 +82,10 @@ function stubHost(
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
-  on('store.get', ($, e) => ({ value: store.get(e.key) }))
+  on('store.get', async ($, e) => {
+    await beforeGet(e.key)
+    return { value: store.get(e.key) }
+  })
   on('store.set', ($, e) => {
     store.set(e.key, e.value)
     return { value: undefined }
@@ -115,9 +120,10 @@ function settle() {
   return new Promise<void>((resolve) => later(resolve, 5))
 }
 
-// Signs a row as the module does, with the secret it keeps in the store
+// Signs a row as the module does, with the first of the secrets it keeps in the store
 async function signed(store: Map<string, unknown>, line: string, body: string) {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(store.get('secret') + '\n' + body))
+  const secret = store.get([...store.keys()].filter((key) => key.startsWith('secret:')).sort()[0]!)
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret + '\n' + body))
   const ref = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 8)
   return line + '\n(notice-board ref ' + ref + ')'
 }
@@ -582,6 +588,7 @@ test("/branch carries the record of what the copied conversation was told", asyn
   await clock.advance(MINUTE)
   id = 'new'
   await $.classic.SessionStart({ source: 'fork' })
+  await settle()
   expect(store.get('told:new')).toEqual(store.get('told:old'))
 
   // The fork's window is full without the row, and the notice is cleared: it is still withdrawn
@@ -590,6 +597,63 @@ test("/branch carries the record of what the copied conversation was told", asyn
   store.delete('notice:1-a')
   await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
   expect(host.passedOn.at(-1)).toBe('This notice no longer applies: CI is paused')
+})
+
+test('a tick while /branch copies the record leaves nothing of it behind', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([
+    ['notice:1-a', notice('CI is paused', APP_KEY, NOW)],
+    ['notice:2-a', notice('Use the staging DB', APP_KEY, NOW)],
+  ])
+  let id = 'old'
+  let slowCopy = false
+  const host = stubHost(on, {
+    store,
+    id: () => id,
+    beforeGet: async (key) => {
+      if (!slowCopy || key !== 'told:old') return
+      slowCopy = false
+      // A tick lands while the copied record is read, and is given the time to write its own
+      void clock.advance(MINUTE)
+      for (let i = 0; i < 40 && !store.has('told:new'); i++) await settle()
+    },
+  })
+  on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
+  await $.session.start(START)
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(2)
+  expect((store.get('told:old') as { told: unknown[] }).told).toHaveLength(2)
+
+  // The copied conversation's window is full, and holds the row of only one notice; the other has
+  // been cleared since the outgoing conversation last loaded
+  const kept = host.transcript.find((m) => m.text.includes('Use the staging DB'))!
+  const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
+  host.transcript = [...Array.from({ length: 4095 }, (_, i) => message(i)), kept]
+  store.delete('notice:1-a')
+  id = 'new'
+  slowCopy = true
+  await $.classic.SessionStart({ source: 'fork' })
+  await settle()
+  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn.slice(2)).toEqual(['This notice no longer applies: CI is paused'])
+})
+
+test('rows signed before another session made its secret at the same time stay readable', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+  expect(host.passedOn).toHaveLength(1)
+
+  // A session that found no secret either writes its own, as this module does, after this one
+  // signed with the one it made
+  const other = '0'.repeat(32)
+  if (store.has('secret')) store.set('secret', other)
+  else store.set('secret:' + other, other)
+  store.delete('notice:1-a')
+  await $.session.start(START)
+  expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
 })
 
 test("/resume reads the resumed session's version 0.1 record", async ($, on) => {

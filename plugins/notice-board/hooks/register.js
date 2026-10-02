@@ -30,10 +30,11 @@ const KEY_PREFIX = 'notice:'
 // compaction, /resume, /rewind and /branch each leave it right. Each notice or withdrawal is a row
 // of its own, whose whole text is one of these, so a notice's body may hold anything, new lines
 // that look like another row included. The ref that ends a row is a hash of its body under a
-// secret kept in $.store, so a prompt that only reads like a row is not taken for one.
+// secret kept in $.store, so a prompt that only reads like a row is not taken for one. Each
+// secret has a key of its own, so one that signed a row is never overwritten by another.
 const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
 const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
-const SECRET_KEY = 'secret'
+const SECRET_PREFIX = 'secret:'
 // Version 0.1 joined its lines into one row, unsigned
 const TOLD_V1 = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)$/
 const WITHDRAWN_V1 = /^This notice no longer applies: ([\s\S]*)$/
@@ -91,12 +92,21 @@ export function register(on) {
     sessionId = incoming
     forgetRefusals()
     legacy = await legacyOf($)
-    // A fork copies the conversation, and with it what was told before its window
+    // A fork copies the conversation, and with it what was told before its window. In the queue,
+    // so no load of either conversation writes its record meanwhile; one under the new id may have
+    // written a record already, from the rows its window shows, so the two are merged. Not awaited:
+    // a load ahead of it may be waiting on the host, which may be waiting on this hook
     if (e.source === 'fork' && outgoing !== null && outgoing !== sessionId) {
-      const record = await $.store.get(RECORD_PREFIX + outgoing)
-      if (isRecord(record) && !isRecord(await $.store.get(RECORD_PREFIX + sessionId))) {
-        await $.store.set(RECORD_PREFIX + sessionId, record)
-      }
+      const target = sessionId
+      void serially(async () => {
+        const record = await $.store.get(RECORD_PREFIX + outgoing)
+        if (!isRecord(record)) return
+        const current = await $.store.get(RECORD_PREFIX + target)
+        const told = isRecord(current) ? current.told : []
+        const merged = [...told, ...record.told.filter((r) => !told.some((t) => t.key === r.key))]
+        if (merged.length === told.length) return
+        await $.store.set(RECORD_PREFIX + target, { at: isRecord(current) ? current.at : record.at, told: merged })
+      }).catch(() => {})
     }
     // Once more, for a load begun while the old version's record or the fork's was still loading
     forgetRefusals()
@@ -174,10 +184,14 @@ async function clear($) {
 
 // Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws
 function refresh($) {
-  const run_ = () => load($)
-  const run = queue.then(run_, run_)
+  return serially(() => load($)).then(() => $.ui.invalidate('ui.render'))
+}
+
+// Runs task once every earlier one has settled
+function serially(task) {
+  const run = queue.then(task, task)
   queue = run.catch(() => {})
-  return run.then(() => $.ui.invalidate('ui.render'))
+  return run
 }
 
 // Reads the notices meant for this session, and tells the model about the ones its conversation
@@ -206,8 +220,8 @@ async function load($) {
     if (!continues(seen, now)) refused.clear()
     seen = now
   }
-  const secret = await secretOf($)
-  const { told, withdrawals } = await toldIn(messages, secret)
+  const secrets = await secretsOf($)
+  const { told, withdrawals } = await toldIn(messages, secrets)
   // A full window may have dropped rows this conversation was told: the record keeps those, less
   // what the window shows was withdrawn since
   const record = await $.store.get(RECORD_PREFIX + id)
@@ -243,7 +257,7 @@ async function load($) {
       ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text, line: 'This notice no longer applies: ' + text })),
     ]
     for (const row of rows) {
-      const line = row.line + '\n(notice-board ref ' + (await ref(secret, row.text)) + ')'
+      const line = row.line + '\n(notice-board ref ' + (await ref(secrets[0], row.text)) + ')'
       // A restart or a switch since this load read the conversation: its rows may not fit the one
       // installed now, which the next load reads afresh. Checked after the last wait before the
       // append.
@@ -284,19 +298,23 @@ function forgetRefusals() {
 
 // The notices the conversation tells the model of, by key, with their text: each row this module
 // added in order, a withdrawal taking back every notice of its text; and the texts withdrawn
-async function toldIn(messages, secret) {
+async function toldIn(messages, secrets) {
+  const signs = async (text, r) => {
+    for (const secret of secrets) if (r === (await ref(secret, text))) return true
+    return false
+  }
   const told = new Map()
   const withdrawals = new Set()
   for (const message of messages) {
     if (message.role !== 'user') continue
     const added = TOLD.exec(message.text)
-    if (added && added[3] === (await ref(secret, added[2]))) {
+    if (added && (await signs(added[2], added[3]))) {
       told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
       withdrawals.delete(added[2])
       continue
     }
     const withdrawn = WITHDRAWN.exec(message.text)
-    if (withdrawn && withdrawn[2] === (await ref(secret, withdrawn[1]))) {
+    if (withdrawn && (await signs(withdrawn[1], withdrawn[2]))) {
       for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
       withdrawals.add(withdrawn[1])
       continue
@@ -352,15 +370,21 @@ async function legacyOf($) {
   }
 }
 
-// The secret every session on this machine signs its rows with, made by the first that needs it.
-// Two made at once leave one; rows signed with the other are told again, once.
-async function secretOf($) {
-  const stored = await $.store.get(SECRET_KEY)
-  if (typeof stored === 'string') return stored
-  const bytes = crypto.getRandomValues(new Uint8Array(16))
-  await $.store.set(SECRET_KEY, hex(bytes))
-  const kept = await $.store.get(SECRET_KEY)
-  return typeof kept === 'string' ? kept : hex(bytes)
+// The secrets rows on this machine are signed with, the one new rows are signed with first. The
+// first session that needs one makes it; sessions that make one at once each keep theirs, so every
+// row any of them signed stays readable, and all of them sign with the same one from then on.
+async function secretsOf($) {
+  const read = async () => {
+    const keys = (await $.store.keys()).filter((key) => key.startsWith(SECRET_PREFIX)).sort()
+    const values = await Promise.all(keys.map((key) => $.store.get(key)))
+    return values.filter((value) => typeof value === 'string')
+  }
+  const secrets = await read()
+  if (secrets.length > 0) return secrets
+  const made = hex(crypto.getRandomValues(new Uint8Array(16)))
+  await $.store.set(SECRET_PREFIX + made, made)
+  const kept = await read()
+  return kept.length > 0 ? kept : [made]
 }
 
 async function ref(secret, text) {
