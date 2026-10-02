@@ -239,6 +239,9 @@ async function load($) {
       ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text, line: 'This notice no longer applies: ' + text })),
     ]
     for (const row of rows) {
+      // A restart or a switch since this load read the conversation: its rows may not fit the one
+      // installed now, which the next load reads afresh
+      if (generation !== started) return
       const line = row.line + '\n(notice-board ref ' + (await ref(secret, row.text)) + ')'
       const result = await $.session
         .append({ message: { type: 'user', content: [{ type: 'text', text: line }] } })

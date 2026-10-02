@@ -423,7 +423,7 @@ test("the person's own prompt that quotes a notice line is not taken for one", a
   ])
 })
 
-test('a refusal met by a load a restart overtook is tried again after the restart', async ($, on) => {
+test('a load a restart overtook in its conversation read leaves the telling to the restart', async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   // The first load waits on the conversation until the restart has begun
@@ -441,10 +441,11 @@ test('a refusal met by a load a restart overtook is tried again after the restar
   await settle()
   release()
   await Promise.all([first, second])
-  expect(host.passedOn).toHaveLength(2)
+  // Told once, by the restart's own load, and not held back by anything the first one met
+  expect(host.passedOn).toHaveLength(1)
 })
 
-test('a refusal met by a load a restart overtook in its first read is tried again', async ($, on) => {
+test('a load a restart overtook in its first read leaves the telling to the restart', async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   // The first load waits on the repository until the restart has begun
@@ -462,7 +463,8 @@ test('a refusal met by a load a restart overtook in its first read is tried agai
   await settle()
   release()
   await Promise.all([first, second])
-  expect(host.passedOn).toHaveLength(2)
+  // Told once, by the restart's own load, and not held back by anything the first one met
+  expect(host.passedOn).toHaveLength(1)
 })
 
 test('a session that ran version 0.1 reads its unsigned rows, withdrawing what was cleared', async ($, on) => {
@@ -484,6 +486,30 @@ test('a session that ran version 0.1 reads its unsigned rows, withdrawing what w
   ]
   await $.session.start(START)
   expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
+})
+
+test('a load a switch overtook adds nothing to the conversation now installed', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  // The first load waits on the conversation until /resume has begun
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  let reads = 0
+  const beforeRead = async () => {
+    reads += 1
+    if (reads === 1) await gate
+  }
+  const host = stubHost(on, { store, keepsRows: false, beforeRead })
+  on('classic.SessionStart', () => ({}))
+  on('prompt.submit', ($, e) => e as never)
+  const started = $.session.start(START)
+  while (reads === 0) await settle()
+  await $.classic.SessionStart({ source: 'resume' })
+  release()
+  await started
+  expect(host.passedOn).toEqual([])
+  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn).toHaveLength(1)
 })
 
 test("a tick during /resume keeps the outgoing conversation's record to it", async ($, on) => {
