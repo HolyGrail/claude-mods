@@ -968,8 +968,10 @@ async function readNotes($, pr, note) {
   return { defers, since, pending, pushing }
 }
 
-// Marks what is new since the last push as relayed, in poll-codex-review.sh's order: an approval,
-// then a review, then the usage limit. Returns each prompt to send with how to take its mark back.
+// Marks what is new since the last push as relayed: an approval, then a review, then the usage
+// limit. poll-codex-review.sh puts an unprocessed review before an approval instead, but the /dev
+// skill runs it once whenever it is woken and follows its signal, so a review the approval settles
+// here still reaches the skill. Returns each prompt to send with how to take its mark back.
 function relay($, pr, signals, record) {
   const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id))
   if (signals.approvedAt > record.approvedAt) {
