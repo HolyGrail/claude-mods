@@ -7,6 +7,7 @@ const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z')
 const URL = 'https://github.com/HolyGrail/claude-mods/pull/7'
 const WORKTREE = '/repo/.wt/feature'
 const LAST_PUSH = NOW - 30 * MINUTE
+const POLL = '~/.claude/skills/dev/references/scripts/poll-codex-review.sh'
 
 const BAND = {
   plugin: 'pr-relay',
@@ -349,11 +350,63 @@ test('waiting for Codex with poll-codex-review.sh --watch is refused while the p
   await $.session.start(START)
   await clock.settle()
 
-  const watched = await $.tool.call({ tool: 'Bash', command: 'poll-codex-review.sh HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch' })
-  expect(watched.deny).toContain('End the turn')
+  for (const command of [
+    `${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch --max-wait 540 2>&1`,
+    `bash ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `cd /repo && "${POLL}" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // The /dev skill's documented form
+    'SCRIPT="$REPO_ROOT/.claude/skills/dev/references/scripts/poll-codex-review.sh"\n' +
+      '"$SCRIPT" "$OWNER/$REPO" "$PR_NUMBER" "$LAST_PUSH_AT" --watch --max-wait 540',
+    `2>/tmp/poll.err ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `</dev/null >>/tmp/poll.log ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // The delimiter is EOF once its quotes are removed, so the call after the body still counts
+    `cat <<'E'OF\nbody\nEOF\n${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `export SCRIPT=${POLL}\n"$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `/bin/bash ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `timeout -s TERM 600 ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `(SCRIPT=${POLL}; "$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch)`,
+    `timeout --signal TERM 600 ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `source ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `. ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // Bash drops a backslash-newline inside double quotes
+    '"/x/poll-codex-review.\\\nsh" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch',
+  ]) {
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(ran.deny).toContain('End the turn')
+  }
+})
 
-  const once = await $.tool.call({ tool: 'Bash', command: 'poll-codex-review.sh HolyGrail/claude-mods 7 2026-10-01T11:30:00Z' })
-  expect(once.deny).toBeUndefined()
+test('poll-codex-review.sh run without --watch, or only mentioned, is let through', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '{}', stderr: '', interrupted: false }, text: '{}' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  for (const command of [
+    `${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z`,
+    'SCRIPT=~/x/poll-codex-review.sh\n"$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z && gh pr checks 7 --watch',
+    "git commit -F - <<'EOF'\nNarrow the deny\n\npoll-codex-review.sh --watch was matched anywhere.\nEOF",
+    'git commit -F - <<-EOF\n\tpoll-codex-review.sh --watch\n\tEOF\ngit status',
+    'gh pr create --title "Narrow the deny" --body "It denied any mention of poll-codex-review.sh --watch"',
+    "gh pr create --body 'poll-codex-review.sh --watch' --base main",
+    `echo done # then ${POLL} HolyGrail/claude-mods 7 now --watch`,
+    `SCRIPT=${POLL}; SCRIPT=/bin/echo; "$SCRIPT" --watch`,
+    `bash -n ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // The subshell's assignment does not reach the parent
+    `SCRIPT=/bin/echo; (SCRIPT=${POLL}); "$SCRIPT" --watch`,
+    // An assignment before a command word lasts only for that command
+    `SCRIPT=/bin/echo; SCRIPT=${POLL} /bin/true; "$SCRIPT" --watch`,
+    `SCRIPT=${POLL}; '$SCRIPT' --watch`,
+    `SCRIPT=${POLL}; "\\$SCRIPT" --watch`,
+    `command -v ${POLL} --watch`,
+    // In double quotes the backslash before O stays, so the body ends only at E\\OF
+    `cat <<"E\\OF"\nEOF\n${POLL} HolyGrail/claude-mods 7 now --watch\nE\\OF`,
+  ]) {
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(ran.deny).toBeUndefined()
+  }
 })
 
 test('the watch tool reports what is watched and watches the pull request it is given', async ($, on) => {
