@@ -65,13 +65,15 @@ test('runs every command as the model wrote it', async ($, on) => {
 })
 
 test('tells the model the fix when a command fails for want of timeout', async ($, on) => {
-  await start($, on, {}, command =>
-    command.startsWith('zsh')
-      ? { text: 'Exit code 127\n(eval):1: command not found: timeout', isError: true }
-      : { text: 'Exit code 127\nbash: line 1: timeout: command not found', isError: true },
-  )
+  const errors: Record<string, string> = {
+    'zsh: timeout 5 make': '(eval):1: command not found: timeout',
+    'bash: timeout 5 make': 'bash: line 1: timeout: command not found',
+    'macOS: env timeout 5 make': 'env: timeout: No such file or directory',
+    'GNU: env timeout 5 make': 'env: ‘timeout’: No such file or directory',
+  }
+  await start($, on, {}, command => ({ text: `Exit code 127\n${errors[command]}`, isError: true }))
 
-  for (const command of ['zsh: timeout 5 make', 'bash: timeout 5 make']) {
+  for (const command of Object.keys(errors)) {
     const ran = await run($, command)
     expect(ran.context?.at(-1)).toContain("Bash tool's timeout parameter")
   }

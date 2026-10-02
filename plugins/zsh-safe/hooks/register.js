@@ -5,10 +5,12 @@
 // points there. Commands are never rewritten, so the permission rules, the auto mode classifier
 // and the transcript all see the command the model wrote.
 
-// How zsh and bash report a missing timeout: `(eval):1: command not found: timeout`,
-// `bash: line 1: timeout: command not found`
+// How zsh, bash and env (macOS, then GNU) report a missing timeout:
+// `(eval):1: command not found: timeout`, `bash: line 1: timeout: command not found`,
+// `env: timeout: No such file or directory`, `env: ‘timeout’: No such file or directory`.
 // A name such as timeout.sh is another command, so the name must end there
-const TIMEOUT_MISSING = /command not found: timeout(?=\s|$)|(^|\s)timeout: command not found/
+const TIMEOUT_MISSING =
+  /command not found: timeout(?=\s|$)|(^|\s)timeout: command not found|(^|\s)env: ['‘]?timeout['’]?: No such file or directory/
 
 export function register(on) {
   // Fires again on a reload. Sets ZDOTDIR before passing the event on, so the hooks beneath that
