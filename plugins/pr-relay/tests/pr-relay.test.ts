@@ -1174,18 +1174,33 @@ test('an old idle note is kept while it holds a push the record has not counted'
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { thumbsUpAt: NOW - 5 * MINUTE } })
   w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - 2 * 60 * MINUTE })
-  // Both sessions' queries kept failing for hours; only the first knew of the push after the approval
+  // Another session's query kept failing for hours; only it knew of the push after the approval
   w.store.set('poll:session-a', { ...pollNote(NOW - 2 * 60 * MINUTE), since: NOW - 2 * MINUTE, idle: true })
-  w.store.set('poll:session-c', { ...pollNote(NOW - 2 * 60 * MINUTE), since: LAST_PUSH, idle: true })
+  // This session left another pull request's note behind in an earlier run
+  const record9 = 'pr:' + PR9.toLowerCase()
+  w.store.set(record9, { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - 2 * 60 * MINUTE })
+  w.store.set(NOTE9, { ...pollNote(NOW - 2 * 60 * MINUTE, PR9.toLowerCase()), since: NOW - 2 * MINUTE, idle: true })
   await $.session.start(START)
   await clock.settle()
 
-  expect(w.store.has('poll:session-c')).toBe(false)
   expect(w.prompts).toEqual([])
-  // Once the record counts the push, the note goes like any other
+  expect(w.store.has(NOTE9)).toBe(true)
+  // Once the record counts the push, this session's note goes
+  w.store.set(record9, { ...(w.store.get(record9) as object), since: NOW - MINUTE })
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.has('poll:session-a')).toBe(false)
+  expect(w.store.has(NOTE9)).toBe(false)
+})
+
+test('another session\'s note is pruned only once stale, since it may be rewritten meanwhile', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('poll:session-a', pollNote(NOW - 2 * 60 * MINUTE))
+  w.store.set('poll:session-c', pollNote(NOW - 15 * 24 * 60 * MINUTE))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.has('poll:session-a')).toBe(true)
+  expect(w.store.has('poll:session-c')).toBe(false)
 })
 
 test('a poll that cannot list the other sessions\' notes relays nothing', async ($, on) => {

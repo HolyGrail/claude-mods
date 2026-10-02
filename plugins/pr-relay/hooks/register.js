@@ -914,20 +914,34 @@ function readJson($, file) {
 async function prune($) {
   const now = await $.clock.now()
   const cutoff = now - STALE_MS
+  const own = `${POLL_PREFIX}${await $.session.id()}:`
   const keys = await $.store.keys()
   await Promise.all(
     keys.map(async (key) => {
       const record = await $.store.get(key)
-      let limit
-      if (key.startsWith(KEY_PREFIX)) limit = record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS)
-      // A poll note matters for one round; one left by a session that did not end cleanly goes later,
-      // unless it holds a push the pull request's record has not counted yet
-      else if (key.startsWith(POLL_PREFIX)) limit = (await counted($, record)) ? now - HOUR_MS : cutoff
-      else return
-      if (record?.at >= limit) return
-      // A note its session rewrote meanwhile is in use again
-      if (key.startsWith(POLL_PREFIX) && JSON.stringify(await $.store.get(key)) !== JSON.stringify(record)) return
-      await $.store.delete(key)
+      if (key.startsWith(KEY_PREFIX)) {
+        if (record?.at >= (record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS))) return
+        await $.store.delete(key)
+      } else if (key.startsWith(own)) {
+        // Only this session writes its notes, so one it no longer holds goes once the record has
+        // counted what it hands on, or once stale; the delete waits for any write still going out
+        if (notesOf(record?.pr).some((note) => note.key === key)) return
+        if (record?.at >= ((await counted($, record)) ? now - HOUR_MS : cutoff)) return
+        const removal = (noteWrites.get(key) ?? Promise.resolve()).then(() => $.store.delete(key))
+        const tail = removal.catch(() => {})
+        noteWrites.set(key, tail)
+        tail.then(() => {
+          if (noteWrites.get(key) === tail) noteWrites.delete(key)
+        })
+        await removal
+      } else if (key.startsWith(POLL_PREFIX)) {
+        // The store has no conditional delete, so another session's note is left until it is stale:
+        // one it rewrote between the read and the delete would vanish from the election. A session
+        // that polls a pull request rewrites its note every minute, so a stale one is long unused.
+        if (record?.at >= cutoff) return
+        if (JSON.stringify(await $.store.get(key)) !== JSON.stringify(record)) return
+        await $.store.delete(key)
+      }
     }),
   )
 }
