@@ -547,7 +547,10 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // An ended poll that finishes after the watch turned leaves the next pull request's pushes alone
   if (watched?.id === pr.id) {
     pushes = pushes.filter((push) => {
-      if (!pushCounts(push, data, { recordHead: record.head })) return true
+      // The record's head is the head before the push only if GitHub showed it before the push
+      // started; one seen later may already be what the push put there
+      const recordHead = (record.headAt ?? 0) < push.at ? record.head : null
+      if (!pushCounts(push, data, now, { recordHead })) return true
       record.since = Math.max(record.since, push.at)
       return false
     })
@@ -555,7 +558,7 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // Another session's push counts by the same rule; one that knew no head before it cannot tell a
   // push that moved nothing from one that did, so it waits for that session's own poll
   for (const push of pending) {
-    if (pushCounts(push, data)) record.since = Math.max(record.since, push.at)
+    if (pushCounts(push, data, now)) record.since = Math.max(record.since, push.at)
   }
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
@@ -752,11 +755,13 @@ function pushKey(push) {
 // Whether a push moved the pull request to the head GitHub shows now: once it has finished, by the
 // commits it pushed, or, when its output named none, by the head having changed since it started.
 // A pushed commit the head already had before is some other ref moved to it. The session that
-// pushed falls back on the record's head; with no head known at all, the push stays pending, and
+// pushed falls back on the record's head as GitHub showed it before the push; with no head known at all, the push stays pending, and
 // the head commit's date is the baseline.
-function pushCounts(push, data, { recordHead = null } = {}) {
+function pushCounts(push, data, now, { recordHead = null } = {}) {
   const head = data.headRefOid
-  if (push.running || !head) return false
+  // A push whose Bash call hung past the time it holds the relays back is taken as finished with
+  // nothing known of what it pushed: it counts once the head moves
+  if (holds(push, now) || !head) return false
   const before = push.head ?? recordHead
   if (Array.isArray(push.shas)) {
     if (before != null) return before !== head && push.shas.some((sha) => head.startsWith(sha))

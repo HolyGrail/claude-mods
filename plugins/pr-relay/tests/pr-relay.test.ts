@@ -2337,3 +2337,46 @@ test('a push made while none was watched stays with the pull request that took i
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('approved')])
 })
+
+test('a push whose Bash call hangs counts once the head moves after it stops holding the relays back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30 * MINUTE)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex reviewed the head the push replaces, and the push moved it to an older commit
+  w.pull.reviews = [{ id: 1, at: NOW + 5_000, comments: 1 }]
+  await clock.advance(10_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.advance(12 * MINUTE)
+  expect(w.prompts).toEqual([])
+  await clock.advance(20 * MINUTE)
+  await push
+})
+
+test('a record head seen after the push started is not taken as the head before it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The record cannot be read as the push starts, so the push knows no head before it
+  w.pull.reviews = [{ id: 1, at: NOW + 5_000, comments: 1 }]
+  await clock.advance(10_000)
+  const record = 'pr:' + URL.toLowerCase()
+  w.getFails = (key) => key === record
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.getFails = undefined
+  // Another session sees the pushed head first
+  w.pull.head = 'b2b2b2b0123456789'
+  w.store.set(record, { ...(w.store.get(record) as object), head: 'b2b2b2b0123456789', headAt: NOW + 20_000 })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
