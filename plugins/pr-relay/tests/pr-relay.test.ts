@@ -366,6 +366,11 @@ test('waiting for Codex with poll-codex-review.sh --watch is refused while the p
     `/bin/bash ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
     `timeout -s TERM 600 ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
     `(SCRIPT=${POLL}; "$SCRIPT" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch)`,
+    `timeout --signal TERM 600 ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `source ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    `. ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
+    // Bash drops a backslash-newline inside double quotes
+    '"/x/poll-codex-review.\\\nsh" HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch',
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toContain('End the turn')
@@ -391,6 +396,13 @@ test('poll-codex-review.sh run without --watch, or only mentioned, is let throug
     `bash -n ${POLL} HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch`,
     // The subshell's assignment does not reach the parent
     `SCRIPT=/bin/echo; (SCRIPT=${POLL}); "$SCRIPT" --watch`,
+    // An assignment before a command word lasts only for that command
+    `SCRIPT=/bin/echo; SCRIPT=${POLL} /bin/true; "$SCRIPT" --watch`,
+    `SCRIPT=${POLL}; '$SCRIPT' --watch`,
+    `SCRIPT=${POLL}; "\\$SCRIPT" --watch`,
+    `command -v ${POLL} --watch`,
+    // In double quotes the backslash before O stays, so the body ends only at E\\OF
+    `cat <<"E\\OF"\nEOF\n${POLL} HolyGrail/claude-mods 7 now --watch\nE\\OF`,
   ]) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.deny).toBeUndefined()

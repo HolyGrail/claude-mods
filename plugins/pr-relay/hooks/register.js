@@ -605,15 +605,18 @@ const SCRIPT = /(^|\/)poll-codex-review\.sh$/
 // Words that may stand before the command word without being it
 // (matched by basename, so `/bin/bash` counts too)
 const PREFIXES = new Set(['!', '{', 'do', 'then', 'else', 'if', 'elif', 'while', 'until', 'time',
-  'export', 'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh'])
+  'export', 'exec', 'command', 'nohup', 'env', 'timeout', 'bash', 'sh', 'zsh', 'source', '.'])
 const SHELLS = new Set(['bash', 'sh', 'zsh'])
 // Options of those prefixes that take the next word as their value (`timeout -s TERM 600`)
-const OPTION_VALUES = { env: ['-u', '-C', '-S'], timeout: ['-s', '-k'] }
+const OPTION_VALUES = {
+  env: ['-u', '--unset', '-C', '--chdir', '-S', '--split-string'],
+  timeout: ['-s', '--signal', '-k', '--kill-after'],
+}
 // A shell word: quoted parts, escapes and plain characters, up to an unquoted blank or operator
 const SHELL_WORD = /^(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>()'"\\])+/
 
 function runsWatch(command) {
-  if (!command.includes('poll-codex-review.sh')) return false
+  if (!command.includes('poll-codex-review')) return false
   // Variables set to the script, one set per subshell: an assignment inside `( )` ends with it
   const scopes = [new Set()]
   for (const entry of simpleCommands(command)) {
@@ -629,13 +632,14 @@ function runsWatch(command) {
     const scripts = scopes.at(-1)
     let i = 0
     let prefix = null
-    let checksOnly = false
+    let notRun = false
+    // Assignments last past this command only when no command word follows them
+    const assignments = []
     for (; i < words.length; i++) {
       const { text } = words[i]
       const assigned = /^([A-Za-z_]\w*)=(.*)$/s.exec(text)
       if (assigned) {
-        if (SCRIPT.test(assigned[2])) scripts.add(assigned[1])
-        else scripts.delete(assigned[1])
+        assignments.push(assigned)
         continue
       }
       const name = text.slice(text.lastIndexOf('/') + 1)
@@ -643,14 +647,23 @@ function runsWatch(command) {
         prefix = name
         continue
       }
-      // `bash -n` reads the script without running it
-      if (SHELLS.has(prefix) && /^-[A-Za-z]*n/.test(text)) checksOnly = true
+      // `bash -n` reads the script without running it, and `command -v` only looks it up
+      if (SHELLS.has(prefix) && /^-[A-Za-z]*n/.test(text)) notRun = true
+      if (prefix === 'command' && /^-[A-Za-z]*[vV]/.test(text)) notRun = true
       if (OPTION_VALUES[prefix]?.includes(text)) i += 1
       if (text.startsWith('-') || /^\d+(\.\d+)?[smhd]?$/.test(text)) continue
       break
     }
-    if (i >= words.length || checksOnly) continue
-    const variable = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(words[i].text)
+    if (i >= words.length) {
+      for (const [, name, value] of assignments) {
+        if (SCRIPT.test(value)) scripts.add(name)
+        else scripts.delete(name)
+      }
+      continue
+    }
+    if (notRun) continue
+    // A `$` that was quoted or escaped is a literal, not a variable
+    const variable = !words[i].literal && /^\$\{?([A-Za-z_]\w*)\}?$/.exec(words[i].text)
     const isScript = variable ? scripts.has(variable[1]) : SCRIPT.test(words[i].text)
     if (isScript && words.slice(i + 1).some((w) => w.text === '--watch')) return true
   }
@@ -668,14 +681,17 @@ function simpleCommands(command) {
   let words = []
   let word = null
   let quoted = false
+  // Whether the word holds a `$` that cannot expand
+  let literal = false
   const heredocs = []
   // The next word is a redirection's target, not part of the command
   let target = false
   const endWord = () => {
-    if (word !== null && !target) words.push({ text: word })
+    if (word !== null && !target) words.push({ text: word, literal })
     if (word !== null) target = false
     word = null
     quoted = false
+    literal = false
   }
   // Drops a file descriptor number written right before a redirection (`2>`)
   const redirect = () => {
@@ -706,18 +722,27 @@ function simpleCommands(command) {
       }
     } else if (c === '\\') {
       if (command[i + 1] !== '\n') word = (word ?? '') + (command[i + 1] ?? '')
+      if (command[i + 1] === '$') literal = true
       i += 2
     } else if (c === "'") {
       const end = command.indexOf("'", i + 1)
       const stop = end < 0 ? command.length : end
       word = (word ?? '') + command.slice(i + 1, stop)
       quoted = true
+      if (command.slice(i + 1, stop).includes('$')) literal = true
       i = stop + 1
     } else if (c === '"') {
       let text = ''
       i += 1
       while (i < command.length && command[i] !== '"') {
-        if (command[i] === '\\' && '"\\$`\n'.includes(command[i + 1] ?? '')) i += 1
+        if (command[i] === '\\' && command[i + 1] === '\n') {
+          i += 2
+          continue
+        }
+        if (command[i] === '\\' && '"\\$`'.includes(command[i + 1] ?? '')) {
+          i += 1
+          if (command[i] === '$') literal = true
+        }
         text += command[i] ?? ''
         i += 1
       }
@@ -740,7 +765,7 @@ function simpleCommands(command) {
       }
       // Quote removal, as Bash does to the delimiter word
       const unquoted = delimiter[0].replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
-        (_, single, double, escaped) => single ?? escaped ?? double.replace(/\\(.)/g, '$1'))
+        (_, single, double, escaped) => single ?? escaped ?? double.replace(/\\([$`"\\\n])/g, '$1'))
       heredocs.push({ delimiter: unquoted, stripTabs: m[1] === '-' })
       i += m[0].length + delimiter[0].length
     } else if (c === '&' && command[i + 1] === '>') {
