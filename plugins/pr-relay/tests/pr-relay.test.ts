@@ -7,8 +7,6 @@ const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z')
 const URL = 'https://github.com/HolyGrail/claude-mods/pull/7'
 const WORKTREE = '/repo/.wt/feature'
 const LAST_PUSH = NOW - 30 * MINUTE
-// How long a session that claims a pull request waits before it reads its claim back
-const CLAIM = 5_000
 
 const BAND = {
   plugin: 'pr-relay',
@@ -112,7 +110,6 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   mock.env(on, { HOME: '/home' })
   on('session.start', () => ({ cwd: WORKTREE }))
   on('session.cwd', () => ({ value: WORKTREE }))
-  on('session.id', () => ({ value: 'this' }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-relay__${e.name}` } }))
   on('fs.list', () => ({
     value: Object.keys(w.devSessions).map((name) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
@@ -170,7 +167,7 @@ test('watches the pull request of the /dev session whose worktree the session ru
   })
   await $.session.start(START)
   // The pull request is looked up once the session is ready
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   expect(w.queries).toBe(1)
   // The repository goes as a string whatever it is named, the number as a number
@@ -183,7 +180,7 @@ test('a thumbs-up from before the last push is not an approval', async ($, on) =
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { thumbsUpAt: LAST_PUSH - 10 * MINUTE } })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts).toEqual([])
 
   // Codex reacts again after the push: GitHub keeps one reaction, now with the new time
@@ -201,7 +198,7 @@ test('a new Codex review wakes the session once, and not another session on the 
     pull: { reviews: [{ id: 1, at: LAST_PUSH - MINUTE, comments: 1 }] },
   })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts).toEqual([])
 
   w.pull.reviews?.push({ id: 2, at: NOW + 10_000, comments: 2 })
@@ -211,7 +208,7 @@ test('a new Codex review wakes the session once, and not another session on the 
   await clock.advance(MINUTE)
   // A session started later on the same pull request reads what was relayed from the store
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts.length).toBe(1)
 })
 
@@ -221,7 +218,7 @@ test('the usage limit shows a toast and wakes nobody', async ($, on) => {
     pull: { comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }] },
   })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   expect(w.prompts).toEqual([])
   expect(w.toasts).toEqual(['PR #7: Codex の利用上限に達し、レビューが付きません'])
@@ -231,7 +228,7 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   w.pull.state = 'MERGED'
   await clock.advance(MINUTE)
@@ -261,12 +258,12 @@ test('a pull request the session creates is watched from then on, without holdin
   })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: URL + '\n', stderr: '', interrupted: false }, text: URL }) as never)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.queries).toBe(0)
 
   await clock.advance(2_000)
   await $.tool.call({ tool: 'Bash', command: 'gh pr create --title t --body-file "$BODY"' })
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.queries).toBe(1)
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
@@ -277,7 +274,7 @@ test('a push moves the baseline, so a thumbs-up from before it is not an approva
   const w = stubWorld(on)
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   // Codex approved the previous push; the session pushes again and the reaction keeps its time
   w.pull.thumbsUpAt = NOW + 10_000
@@ -293,7 +290,7 @@ test('a push that leaves the head where it was keeps the baseline', async ($, on
   const w = stubWorld(on)
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: 'Everything up-to-date', interrupted: false }, text: '' }) as never)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   // Codex approves the head between two polls, and a push then changes nothing
   w.pull.thumbsUpAt = NOW + 10_000
@@ -307,7 +304,7 @@ test('a push the /dev session file records moves the baseline too', async ($, on
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   // The push went unseen here (git -C, a script); the skill recorded it after the old thumbs-up
   w.pull.thumbsUpAt = NOW + 10_000
@@ -320,7 +317,7 @@ test('a pull request gh could not look up at startup is looked up again', async 
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { devSessions: {}, branchPr: 'error' })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.queries).toBe(0)
 
   w.branchPr = { url: URL, state: 'OPEN' }
@@ -334,7 +331,7 @@ test('waiting for Codex with poll-codex-review.sh --watch is refused while the p
   stubWorld(on)
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '{}', stderr: '', interrupted: false }, text: '{}' }) as never)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   const watched = await $.tool.call({ tool: 'Bash', command: 'poll-codex-review.sh HolyGrail/claude-mods 7 2026-10-01T11:30:00Z --watch' })
   expect(watched.deny).toContain('End the turn')
@@ -347,14 +344,14 @@ test('the watch tool reports what is watched and watches the pull request it is 
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { devSessions: {} })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   const idle = await $.tool.call({ tool: 'mcp__pr-relay__watch' })
   expect(idle.result).toBe('pr-relay is not watching a pull request in this session.')
 
   const watching = await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
   expect(watching.result).toContain(`pr-relay is watching ${URL}`)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.queries).toBe(1)
 })
 
@@ -367,7 +364,7 @@ test('the worktree that holds the cwd decides, even before its pull request exis
     },
   })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   expect(w.queries).toBe(0)
   expect(w.status).toBeUndefined()
@@ -379,7 +376,7 @@ test('a review that comes after an approval is relayed on its own', async ($, on
     pull: { thumbsUpAt: NOW - 10 * MINUTE, reviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 3 }] },
   })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
 
   await clock.advance(MINUTE)
@@ -390,9 +387,9 @@ test('a pull request watched before /dev records it follows the session file onc
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { devSessions: {} })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   // The skill records the PR and, later, a push this module did not see; the old thumbs-up stays
   w.devSessions['feature.json'] = devSession({ review: { last_push_at: iso(NOW + 20_000) } })
@@ -404,9 +401,9 @@ test('a pull request watched before /dev records it follows the session file onc
 test('a reopened pull request is reported again when it closes', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
-  w.store.set('pr:' + URL, { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'CLOSED', at: NOW - MINUTE })
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'CLOSED', at: NOW - MINUTE })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   w.pull.state = 'MERGED'
   await clock.advance(MINUTE)
@@ -418,7 +415,7 @@ test('a push made for one pull request does not move the baseline of the next on
   const w = stubWorld(on, { devSessions: {}, branchPr: { url: 'https://github.com/HolyGrail/claude-mods/pull/3', state: 'OPEN' } })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
 
   // The push to #3 is still waiting for its head when the session turns to #7, which Codex
   // approved before that push
@@ -426,35 +423,8 @@ test('a push made for one pull request does not move the baseline of the next on
   await clock.advance(20_000)
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('PR #7')])
-})
-
-test('another session that owns the pull request is the one woken, until it falls silent', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
-  w.store.set('pr:' + URL, { since: LAST_PUSH, owner: { id: 'other', at: NOW - MINUTE }, at: NOW - MINUTE })
-  await $.session.start(START)
-  await clock.advance(CLAIM)
-  expect(w.prompts).toEqual([])
-  expect(w.status).toBe('PR #7 監視中（通知は別のセッション） · 21:00 確認')
-
-  // The owner stops renewing its lease, so this session takes the pull request over
-  await clock.advance(3 * MINUTE)
-  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
-  expect(w.store.get('pr:' + URL)).toMatchObject({ owner: { id: 'this' } })
-})
-
-test('a session that ends hands its pull request over', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on)
-  on('session.end', () => ({ sessionId: 'this' }))
-  await $.session.start(START)
-  await clock.advance(CLAIM)
-  expect(w.store.get('pr:' + URL)).toMatchObject({ owner: { id: 'this' } })
-
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'this', resume: { id: '' } })
-  expect(w.store.get('pr:' + URL)).toMatchObject({ owner: null })
 })
 
 test('a prompt that does not enter is sent again on the next poll', async ($, on) => {
@@ -467,11 +437,68 @@ test('a prompt that does not enter is sent again on the next poll', async ($, on
     },
   })
   await $.session.start(START)
-  await clock.advance(CLAIM)
+  await clock.settle()
   expect(w.prompts.length).toBe(1)
 
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(2)
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(2)
+})
+
+test('a pull request found after a push takes that push as its baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { devSessions: {} })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The branch's pull request shows up once pushed; Codex approved an older push of it
+  w.branchPr = { url: URL, state: 'OPEN' }
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2'
+  await clock.settle()
+  expect(w.queries).toBe(1)
+  expect(w.prompts).toEqual([])
+})
+
+test('the same pull request spelled in another case is one pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/holygrail/Claude-Mods/pull/7' })
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+  expect([...w.store.keys()]).toEqual(['pr:' + URL.toLowerCase()])
+})
+
+test('taking back a prompt that did not enter leaves what a later approval settled', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let release = () => {}
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    // The review prompt waits for its turn, and then does not enter
+    turnStarts: () =>
+      w.prompts.length === 1
+        ? new Promise<void>((_, reject) => {
+            release = () => reject(new Error('the queue is closed'))
+          })
+        : Promise.resolve(),
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+
+  // Codex approves after the review, before the review prompt fails
+  w.pull.thumbsUpAt = NOW + 30_000
+  await clock.advance(MINUTE)
+  expect(w.prompts[1]).toContain('approved にしました')
+  release()
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(2)
 })

@@ -21,12 +21,6 @@ const FINAL_REASONS = ['prompt_input_exit', 'other']
 const HOUR_MS = 3_600_000
 // Records untouched this long belong to pull requests nobody watches any more
 const STALE_MS = 14 * 24 * HOUR_MS
-// One session per pull request is woken: the owner the record names. An owner silent this long
-// (ended without saying so, or stopped polling) is replaced.
-const LEASE_MS = 3 * TICK_MS
-// $.store has no atomic update, so a session that claims the pull request reads the record again
-// after this long and goes on only if its claim was the one that stayed
-const CLAIM_SETTLE_MS = 5_000
 // How a pull request that is no longer open reads
 const ENDED = { MERGED: 'マージ', CLOSED: 'クローズ' }
 // JST has no daylight saving time, so a fixed offset gives its clock
@@ -93,14 +87,7 @@ export function register(on) {
   })
 
   on('session.end', async ($, e, next) => {
-    if (!FINAL_REASONS.includes(e.reason)) return next(e)
-    stop()
-    // Hands the pull request to whichever session polls it next, without waiting out the lease
-    if (watched && !watched.ended) {
-      const key = KEY_PREFIX + watched.url
-      const [stored, self] = await Promise.all([$.store.get(key), $.session.id()])
-      if (stored?.owner?.id === self) await $.store.set(key, { ...stored, owner: null })
-    }
+    if (FINAL_REASONS.includes(e.reason)) stop()
     return next(e)
   })
 
@@ -192,8 +179,9 @@ function watch($, { url, since, sessionFile = null }) {
   stop()
   const gen = generation
   const pr = parse(url)
-  // A push still waiting for its head to move belongs to the pull request watched before
-  if (watched?.url !== pr.url) pushedAt = 0
+  // A push still waiting for its head to move belongs to the pull request watched before; with
+  // none watched, it is the push that led here
+  if (watched && watched.id !== pr.id) pushedAt = 0
   watched = { ...pr, since, sessionFile }
   offersCleanup = false
   // Ask at once: a review or a merge may have come while no session watched
@@ -210,16 +198,15 @@ function stop() {
 async function poll($, gen) {
   if (gen !== generation || !watched || watched.ended) return
   const pr = watched
-  const key = KEY_PREFIX + pr.url
+  const key = KEY_PREFIX + pr.id
   const now = await $.clock.now()
   // /dev writes the session's pr_url only after the pull request exists, so a watch that began
   // before (gh pr create, the watch tool) looks for its file until one names it
-  const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.url))
-  const [answer, stored, recordedPush, self] = await Promise.all([
+  const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
+  const [answer, stored, recordedPush] = await Promise.all([
     query($, pr).then((data) => ({ data }), (error) => ({ error })),
     $.store.get(key),
     lastPushOf($, sessionFile),
-    $.session.id(),
   ])
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
@@ -241,36 +228,16 @@ async function poll($, gen) {
     }
   }
 
-  const owned = await claim($, key, normalize(stored), self, now, gen, ended)
-  if (owned === null) return
-  watched = { ...watched, isObserver: !owned }
-  if (owned) {
-    const record = owned
-    const sends = update($, pr, data, record, recordedPush)
-    // An ended pull request needs no owner; an open one keeps this session's lease fresh
-    record.owner = ended ? null : { id: self, at: now }
-    record.at = now
-    await $.store.set(key, record)
-    // Only once the record says they were relayed, so a send that fails can take its mark back
-    for (const send of sends) deliver($, key, send)
-  }
+  const record = normalize(stored)
+  const sends = update($, pr, data, record, recordedPush)
+  record.at = now
+  await $.store.set(key, record)
+  // Only once the record says they were relayed, so a send that fails can take its mark back. A
+  // watch that began during the write (an ended pull request stopped the timers itself) takes
+  // the marks back instead, and a later watch of this pull request sends them.
+  const current = gen === generation || ended
+  for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
   showStatus($)
-}
-
-// The record to go on with when this session wakes for the pull request, false when another
-// session does, and null when a newer watch began meanwhile. A session that finds no live owner
-// claims the record, and owns it if the claim is still there after CLAIM_SETTLE_MS: of two
-// sessions that claim together, the one that wrote last is the one both read back.
-async function claim($, key, record, self, now, gen, ended) {
-  const owner = record.owner
-  if (owner?.id === self) return record
-  if (owner && now - owner.at < LEASE_MS) return false
-  await $.store.set(key, { ...record, owner: { id: self, at: now }, at: now })
-  await $.clock.sleep(CLAIM_SETTLE_MS)
-  // poll stopped the timers itself when the pull request ended
-  if (gen !== generation && !ended) return null
-  const again = normalize(await $.store.get(key))
-  return again.owner?.id === self ? again : false
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
@@ -313,24 +280,27 @@ function relay($, pr, signals, record) {
         text:
           `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}）。` +
           'CI の結果を確かめ、完了報告と ~/.claude/dev-sessions のセッションファイルの更新をしてください。',
+        // A newer approval recorded since keeps both its time and the reviews it settles
         undo: (r) => {
-          if (r.approvedAt === approvedAt) r.approvedAt = previous
+          if (r.approvedAt !== approvedAt) return
+          r.approvedAt = previous
           r.reviews = r.reviews.filter((id) => !settled.includes(id))
         },
       },
     ]
   }
   if (fresh.length > 0) {
-    const ids = fresh.map((r) => r.id)
-    record.reviews.push(...ids)
+    record.reviews.push(...fresh.map((r) => r.id))
     const comments = fresh.reduce((sum, r) => sum + r.comments, 0)
     return [
       {
         text:
           `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${fresh.length} 件、` +
           `inline コメント ${comments} 件）。/dev の Phase 5.5 の手順で指摘を triage し、対応してください。`,
+        // A review an approval recorded since came after stays settled by it
         undo: (r) => {
-          r.reviews = r.reviews.filter((id) => !ids.includes(id))
+          const pending = fresh.filter((f) => f.at > r.approvedAt).map((f) => f.id)
+          r.reviews = r.reviews.filter((id) => !pending.includes(id))
         },
       },
     ]
@@ -345,12 +315,13 @@ function relay($, pr, signals, record) {
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
 function deliver($, key, { text, undo }) {
-  submit($, text).then(async (entered) => {
-    if (entered) return
-    const record = normalize(await $.store.get(key))
-    undo(record)
-    await $.store.set(key, record)
-  })
+  submit($, text).then((entered) => entered || takeBack($, key, undo))
+}
+
+async function takeBack($, key, undo) {
+  const record = normalize(await $.store.get(key))
+  undo(record)
+  await $.store.set(key, record)
 }
 
 // Whether the prompt entered the session
@@ -433,9 +404,9 @@ async function findForBranch($) {
 }
 
 // The /dev session file that names this pull request, or null
-async function findSessionFile($, url) {
+async function findSessionFile($, id) {
   const { files, sessions } = await readDevSessions($)
-  const i = sessions.findIndex((session) => session?.pr_url === url)
+  const i = sessions.findIndex((session) => PR_URL.test(session?.pr_url ?? '') && parse(session.pr_url).id === id)
   return i < 0 ? null : files[i]
 }
 
@@ -483,14 +454,15 @@ function normalize(record) {
     usageLimitAt: record?.usageLimitAt ?? 0,
     reviews: Array.isArray(record?.reviews) ? record.reviews : [],
     ended: record?.ended ?? null,
-    owner: record?.owner ?? null,
     at: record?.at ?? 0,
   }
 }
 
+// id is the pull request whatever the case it is spelled in, as GitHub reads owner and repository
+// names: the store key, and what watches and session files are matched by
 function parse(url) {
   const [whole, owner, name, number] = url.match(PR_URL)
-  return { url: whole, owner, name, number: Number(number) }
+  return { url: whole, id: whole.toLowerCase(), owner, name, number: Number(number) }
 }
 
 function showStatus($) {
@@ -498,8 +470,7 @@ function showStatus($) {
   const label = `PR #${watched.number}`
   if (watched.ended) return $.ui.status(`${label} ${ENDED[watched.ended]}済み`)
   if (lastCheck?.error) return $.ui.status(`${label} 確認失敗 ${clock(lastCheck.at)}: ${lastCheck.error}`)
-  const by = watched.isObserver ? '（通知は別のセッション）' : ''
-  $.ui.status(`${label} 監視中${by} · ${clock(lastCheck?.at ?? 0)} 確認`)
+  $.ui.status(`${label} 監視中 · ${clock(lastCheck?.at ?? 0)} 確認`)
 }
 
 function describe() {
