@@ -96,8 +96,10 @@ type World = {
   noteError?: string
   // What listing the store fails with, when it does
   keysError?: string
-  // What reading the store waits for
-  gets?: () => Promise<void>
+  // What reading a key of the store waits for before it answers what the key held when asked
+  gets?: (key: string) => Promise<void>
+  // What writing a key of the store waits for before the value lands
+  sets?: (key: string) => Promise<void>
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -167,11 +169,13 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { value: [...w.store.keys()] }
   })
   on('store.get', async ($, e) => {
-    await w.gets?.()
-    return { value: w.store.get(e.key) }
+    const value = w.store.get(e.key)
+    await w.gets?.(e.key)
+    return { value }
   })
-  on('store.set', ($, e) => {
+  on('store.set', async ($, e) => {
     if (w.noteError && e.key.startsWith('poll:')) throw new Error(w.noteError)
+    await w.sets?.(e.key)
     w.store.set(e.key, e.value)
     return { value: undefined }
   })
@@ -1584,4 +1588,66 @@ test('coming back to a pull request keeps the push its note was handing on', asy
   await clock.settle()
   expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 20_000, shas: ['b2b2b2b'] }] })
   expect(w.store.get(NOTE)).not.toHaveProperty('idle')
+})
+
+test('a push started before the pull request had a note keeps one when the watch turns away', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { reads: () => clock.sleep(10_000) })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  // The watch has begun, and its first poll still reads the session file
+  await clock.advance(10_500)
+  expect(w.store.has(NOTE)).toBe(false)
+
+  w.gets = () => clock.sleep(5_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(1_000)
+  const turned = $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(30_000)
+  await Promise.all([push, turned])
+  w.gets = async () => {}
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: [{ at: NOW + 10_500 }] })
+})
+
+test('a note write the store answers late does not land over a later one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(61_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(1_000)
+  // The note the tick leaves after its query, saying the push runs, is slow to land; the one
+  // saying it finished is not
+  let writes = 0
+  w.sets = async (key) => {
+    if (key !== NOTE || ++writes !== 2) return
+    await clock.sleep(5_000)
+  }
+  await clock.advance(70_000)
+  await push
+  await clock.settle()
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW }] })
+  expect((w.store.get(NOTE) as { pending: object[] }).pending[0]).not.toHaveProperty('running')
+})
+
+test('pruning leaves a note its session wrote again while it was deciding', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('poll:session-a', pollNote(NOW - 2 * 60 * MINUTE))
+  w.gets = async (key) => {
+    if (key === 'poll:session-a') await clock.sleep(5_000)
+  }
+  const started = $.session.start(START)
+  await clock.advance(2_000)
+  // The other session polls again before the prune deletes its old note
+  w.store.set('poll:session-a', pollNote(NOW + 2_000))
+  await clock.advance(20_000)
+  await started
+  expect(w.store.get('poll:session-a')).toEqual(pollNote(NOW + 2_000))
 })

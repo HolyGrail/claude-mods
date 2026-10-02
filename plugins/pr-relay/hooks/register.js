@@ -89,6 +89,8 @@ let lastHeadAt = 0
 let lastNote = null
 // The notes a stop left idle, by key, which a push that finishes later still updates
 const retired = new Map()
+// The last write of each note key still going out
+const noteWrites = new Map()
 // Tells apart the polls of one session, which may share a key and a time
 let noteSerial = 0
 // Whether the band offers to clean up after the watched pull request's merge
@@ -196,6 +198,12 @@ export function register(on) {
       }
       pushesRunning += 1
       push.head = await headBefore($, prId)
+      // A watch that turned to another pull request before this one had a note leaves the push
+      // nowhere else, so it gets an idle note of its own
+      if (prId && prId !== watched?.id && !notesOf(prId).length) {
+        const key = `${POLL_PREFIX}${await $.session.id()}:${prId}`
+        if (!retired.has(key)) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
+      }
       // The other sessions hold back their relays only if they can see the push; a store that
       // will not take it is shown rather than holding up the push
       await refreshNote($, { strict: true }).catch((error) => {
@@ -563,29 +571,45 @@ function catchUp(note) {
 
 // Writes a note as it stands, its pushes included. dirty says the store has not taken what the note
 // holds now, and writtenIdle whether it last took the note as idle.
+// Writes to one key go out one after another, each with the note as it stands when it goes out, so
+// an earlier write that the store answers late never lands over a later one.
 function writeNote($, note, { strict = false } = {}) {
-  const { key, pr, at, since, running, idle, deferred } = note
-  const pending = (note.pending ?? []).filter((push) => !push.dropped).map(pushNote)
-  const value = {
+  note.dirty = false
+  const { key } = note
+  let idle = false
+  const write = (noteWrites.get(key) ?? Promise.resolve())
+    .then(() => {
+      idle = Boolean(note.idle)
+      return $.store.set(key, noteValue(note))
+    })
+    .then(
+      () => {
+        note.writtenIdle = idle
+      },
+      (error) => {
+        note.dirty = true
+        throw error
+      },
+    )
+  const tail = write.catch(() => {})
+  noteWrites.set(key, tail)
+  tail.then(() => {
+    if (noteWrites.get(key) === tail) noteWrites.delete(key)
+  })
+  return strict ? write : tail
+}
+
+function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
+  const pushes = pending.filter((push) => !push.dropped).map(pushNote)
+  return {
     pr,
     at,
     since,
-    ...(pending.length ? { pending } : {}),
+    ...(pushes.length ? { pending: pushes } : {}),
     ...(running ? { running } : {}),
     ...(idle ? { idle } : {}),
     ...(deferred ? { deferred } : {}),
   }
-  note.dirty = false
-  const write = $.store.set(key, value).then(
-    () => {
-      note.writtenIdle = Boolean(idle)
-    },
-    (error) => {
-      note.dirty = true
-      throw error
-    },
-  )
-  return strict ? write : write.catch(() => {})
 }
 
 // A push as a note hands it on, for the session that relays to apply
@@ -892,7 +916,10 @@ async function prune($) {
       // unless it holds a push the pull request's record has not counted yet
       else if (key.startsWith(POLL_PREFIX)) limit = (await counted($, record)) ? now - HOUR_MS : cutoff
       else return
-      if (!(record?.at >= limit)) await $.store.delete(key)
+      if (record?.at >= limit) return
+      // A note its session rewrote meanwhile is in use again
+      if (key.startsWith(POLL_PREFIX) && JSON.stringify(await $.store.get(key)) !== JSON.stringify(record)) return
+      await $.store.delete(key)
     }),
   )
 }
