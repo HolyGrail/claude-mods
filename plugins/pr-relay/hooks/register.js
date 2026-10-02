@@ -899,14 +899,14 @@ function pushCounts(push, data, now, { recordHead = null } = {}) {
 // moved nothing, or null when its output does not say (a new branch, a quiet push)
 function pushedCommits(ran) {
   const text = [ran.text, ran.result?.stdout, ran.result?.stderr].filter((t) => typeof t === 'string').join('\n')
-  if (/Everything up-to-date/.test(text)) return { shas: [], refs: {} }
   // The usual form (old..new  src -> dst) and --porcelain's (flag TAB src:dst TAB old..new)
   const moves = [
     ...[...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s+(\S+)/g)].map((m) => [m[1], m[2]]),
     ...[...text.matchAll(/^[ +\-*!=]\t[^\t]*:(\S+)\t[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\b/gm)].map((m) => [m[2], m[1]]),
   ]
-  // --porcelain says a ref already up to date with =, and nothing else for it
-  if (!moves.length) return /^=\t/m.test(text) ? { shas: [], refs: {} } : null
+  // Moved nothing only when no update was printed: one Bash call may run several pushes, of which
+  // only the last was up to date. --porcelain says a ref already up to date with =
+  if (!moves.length) return /Everything up-to-date|^=\t/m.test(text) ? { shas: [], refs: {} } : null
   // The branch each ref moved to its commit, so a push can be told to have moved the pull request's
   // own branch even with no head known before it
   const refs = Object.fromEntries(moves.map(([sha, ref]) => [ref.replace(/^refs\/heads\//, ''), sha]))

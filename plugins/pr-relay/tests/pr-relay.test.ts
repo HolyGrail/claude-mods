@@ -2269,6 +2269,25 @@ test('a --porcelain push of another branch to the commit the pull request reache
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
 })
 
+test('a Bash call whose last push was up to date still counts the push before it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1a1a1a0123456789' } })
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\nEverything up-to-date\n'
+  on('tool.call', { tool: 'Bash' }, () => {
+    w.pull.head = 'b2b2b2b0123456789'
+    return { result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex reviewed the old head just before the push
+  w.pull.reviews = [{ id: 1, at: NOW + 5_000, comments: 1 }]
+  await clock.advance(10_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD && git push --tags' })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
 test('a final read of the notes that outlasts the lease sends nothing', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
