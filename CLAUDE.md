@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. The repo root is also a plugin marketplace: `.claude-plugin/marketplace.json` lists every plugin, so a new plugin needs an entry there, and a user-visible change should bump `version` in that plugin's `plugin.json` so `claude plugin update` treats it as a new release. There is no package.json or build step; the module runs as plain JS inside Claude Code. The plugins are `plugins/usage-meter`, `plugins/pr-relay` and `plugins/notice-board`.
+A collection of Claude Code mods: plugins under `plugins/<name>/` whose hooks are function hooks (a JS module exporting `register(on)`), listed in `hooks/hooks.json` under `"modules"`. The repo root is also a plugin marketplace: `.claude-plugin/marketplace.json` lists every plugin, so a new plugin needs an entry there, and a user-visible change should bump `version` in that plugin's `plugin.json` so `claude plugin update` treats it as a new release. There is no package.json or build step; the module runs as plain JS inside Claude Code. The plugins are `plugins/usage-meter`, `plugins/pr-relay`, `plugins/notice-board` and `plugins/zsh-safe`.
 
 User-facing docs (README.md) are written in Japanese; code comments, commit messages and test names are in English.
 
@@ -61,3 +61,9 @@ Rendering: SVG gauge when `e.surface === 'desktop'`, otherwise a text bar sized 
 - Polls run on `$.clock` timers, never inside a hook: a prompt `$.prompt.submit` queues resolves only when its turn starts, so awaiting one inside `tool.call` would wait on the running turn. `generation` lets a poll or lookup started before the latest watch or stop leave the state alone.
 - What was relayed is kept per pull request under `pr:<id>` (the URL in lower case) in `$.store`, so a second session on the same pull request, or a restart, is not woken again; two sessions polling it at the same moment can both be, since `$.store` has no atomic update. The record is marked before the prompt is sent, and a prompt that did not enter (rejected, or dropped by a hook) takes its mark back for the next poll to resend.
 - The tool `mcp__pr-relay__watch` is how the skill tells the mod runs (and can set the pull request and baseline); while a pull request is watched, a Bash call running `poll-codex-review.sh --watch` is denied.
+
+## zsh-safe architecture
+
+The zsh options come from `zdotdir/.zshenv`, not from rewriting commands: `session.start` points the process's `ZDOTDIR` there (keeping the person's value in `ZSH_SAFE_ZDOTDIR`), and that file hands `ZDOTDIR` back, sources the person's `.zshenv`, then runs `setopt nonomatch noequals`. Every zsh Claude Code starts reads it. Prefixing `setopt ...;` to the command was tried first and dropped: the permission rules see the rewritten command, so `Bash(echo:*)` stopped matching, and merging verdicts in `tool.check` could not tell an ask a PreToolUse hook of another plugin made from one the prefix caused.
+
+`hooks/register.js` also has one `tool.call` hook, which runs the command unchanged and, when the result is an error saying `command not found: timeout`, appends the fix (the Bash tool's `timeout` parameter) to the result's `context`, which only the model reads. A lexical scan that denied `timeout` before the run was tried and dropped: it mistook variables, here-document lines and `case` patterns for commands.

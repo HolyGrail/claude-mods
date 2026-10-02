@@ -19,6 +19,11 @@
       "name": "pr-relay",
       "source": "./plugins/pr-relay",
       "description": "Watches the session's pull request and wakes the session when it is merged or Codex reviews it"
+    },
+    {
+      "name": "zsh-safe",
+      "source": "./plugins/zsh-safe",
+      "description": "Lets Bash commands written for bash run under zsh: unmatched globs, leading =, and a missing timeout"
     }
   ]
 }
