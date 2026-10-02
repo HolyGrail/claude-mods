@@ -322,9 +322,10 @@ function watch($, { url, since, sessionFile = null }) {
   stop()
   const gen = generation
   const pr = parse(url)
-  // The note of the pull request watched before must not hold back the sessions still watching it
-  // while this watch's first poll reads the session file
-  if (lastNote && lastNote.pr !== pr.id) retire($)
+  // The note of the poll this stops must not hold back the sessions still watching its pull request
+  // while this watch's first poll reads the session file; watching the same pull request again, its
+  // first poll takes up what the note held
+  if (lastNote) retire($)
   // A push still waiting for its head to move belongs to the pull request watched before; with
   // none watched, or the one watched ended, it is the push that led here
   if (watched && !watched.ended && watched.id !== pr.id) pushes = []
@@ -414,6 +415,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // new; this one leaves the record to it and passes on what it knows through its note
   // Notes it could not read may hold an earlier poll, so this one then learned nothing either
   const notes = await readNotes($, pr, note).catch((error) => ({ error }))
+  // Read before the watch is checked, so nothing waits between the check and what follows
+  const readAt = await $.clock.now()
   if (gen !== generation) return
   if (notes.error) {
     await retire($)
@@ -422,7 +425,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     return
   }
   // So may one whose store answered too late
-  if (lapsed(now, await $.clock.now())) return late($, now)
+  if (lapsed(now, readAt)) return late($, now, pr, note)
   const { defers, since: othersSince, pending, pushing } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) lastNote.deferred = true
@@ -446,15 +449,19 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
 
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
+    const writeAt = await $.clock.now()
     // A watch that began while this waited its turn owns the pushes and the marks now
     if (gen !== generation && !ended) return null
     // Checked once more just before the record is written, since the store may have kept it waiting
-    if (lapsed(now, await $.clock.now())) return LATE
-    const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers, pushing)
+    if (lapsed(now, writeAt)) return LATE
+    // An ended poll goes on past a new watch, whose baseline is not this pull request's: it goes by
+    // what its note said
+    const owns = watched?.id === pr.id
+    const noted = Math.max(othersSince, owns ? knownSince : note.since)
+    const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
-    // An ended poll goes on past a new watch, whose baseline is not this pull request's
-    if (watched?.id === pr.id) knownSince = Math.max(knownSince, record.since)
+    if (owns) knownSince = Math.max(knownSince, record.since)
     if (defers) return sends
     record.at = now
     if (data.headRefOid) record.headAt = seenAt
@@ -465,7 +472,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     return sends
   })
   if (sends === null) return
-  if (sends === LATE) return late($, now)
+  if (sends === LATE) return late($, now, pr, note)
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
@@ -479,9 +486,11 @@ function lapsed(now, at) {
   return at >= now + RUNNING_MS - ROUND_MS
 }
 
-// A poll that lapsed relays nothing, and says so
-async function late($, now) {
-  await retire($)
+// A poll that lapsed relays nothing, and says so. An ended one that a new watch went past leaves
+// that watch's note and status alone.
+async function late($, now, pr, note) {
+  if (lastNote?.serial === note.serial) await retire($)
+  if (watched?.id !== pr.id) return
   lastCheck = { at: now, error: LATE }
   showStatus($)
 }

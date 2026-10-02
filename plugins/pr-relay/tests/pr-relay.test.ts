@@ -1838,3 +1838,67 @@ test('a merge seen as the watch turns leaves the next pull request\'s pushes alo
   await clock.advance(MINUTE)
   expect(w.store.get(NOTE9)).toMatchObject({ pending: [{ at: NOW + MINUTE + 2_000, head: 'b2' }] })
 })
+
+test('watching the same pull request again frees the round of the poll it stops', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The next poll waits on GitHub, and the watch starts over while it does
+  w.answers = () => clock.sleep(5 * MINUTE)
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  w.reads = () => clock.sleep(20_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.advance(1_000)
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, since: LAST_PUSH })
+  expect(w.store.get(NOTE)).not.toHaveProperty('running')
+  // The new poll takes up the baseline the note held
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ since: LAST_PUSH, running: true })
+})
+
+test('a merge seen as the watch turns leaves the next pull request\'s note running when it lapses', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The merged pull request's record is so slow to read that the poll lapses
+  const record = 'pr:' + URL.toLowerCase()
+  w.pull.state = 'MERGED'
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(10 * MINUTE)
+  }
+  await clock.advance(MINUTE + 1_000)
+  // The next pull request's first poll waits on GitHub meanwhile
+  w.pulls = { 9: {} }
+  w.answers = () => clock.sleep(20 * MINUTE)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(11 * MINUTE)
+  expect(w.store.get(NOTE9)).toMatchObject({ running: true })
+  expect(w.status).not.toContain('poll outlasted its turn')
+})
+
+test('a merge seen as the watch turns keeps the next pull request\'s baseline out of its record', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  const record = 'pr:' + URL.toLowerCase()
+  w.pull.state = 'MERGED'
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  // The next pull request was pushed to later than anything the merged one knows
+  w.pulls = { 9: {} }
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9, since: iso(NOW + 30_000) })
+  await clock.advance(20_000)
+  w.gets = undefined
+  await clock.settle()
+  expect((w.store.get(record) as { since: number; ended: string }).ended).toBe('MERGED')
+  expect((w.store.get(record) as { since: number }).since).toBeLessThan(NOW + 30_000)
+})
