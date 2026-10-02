@@ -56,6 +56,9 @@ let offersCleanup = false
 // has moved, since a push that changed nothing ("Everything up-to-date", another branch) must not
 // hide the events that came before it.
 let pushedAt = 0
+// The read, change and write of a record in this session, one after another: a poll and a send
+// that takes its mark back would otherwise each write what they read before the other wrote
+let writes = Promise.resolve()
 
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
@@ -125,7 +128,7 @@ export function register(on) {
     } else {
       // Codex reviews what was pushed, so its earlier activity says nothing about this push
       pushedAt = startedAt
-      if (!watched) timers.push($.clock.after(0, () => discover($, { branchOnly: true })))
+      if (!watched || watched.ended) timers.push($.clock.after(0, () => discover($, { branchOnly: true })))
     }
     return ran
   })
@@ -147,9 +150,14 @@ export function register(on) {
           key: 'cleanup',
           label: 'cleanup',
           variant: 'primary',
-          onPress: () => {
+          onPress: async () => {
             close()
-            submit($, `PR ${url} がマージされました。/dev cleanup の手順で worktree とブランチを片付けてください。`)
+            const text = `PR ${url} がマージされました。/dev cleanup の手順で worktree とブランチを片付けてください。`
+            // A prompt that did not enter leaves the button to press again
+            if (!(await submit($, text))) {
+              offersCleanup = true
+              $.ui.invalidate('ui.render')
+            }
           },
         }),
         elements.Button({ key: 'dismiss', label: '閉じる', role: 'dismiss', onPress: close }),
@@ -164,11 +172,11 @@ export function register(on) {
 
 // Looks for the pull request to watch, and asks again a tick later when gh could not answer
 async function discover($, { branchOnly = false } = {}) {
-  if (watched) return
+  if (watched && !watched.ended) return
   const gen = generation
   if (!branchOnly) await prune($)
   const found = (branchOnly ? null : await findInDevSessions($)) ?? (await findForBranch($))
-  if (watched || gen !== generation) return
+  if ((watched && !watched.ended) || gen !== generation) return
   if (found) watch($, found)
   else if (found === undefined) timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
 }
@@ -203,9 +211,8 @@ async function poll($, gen) {
   // /dev writes the session's pr_url only after the pull request exists, so a watch that began
   // before (gh pr create, the watch tool) looks for its file until one names it
   const sessionFile = pr.sessionFile ?? (await findSessionFile($, pr.id))
-  const [answer, stored, recordedPush] = await Promise.all([
+  const [answer, recordedPush] = await Promise.all([
     query($, pr).then((data) => ({ data }), (error) => ({ error })),
-    $.store.get(key),
     lastPushOf($, sessionFile),
   ])
   // A watch that began meanwhile owns the state now
@@ -228,10 +235,13 @@ async function poll($, gen) {
     }
   }
 
-  const record = normalize(stored)
-  const sends = update($, pr, data, record, recordedPush)
-  record.at = now
-  await $.store.set(key, record)
+  const sends = await exclusive(async () => {
+    const record = normalize(await $.store.get(key))
+    const sends = update($, pr, data, record, recordedPush)
+    record.at = now
+    await $.store.set(key, record)
+    return sends
+  })
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
@@ -318,10 +328,18 @@ function deliver($, key, { text, undo }) {
   submit($, text).then((entered) => entered || takeBack($, key, undo))
 }
 
-async function takeBack($, key, undo) {
-  const record = normalize(await $.store.get(key))
-  undo(record)
-  await $.store.set(key, record)
+function takeBack($, key, undo) {
+  return exclusive(async () => {
+    const record = normalize(await $.store.get(key))
+    undo(record)
+    await $.store.set(key, record)
+  })
+}
+
+function exclusive(fn) {
+  const run = writes.then(fn, fn)
+  writes = run.catch(() => {})
+  return run
 }
 
 // Whether the prompt entered the session

@@ -74,6 +74,8 @@ type World = {
   branchPr: { url: string; state: string } | null | 'error'
   // What a submitted prompt waits for before its turn starts
   turnStarts: () => Promise<void>
+  // What gh api graphql waits for before it answers
+  answers: () => Promise<void>
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -105,6 +107,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     queries: 0,
     queryArgv: [],
     turnStarts: async () => {},
+    answers: async () => {},
     ...world,
   }
   mock.env(on, { HOME: '/home' })
@@ -115,7 +118,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     value: Object.keys(w.devSessions).map((name) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
   }))
   on('fs.read', ($, e) => ({ value: JSON.stringify(w.devSessions[e.path.split('/').pop() ?? '']) }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
@@ -125,6 +128,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     }
     w.queries += 1
     w.queryArgv.push(e.argv)
+    await w.answers()
     return run(0, graphql(w.pull))
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }))
@@ -501,4 +505,61 @@ test('taking back a prompt that did not enter leaves what a later approval settl
   release()
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(2)
+})
+
+test('a prompt taken back while the next poll waits on GitHub is sent again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let sent = 0
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    // The first prompt waits a minute for its turn and then does not enter
+    turnStarts: () => (sent++ === 0 ? clock.sleep(MINUTE + 1_000).then(() => Promise.reject(new Error('closed'))) : Promise.resolve()),
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+
+  // The next poll's query is in flight when the prompt is taken back
+  w.answers = () => clock.sleep(5_000)
+  await clock.advance(MINUTE + 5_000)
+  w.answers = async () => {}
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(2)
+})
+
+test('a push after the watched pull request ended looks for the next one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #7 マージ済み')
+
+  // The session moves to another branch, whose pull request is open
+  w.pull.state = 'OPEN'
+  w.branchPr = { url: 'https://github.com/HolyGrail/claude-mods/pull/9', state: 'OPEN' }
+  await $.tool.call({ tool: 'Bash', command: 'git push -u origin next' })
+  await clock.settle()
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+})
+
+test('the cleanup button comes back when its prompt does not enter', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    turnStarts: async () => {
+      throw new Error('the queue is closed')
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'cleanup' })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('/dev cleanup')])
+  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
 })
