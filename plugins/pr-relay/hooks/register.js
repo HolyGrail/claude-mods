@@ -58,6 +58,9 @@ let offersCleanup = false
 // has moved, since a push that changed nothing ("Everything up-to-date", another branch) must not
 // hide the events that came before it.
 let pushedAt = 0
+// git push calls still running. While one is, what Codex said may be about the head it replaces,
+// so nothing is relayed until it ends.
+let pushesRunning = 0
 // The read, change and write of a record in this session, one after another: a poll and a send
 // that takes its mark back would otherwise each write what they read before the other wrote
 let writes = Promise.resolve()
@@ -96,6 +99,19 @@ export function register(on) {
     return next(e)
   })
 
+  // /resume can turn this process to another conversation without a new session.start, and that
+  // conversation may belong to another worktree and pull request
+  on('classic.SessionStart', { source: ['resume'] }, async ($, e, next) => {
+    stop()
+    watched = null
+    lastCheck = null
+    offersCleanup = false
+    pushedAt = 0
+    showStatus($)
+    timers.push($.clock.after(0, () => discover($)))
+    return next(e)
+  })
+
   on('tool.call', { tool: 'mcp__pr-relay__watch' }, async ($, e) => {
     if (typeof e.pr_url === 'string') {
       if (!PR_URL.test(e.pr_url)) return { result: `Not a pull request URL: ${e.pr_url}` }
@@ -126,8 +142,16 @@ export function register(on) {
     // is set before the push runs, so a poll that sees the new head while it is still finishing
     // already applies it, and put back if the push failed.
     const before = pushedAt
-    if (pushes) pushedAt = startedAt
-    const ran = await next(e)
+    if (pushes) {
+      pushedAt = startedAt
+      pushesRunning += 1
+    }
+    let ran
+    try {
+      ran = await next(e)
+    } finally {
+      if (pushes) pushesRunning -= 1
+    }
     if (ran.deny !== undefined || ran.isError) {
       if (pushes && pushedAt === startedAt) pushedAt = before
       return ran
@@ -162,7 +186,7 @@ export function register(on) {
             close()
             const text = `PR ${url} がマージされました。/dev cleanup の手順で worktree とブランチを片付けてください。`
             // A prompt that did not enter leaves the button to press again
-            if (!(await submit($, text))) {
+            if (!(await submit($, text)) && watched?.url === url) {
               offersCleanup = true
               $.ui.invalidate('ui.render')
             }
@@ -199,8 +223,8 @@ function watch($, { url, since, sessionFile = null }) {
   const gen = generation
   const pr = parse(url)
   // A push still waiting for its head to move belongs to the pull request watched before; with
-  // none watched, it is the push that led here
-  if (watched && watched.id !== pr.id) pushedAt = 0
+  // none watched, or the one watched ended, it is the push that led here
+  if (watched && !watched.ended && watched.id !== pr.id) pushedAt = 0
   watched = { ...pr, since, sessionFile }
   offersCleanup = false
   // Ask at once: a review or a merge may have come while no session watched
@@ -246,11 +270,14 @@ async function poll($, gen) {
 
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
+    // A watch that began while this waited its turn owns pushedAt and the marks now
+    if (gen !== generation && !ended) return null
     const sends = update($, pr, data, record, recordedPush)
     record.at = now
     await $.store.set(key, record)
     return sends
   })
+  if (sends === null) return
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
@@ -280,7 +307,7 @@ function update($, pr, data, record, recordedPush) {
   }
   // A reopened pull request ends again, and that end is news again
   record.ended = null
-  return relay($, pr, read(data, record.since), record)
+  return pushesRunning > 0 ? [] : relay($, pr, read(data, record.since), record)
 }
 
 // Marks what is new since the last push as relayed, in poll-codex-review.sh's order: an approval,
@@ -419,7 +446,8 @@ function setPage(data, kind, page) {
 // When the oldest item on a page happened
 function oldest(kind, page) {
   if (kind === 'reactors') return Date.parse(page.edges?.[0]?.reactedAt ?? '') || 0
-  if (kind === 'reviews') return Date.parse(page.nodes?.[0]?.submittedAt ?? '') || 0
+  // A pending review has no submission time yet, and says nothing about where the page starts
+  if (kind === 'reviews') return Date.parse(page.nodes?.find((node) => node.submittedAt)?.submittedAt ?? '') || 0
   return Date.parse(page.nodes?.[0]?.createdAt ?? '') || 0
 }
 

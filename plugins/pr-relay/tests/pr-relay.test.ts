@@ -33,7 +33,7 @@ type Pull = {
   head?: string
   committedAt?: number
   thumbsUpAt?: number
-  reviews?: { id: number; at: number; comments: number; by?: string }[]
+  reviews?: { id: number; at: number; comments: number; by?: string; pending?: true }[]
   // Reviews on the page before the newest, which gh hands out for the cursor 'older'
   olderReviews?: { id: number; at: number; comments: number; by?: string }[]
   comments?: { at: number; body: string }[]
@@ -42,7 +42,7 @@ type Pull = {
 const reviewNodes = (reviews: NonNullable<Pull['reviews']>) =>
   reviews.map((r) => ({
     databaseId: r.id,
-    submittedAt: iso(r.at),
+    submittedAt: 'pending' in r && r.pending ? null : iso(r.at),
     author: { login: r.by ?? 'chatgpt-codex-connector' },
     comments: { totalCount: r.comments },
   }))
@@ -614,4 +614,76 @@ test('a Codex review pushed off the newest page by later reviews is still found'
 
   expect(w.queries).toBe(2)
   expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
+})
+
+test('a pending review at the start of a page does not stop the search for older pages', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: {
+      reviews: [
+        { id: 3, at: 0, comments: 0, by: 'someone', pending: true },
+        { id: 2, at: NOW - 2 * MINUTE, comments: 0, by: 'someone' },
+      ],
+      olderReviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 4 }],
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
+})
+
+test('nothing is relayed while a push runs, even before GitHub has its head', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  // The push takes over a minute, and GitHub has the new head only as it returns
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(90_000)
+    w.pull.head = 'b2'
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex approved the previous push
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(90_000)
+  await push
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a push after the watched pull request ended is the baseline of the next one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+
+  // The next branch's pull request carries an approval from before this push
+  w.pull = { state: 'OPEN', head: 'b2', thumbsUpAt: NOW + 70_000 }
+  w.branchPr = { url: 'https://github.com/HolyGrail/claude-mods/pull/9', state: 'OPEN' }
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push -u origin next' })
+  await clock.settle()
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  expect(w.prompts).toEqual([])
+})
+
+test('resuming another conversation watches its pull request instead', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('classic.SessionStart', () => ({}))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+
+  w.devSessions['feature.json'] = devSession({ pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
+  await $.classic.SessionStart({ source: 'resume' })
+  await clock.settle()
+  expect(w.status).toBe('PR #9 監視中 · 21:00 確認')
 })
