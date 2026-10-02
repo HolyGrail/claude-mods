@@ -1270,3 +1270,131 @@ test('a poll cut short by a watch restarted at the same moment leaves the new po
   expect(w.queries).toBe(2)
   expect(w.store.get(NOTE)).toMatchObject({ at: NOW, running: true })
 })
+
+test('a poll overtaken by a new watch while it reads the session file writes no note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+
+  w.reads = () => clock.sleep(5_000)
+  await clock.advance(MINUTE)
+  // The session turns to another pull request while the poll still reads the session file
+  w.reads = async () => {}
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
+  await clock.advance(10_000)
+  expect(w.store.get(NOTE)).toMatchObject({ at: NOW })
+  expect(w.store.get(NOTE)).not.toHaveProperty('running')
+  expect(w.store.get('poll:session-b:https://github.com/holygrail/claude-mods/pull/9')).not.toHaveProperty('running')
+})
+
+test('a push that finishes after the session turned to another pull request clears it from the last one\'s note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(90_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(10_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
+  await clock.advance(10_000)
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: { at: NOW, running: true } })
+  await clock.advance(70_000)
+  await push
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true, pending: { at: NOW } })
+  expect((w.store.get(NOTE) as { pending: object }).pending).not.toHaveProperty('running')
+})
+
+test('a push counts against the head before it even once another session recorded the new one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Codex approved the previous push; after this push another session polls first and records b2
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2'
+  const record = w.store.get('pr:' + URL.toLowerCase()) as Record<string, unknown>
+  w.store.set('pr:' + URL.toLowerCase(), { ...record, head: 'b2', at: NOW + 30_000 })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a push of another branch does not move the baseline, even after the head moved some other way', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const pushed = '   c3c3c3c..d4d4d4d  other -> other\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Someone else pushed b2 and Codex approved it; then this session pushes another branch
+  w.pull.head = 'b2'
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin other' })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a push counts once GitHub shows the commit it pushed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW + 20_000 })
+})
+
+test('a session that leaves the waking to another pages through the same pages again next time', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: {
+      reviews: [{ id: 2, at: NOW - 10 * MINUTE, comments: 0, by: 'someone' }],
+      olderReviews: [{ id: 1, at: NOW - 20 * MINUTE, comments: 4 }],
+    },
+  })
+  // The other session was elected but never wrote what it relayed
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.queries).toBe(2)
+  expect(w.prompts).toEqual([])
+
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(4)
+  expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
+})
+
+test('a push whose note cannot be written still runs, and says so in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  let pushes = 0
+  on('tool.call', { tool: 'Bash' }, () => {
+    pushes += 1
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  w.noteError = 'disk full'
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  expect(pushes).toBe(1)
+  expect(w.status).toContain('push note:')
+})

@@ -81,13 +81,14 @@ let lookupFailure = null
 let polling = null
 // The last push this session knows of for the watched pull request, which its poll note carries
 let knownSince = 0
-// The head of the watched pull request as this session's last poll found it
+// The head of the watched pull request as this session's last poll found it, and when
 let lastHead = null
+let lastHeadAt = 0
 // This session's latest poll note, { key, pr, at, since, pending, running, serial }, as last written,
 // so an older poll does not mark it finished, a push can update it and a stop can leave it idle
 let lastNote = null
-// The note a stop left idle, which a push that finishes later still updates
-let idleNote = null
+// The notes a stop left idle, by key, which a push that finishes later still updates
+const retired = new Map()
 // Tells apart the polls of one session, which may share a key and a time
 let noteSerial = 0
 // Whether the band offers to clean up after the watched pull request's merge
@@ -96,6 +97,10 @@ let offersCleanup = false
 // has moved, since a push that changed nothing ("Everything up-to-date", another branch) must not
 // hide the events that came before it.
 let pushedAt = 0
+// The head the pull request had as far as this session knew when that push started, and the
+// commits the push moved refs to once it has finished (null while unknown)
+let pushHead = null
+let pushShas = null
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
 let pushesRunning = 0
@@ -178,11 +183,18 @@ export function register(on) {
     // Codex reviews what was pushed, so its earlier activity says nothing about this push. The time
     // is set before the push runs, so a poll that sees the new head while it is still finishing
     // already applies it, and put back if the push failed.
-    const before = pushedAt
+    const before = { at: pushedAt, head: pushHead, shas: pushShas }
     if (pushes) {
+      pushHead = await headBefore($)
       pushedAt = startedAt
+      pushShas = null
       pushesRunning += 1
-      await refreshNote($)
+      // The other sessions hold back their relays only if they can see the push; a store that
+      // will not take it is shown rather than holding up the push
+      await refreshNote($, { strict: true }).catch((error) => {
+        lastCheck = { at: startedAt, error: `push note: ${error?.message ?? error}` }
+        showStatus($)
+      })
     }
     let ran
     try {
@@ -190,13 +202,14 @@ export function register(on) {
     } finally {
       if (pushes) pushesRunning -= 1
     }
-    if (ran.deny !== undefined || ran.isError) {
-      if (pushes && pushedAt === startedAt) {
-        pushedAt = before
-        await refreshNote($)
-      }
+    // A push that moved nothing says nothing about what Codex reviewed
+    const shas = pushes && !(ran.deny !== undefined || ran.isError) ? pushedCommits(ran) : null
+    if (ran.deny !== undefined || ran.isError || shas?.length === 0) {
+      if (pushes && pushedAt === startedAt) ({ at: pushedAt, head: pushHead, shas: pushShas } = before)
+      if (pushes) await refreshNote($)
       return ran
     }
+    if (pushes && pushedAt === startedAt) pushShas = shas
     // The other sessions hold back their relays only while the push runs
     if (pushes) await refreshNote($)
     if (creates) {
@@ -292,6 +305,7 @@ function watch($, { url, since, sessionFile = null }) {
   lookupFailure = null
   knownSince = 0
   lastHead = null
+  lastHeadAt = 0
   // The band may still offer the cleanup of the pull request watched before
   if (offersCleanup) {
     offersCleanup = false
@@ -328,13 +342,15 @@ async function pollOnce($, gen) {
   const recordedPush = await lastPushOf($, sessionFile)
   // Read just before the note goes out, since the time is this poll's place in the election
   const now = await $.clock.now()
+  // A watch that began while this read the session file owns what the session knows now
+  if (gen !== generation) return
   // What an earlier poll of this watch paged through is not asked for again
   const floor = Math.max(pr.since, recordedPush, (pr.pagedAt ?? 0) - PAGE_OVERLAP_MS)
   // Noted before asking, so a session that starts polling while this one waits on GitHub finds it,
   // with the pushes known already, so a session that relays before this one finishes counts them
   knownSince = Math.max(knownSince, pr.since, recordedPush)
   // A poll the other sessions cannot see would relay beside the one they elect, so it waits a tick
-  const note = await notePoll($, pr, now).catch((error) => {
+  const note = await notePoll($, pr, now, gen).catch((error) => {
     lastCheck = { at: now, error: `poll note: ${error?.message ?? error}` }
     showStatus($)
     return null
@@ -372,9 +388,12 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     return
   }
   const { defers, since: othersSince, pending, pushing } = notes
-  lastHead = data.headRefOid ?? lastHead
+  if (data.headRefOid) {
+    lastHead = data.headRefOid
+    lastHeadAt = now
+  }
   lastCheck = { at: now }
-  watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
+  watched = { ...watched, ...(sessionFile ? { sessionFile } : {}) }
   // One that leaves the waking to another session leaves the end to it too, and sees it next round
   // from the record, as the session that relays: only then does it stop and offer the cleanup
   const ended = !defers && (data.state === 'MERGED' || data.state === 'CLOSED')
@@ -398,6 +417,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     if (defers) return sends
     record.at = now
     await $.store.set(key, record)
+    // Pages are skipped next time only once what they held is in the record: a session that leaves
+    // the waking to another goes through them again in case that one never writes it
+    if (gen === generation) watched = { ...watched, pagedAt: now }
     return sends
   })
   if (sends === null) return
@@ -416,15 +438,16 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // presence would read as an approval of every later push.
   const committedAt = Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0
   record.since = Math.max(record.since, pr.since, recordedPush, committedAt, notedPush)
-  if (pushedAt && data.headRefOid !== record.head) {
-    record.since = Math.max(record.since, pushedAt)
+  const own = pendingPush()
+  if (own && pushCounts(own, data, { own: true, recordHead: record.head })) {
+    record.since = Math.max(record.since, own.at)
     pushedAt = 0
+    pushShas = null
   }
-  // Another session's push counts by the same rule, against the head that session last saw; one
-  // that saw none yet cannot tell a push that moved nothing from one that did, so it waits for that
-  // session's own poll
+  // Another session's push counts by the same rule; one that knew no head before it cannot tell a
+  // push that moved nothing from one that did, so it waits for that session's own poll
   for (const push of pending) {
-    if (push.head != null && data.headRefOid !== push.head) record.since = Math.max(record.since, push.at)
+    if (pushCounts(push, data)) record.since = Math.max(record.since, push.at)
   }
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
@@ -441,13 +464,14 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
 }
 
 // Notes that this session starts a poll of the pull request now, and returns the note
-async function notePoll($, pr, at) {
+async function notePoll($, pr, at, gen) {
   // One note per pull request, so a session that turns to another leaves this one's push behind
   const key = `${POLL_PREFIX}${await $.session.id()}:${pr.id}`
+  if (gen !== generation) return null
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
   lastNote = { key, pr: pr.id, at, since: knownSince, pending: pendingPush(), running: true, serial: ++noteSerial }
-  idleNote = null
+  retired.delete(key)
   await writeNote($, lastNote, { strict: true })
   return { ...lastNote }
 }
@@ -462,11 +486,24 @@ async function finishNote($, note) {
 
 // Puts a push this session just started into its running or finished note, so a session that
 // relays before this one polls again counts it
-async function refreshNote($) {
-  const note = lastNote ?? idleNote
-  if (!note || note.pr !== watched?.id) return
-  catchUp(note)
-  await writeNote($, note)
+async function refreshNote($, { strict = false } = {}) {
+  const writes = []
+  for (const note of [lastNote, ...retired.values()]) {
+    if (!note) continue
+    if (note.pr === watched?.id) {
+      catchUp(note)
+      writes.push(writeNote($, note, { strict }))
+      continue
+    }
+    // A note left for a pull request the session turned from still says whether the push runs
+    if (note.pending?.running && pushesRunning === 0) {
+      const { running, ...pending } = note.pending
+      note.pending = pending
+      writes.push(writeNote($, note, { strict }))
+    }
+    if (note.idle && !note.pending?.running) retired.delete(note.key)
+  }
+  await Promise.all(writes)
 }
 
 // Leaves this session's note idle: it holds back no other session, and still hands on its push
@@ -477,8 +514,9 @@ async function retire($) {
   // What the session knows belongs to the watch, which may have moved on to another pull request;
   // then the note keeps what it last said
   catchUp(note)
-  idleNote = { ...note, running: false, idle: true }
-  await writeNote($, idleNote)
+  const idle = { ...note, running: false, idle: true }
+  retired.set(note.key, idle)
+  await writeNote($, idle)
 }
 
 // Brings a note of the watched pull request up to what this session knows of its pushes
@@ -496,7 +534,37 @@ function writeNote($, { key, pr, at, since, pending, running, idle }, { strict =
 
 // A push this session ran that has not counted yet, for the session that relays to apply
 function pendingPush() {
-  return pushedAt ? { at: pushedAt, head: lastHead, ...(pushesRunning > 0 ? { running: true } : {}) } : null
+  if (!pushedAt) return null
+  return { at: pushedAt, head: pushHead, ...(pushShas ? { shas: pushShas } : {}), ...(pushesRunning > 0 ? { running: true } : {}) }
+}
+
+// Whether a push moved the pull request to the head GitHub shows now: once it has finished, by the
+// commits it pushed, or, when its output named none, by the head having changed since it started.
+// The session that pushed falls back on the record's head, and with none (a pull request it found
+// only after the push) takes the push as the one that led there.
+function pushCounts(push, data, { own = false, recordHead = null } = {}) {
+  const head = data.headRefOid
+  if (push.running || !head) return false
+  if (Array.isArray(push.shas)) return push.shas.some((sha) => head.startsWith(sha))
+  const before = push.head ?? recordHead
+  return before == null ? own : head !== before
+}
+
+// The commits a finished git push moved refs to, [] when it moved none, or null when its output
+// does not say (a new branch, a quiet push)
+function pushedCommits(ran) {
+  const text = [ran.text, ran.result?.stdout, ran.result?.stderr].filter((t) => typeof t === 'string').join('\n')
+  if (/Everything up-to-date/.test(text)) return []
+  const shas = [...text.matchAll(/\b[0-9a-f]{7,40}\.{2,3}([0-9a-f]{7,40})\s+\S+\s+->\s/g)].map((m) => m[1])
+  return shas.length ? shas : null
+}
+
+// The head the watched pull request had as lately as this session knows: its own last poll or the
+// record another session wrote since
+async function headBefore($) {
+  if (!watched || watched.ended) return null
+  const record = await $.store.get(KEY_PREFIX + watched.id).catch(() => undefined)
+  return record?.head && (record.at ?? 0) > lastHeadAt ? record.head : lastHead
 }
 
 // What the other sessions' notes on the same pull request say: defers, whether one of them started
