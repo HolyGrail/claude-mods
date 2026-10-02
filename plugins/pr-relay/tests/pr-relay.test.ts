@@ -1956,7 +1956,8 @@ test('a push goes out running before its head is looked up', async ($, on) => {
   await clock.advance(1_000)
   expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW, running: true }] })
   await clock.advance(10_000)
-  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW, head: 'a1', running: true }] })
+  // Once the head is known the push is timed again, just before Bash runs, and that goes out too
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 10_000, head: 'a1', running: true }] })
   w.gets = undefined
   await clock.advance(MINUTE)
   await push
@@ -2379,6 +2380,38 @@ test('a record head seen after the push started is not taken as the head before 
   w.store.set(record, { ...(w.store.get(record) as object), head: 'b2b2b2b0123456789', headAt: NOW + 20_000 })
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
+})
+
+test('a record head seen in the same millisecond as this session\'s but different leaves the head before unknown', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const pushed = '   a1a1a1a..b2b2b2b  other -> other\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Another session saw a different head in the very millisecond this one saw its own
+  const record = 'pr:' + URL.toLowerCase()
+  const seen = w.store.get(record) as { headAt: number }
+  w.store.set(record, { ...seen, head: 'b2b2b2b0123456789' })
+  w.pull.thumbsUpAt = NOW + 10_000
+  await clock.advance(20_000)
+  // A push of another branch to that commit is not the pull request's push
+  await $.tool.call({ tool: 'Bash', command: 'git push origin other' })
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('approved')])
+})
+
+test('another session\'s stale note is kept while its pull request is open', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('pr:' + URL.toLowerCase(), { at: NOW - MINUTE, since: LAST_PUSH })
+  w.store.set('poll:session-c', pollNote(NOW - 15 * 24 * 60 * MINUTE))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.deleted).not.toContain('poll:session-c')
+  expect(w.store.has('poll:session-c')).toBe(true)
 })
 
 test('a push that started and finished while the record was read still holds back the relay', async ($, on) => {

@@ -240,6 +240,8 @@ export function register(on) {
       // so the push counts from when it actually runs; the notes take the time with its end
       push.at = await $.clock.now()
       for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
+      // The other sessions hold back for RUNNING_MS from the time they see, so they see this one
+      await publish()
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {
@@ -827,7 +829,11 @@ async function headBefore($, prId) {
   // A record it cannot read may hold a fresher head than this session saw, so the head is unknown
   const record = await $.store.get(KEY_PREFIX + prId).catch(() => null)
   if (record === null) return null
-  return record?.head && (!own || (record.headAt ?? record.at ?? 0) > lastHeadAt) ? record.head : own
+  if (!record?.head || !own) return record?.head ?? own
+  const recordAt = record.headAt ?? record.at ?? 0
+  // Two heads seen in the same millisecond cannot be told apart, so neither is the head before
+  if (recordAt === lastHeadAt && record.head !== own) return null
+  return recordAt > lastHeadAt ? record.head : own
 }
 
 // What the other sessions' notes on the same pull request say: defers, whether one of them started
@@ -1147,10 +1153,13 @@ async function prune($) {
         })
         await removal
       } else if (key.startsWith(POLL_PREFIX)) {
-        // The store has no conditional delete, so another session's note is left until it is stale:
-        // one it rewrote between the read and the delete would vanish from the election. A session
-        // that polls a pull request rewrites its note every minute, so a stale one is long unused.
+        // The store has no conditional delete, so another session's note is left while its pull
+        // request may still hold an election: one that session rewrote between the read and the
+        // delete would vanish from it. Only a stale note of a pull request that ended (or whose record
+        // is gone) goes, since no session polls that one any more
         if (record?.at >= cutoff) return
+        const pr = await $.store.get(KEY_PREFIX + record?.pr)
+        if (pr && !pr.ended) return
         if (JSON.stringify(await $.store.get(key)) !== JSON.stringify(record)) return
         await $.store.delete(key)
       }
