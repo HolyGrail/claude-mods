@@ -146,6 +146,8 @@ test('draws context, both limits and the other mods on each surface', async ($, 
     expect(await ui.find({ type: 'Text', text: '62% 2h13m (23:13)' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^5% 4d18h$/ })).toMatchObject({ props: { color: 'success' } })
     expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+    // Desktop leaves a row between the meters and the other mods; the terminal keeps its rows
+    expect(await ui.find({ type: 'Box' })).toMatchObject({ props: { rowGap: surface === 'desktop' ? 1 : 0 } })
     await ui.unmount()
   }
 })
