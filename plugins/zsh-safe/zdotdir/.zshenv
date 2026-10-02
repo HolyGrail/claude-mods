@@ -8,8 +8,9 @@ if (( ${+ZSH_SAFE_ZDOTDIR} )); then
 else
   unset ZDOTDIR
 fi
-if [[ -f ${ZDOTDIR-$HOME}/.zshenv ]]; then
-  builtin source ${ZDOTDIR-$HOME}/.zshenv
+# Quoted, since /etc/zshenv may turn on sh_word_split or glob_subst
+if [[ -f "${ZDOTDIR-$HOME}/.zshenv" ]]; then
+  builtin source "${ZDOTDIR-$HOME}/.zshenv"
 fi
 # null_glob and csh_null_glob take precedence over nonomatch, dropping an unmatched glob or
 # failing on it, so they go off too

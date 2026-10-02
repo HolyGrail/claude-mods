@@ -32,6 +32,7 @@ zsh は、起動のたびに `$ZDOTDIR/.zshenv` を読みます。
 ## 制約
 
 - `zdotdir/.zshenv` の `setopt` は、利用者の `.zshenv` の後、`.zprofile` と `.zshrc` の前に実行されます。そのため、`.zshrc` で `unsetopt nonomatch` のように打ち消している環境では効きません。
+- `/etc/zshenv` が `ZDOTDIR` を設定し直す環境では効きません。zsh は `/etc/zshenv` を先に実行してから `$ZDOTDIR/.zshenv` を探すので、同梱の `.zshenv` が読まれなくなります。
 - `ZDOTDIR` は、Claude Code がこのあと起動するすべての zsh に効きます。Bash ツールのほか、設定のフックから zsh を起動するスクリプトも含みます。コマンドの中でさらに起動した zsh は、元の `ZDOTDIR` に戻っているので、影響を受けません。
 - mod を無効にしたりアンインストールしたりしても、そのプロセスの `ZDOTDIR` は戻りません。mods API に、アンロードを知らせるイベントがないからです。Claude Code を再起動すると戻ります。
 - `timeout` の失敗は防ぎません。`make clean && timeout 30 make` なら、`make clean` は実行されたあとで止まります。mod がないときと同じ振る舞いで、変わるのは、モデルが同じ往復のうちに直し方を受け取ることです。
