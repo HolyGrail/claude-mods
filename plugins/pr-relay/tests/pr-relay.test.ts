@@ -2141,3 +2141,47 @@ test('a push another session started while the record was written holds back the
   expect(w.prompts).toEqual([])
   w.sets = undefined
 })
+
+test('a baseline another session\'s note shows once the record is written holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const record = 'pr:' + URL.toLowerCase()
+  w.sets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  // The other session read a newer push from its session file after this poll read the notes
+  w.store.set('poll:session-a:' + URL.toLowerCase(), { ...pollNote(NOW + MINUTE + 1_000), idle: true, since: NOW + 40_000 })
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  w.sets = undefined
+})
+
+test('the head is timed when GitHub showed it, not once the older pages came', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let asked = 0
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 2, at: NOW - 2 * MINUTE, comments: 0, by: 'someone' }], olderReviews: [] },
+    answers: async () => {
+      if (++asked === 2) await clock.sleep(20_000)
+    },
+  })
+  await $.session.start(START)
+  await clock.advance(30_000)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ headAt: NOW })
+})
+
+test('a module started afresh for the same session keeps what its note in the store held', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - 20_000, comments: 1 }] } })
+  // The module before the respawn knew of a push the record has not counted yet
+  w.store.set(NOTE, { ...pollNote(NOW - 2 * MINUTE), idle: true, since: NOW - 10_000 })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW - 10_000 })
+})

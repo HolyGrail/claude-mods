@@ -409,14 +409,15 @@ async function pollOnce($, gen) {
 }
 
 async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note }) {
-  const answer = await query($, pr, floor).then((data) => ({ data }), (error) => ({ error }))
+  const answer = await query($, pr, floor).catch((error) => ({ error }))
   // When GitHub showed the head, which is what tells a fresher head from a staler one
-  const seenAt = await $.clock.now()
+  const seenAt = answer.seenAt
+  const answeredAt = await $.clock.now()
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
   // A query that outlasted the time the others wait on a running note may have seen another
   // session take the round over, which this one's election cannot tell: it relays nothing
-  if (!answer.error && lapsed(now, seenAt)) answer.error = new Error(LATE)
+  if (!answer.error && lapsed(now, answeredAt)) answer.error = new Error(LATE)
   if (answer.error) {
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
@@ -463,6 +464,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   }
 
   let started = 0
+  let noted = 0
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
     const writeAt = await $.clock.now()
@@ -473,7 +475,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // An ended poll goes on past a new watch, whose baseline is not this pull request's: it goes by
     // what its note said
     const owns = watched?.id === pr.id
-    const noted = Math.max(othersSince, owns ? knownSince : note.since)
+    noted = Math.max(othersSince, owns ? knownSince : note.since)
     started = pushStarts.get(pr.id) ?? 0
     const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
@@ -503,7 +505,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   if (sends.length && !pushedSince) {
     const again = await readNotes($, pr, note).catch(() => null)
     const known = new Set(pending.map((push) => push.at))
-    pushedSince = !again || again.pushing || again.pending.some((push) => !known.has(push.at))
+    pushedSince =
+      !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(push.at))
   }
   const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => push.running))
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
@@ -572,6 +575,9 @@ async function sessionIdOf($) {
 async function notePoll($, pr, gen) {
   // One note per pull request, so a session that turns to another leaves this one's push behind
   const key = `${POLL_PREFIX}${await sessionIdOf($)}:${pr.id}`
+  // A worker respawn starts this module afresh while the session's note from before stays in the
+  // store, still holding what the record may not have counted; a read that fails is retried
+  const stored = lastNote?.key === key || retired.has(key) ? null : await $.store.get(key)
   // Read just before the note goes out, since the time is this poll's place in the election
   const at = await $.clock.now()
   if (gen !== generation) return null
@@ -586,6 +592,14 @@ async function notePoll($, pr, gen) {
     knownSince = Math.max(knownSince, left.since)
     for (const push of left.pending) if (!push.dropped && !pushes.includes(push)) pushes.push(push)
     retired.delete(key)
+  } else if (stored?.pr === pr.id) {
+    if (typeof stored.since === 'number') knownSince = Math.max(knownSince, stored.since)
+    for (const push of [].concat(stored.pending ?? [])) {
+      if (typeof push?.at !== 'number' || pushes.some((p) => p.at === push.at)) continue
+      // Whether a push the last module saw running pushed anything is unknown, so it counts once
+      // the head moves
+      pushes.push({ at: push.at, head: push.head ?? null, shas: push.running ? null : (push.shas ?? null), running: false })
+    }
   }
   lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, serial: ++noteSerial }
   await writeNote($, lastNote, { strict: true })
@@ -880,6 +894,8 @@ function read(data, since) {
 // head commit's date, or since when that is later
 async function query($, pr, since) {
   const data = await graphql($, pr, QUERY)
+  // The head comes from this first page only, so it was seen now, not once the older pages came
+  const seenAt = await $.clock.now()
   const floor = Math.max(since, Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0)
   for (const kind of Object.keys(CONNECTIONS)) {
     let page = pageOf(data, kind)
@@ -892,7 +908,7 @@ async function query($, pr, since) {
       page = older
     }
   }
-  return data
+  return { data, seenAt }
 }
 
 // One page of a connection; the reactors that matter are the thumbs-up's
