@@ -2380,3 +2380,45 @@ test('a record head seen after the push started is not taken as the head before 
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
 })
+
+test('a push that started and finished while the record was read still holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const record = 'pr:' + URL.toLowerCase()
+  let slow = true
+  w.gets = async (key) => {
+    if (key === record && slow) {
+      slow = false
+      await clock.sleep(10_000)
+    }
+  }
+  await clock.advance(MINUTE + 1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  w.gets = undefined
+})
+
+test('a poll yields to a note timed in the same millisecond while its own was on its way', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  // The next poll's note is slow to land, and a session whose key sorts after this one's starts its
+  // poll in the same millisecond
+  let writes = 0
+  w.sets = async (key) => {
+    if (key === NOTE && ++writes === 1) await clock.sleep(20_000)
+  }
+  await clock.advance(MINUTE)
+  w.store.set('poll:session-z', pollNote(NOW + MINUTE))
+  await clock.advance(25_000)
+  expect(w.prompts).toEqual([])
+})

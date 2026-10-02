@@ -195,18 +195,23 @@ export function register(on) {
     // Bound to the pull request watched as the push starts, before anything else can turn the
     // watch to another
     const prId = watched && !watched.ended ? watched.id : null
-    const startedAt = await $.clock.now()
-    // Codex reviews what was pushed, so its earlier activity says nothing about this push. The time
-    // is set before the push runs, so a poll that sees the new head while it is still finishing
-    // already applies it, and put back if the push failed.
+    // Codex reviews what was pushed, so its earlier activity says nothing about this push. The push
+    // is counted as started before anything is awaited, so a poll finishing meanwhile holds back
+    // what it read from the head being replaced; a watch that turns to another pull request while
+    // the time is read leaves it behind with the rest of the last one's pushes
     let push = null
     if (pushing) {
-      // id tells parallel pushes started in the same millisecond apart, in this session and others
-      push = { id: pushId(startedAt), pr: prId, at: startedAt, head: null, shas: null, running: true }
+      push = { id: null, pr: prId, at: null, head: null, shas: null, running: true }
       if (prId) pushStarts.set(prId, (pushStarts.get(prId) ?? 0) + 1)
-      // A watch that turned to another pull request while the time was read cleared the last one's
-      // pushes: this one goes only into that pull request's notes
-      if (!prId || watched?.id === prId) pushes.push(push)
+      pushes.push(push)
+    }
+    // The time is set before the push runs, so a poll that sees the new head while it is still
+    // finishing already applies it, and put back if the push failed
+    const startedAt = await $.clock.now()
+    if (pushing) {
+      push.at = startedAt
+      // id tells parallel pushes started in the same millisecond apart, in this session and others
+      push.id = pushId(startedAt)
       for (const note of notesOf(prId)) {
         note.pending = [...note.pending.filter((p) => p !== push), push]
         note.dirty = true
@@ -416,6 +421,9 @@ async function pollOnce($, gen) {
 }
 
 async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note }) {
+  // Read before GitHub is asked: a push that starts, and even finishes, while the query or the
+  // record is on its way may have replaced the head the query saw
+  const started = pushStarts.get(pr.id) ?? 0
   const answer = await query($, pr, floor).catch((error) => ({ error }))
   // When GitHub showed the head, which is what tells a fresher head from a staler one
   const seenAt = answer.seenAt
@@ -470,7 +478,6 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     }
   }
 
-  let started = 0
   let noted = 0
   const sends = await exclusive(async () => {
     const record = normalize(await $.store.get(key))
@@ -483,7 +490,6 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     // what its note said
     const owns = watched?.id === pr.id
     noted = Math.max(othersSince, owns ? knownSince : note.since)
-    started = pushStarts.get(pr.id) ?? 0
     const sends = update($, pr, data, record, recordedPush, noted, pending, defers, pushing, now)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
@@ -740,7 +746,7 @@ function pushNote({ id, at, head, shas, refs, running }) {
 // Whether a push of this session still holds back a poll started at now: one whose Bash call hung
 // holds nothing back for long, the same as another session's in readNotes
 function holds(push, now) {
-  return push.running && push.at >= now - RUNNING_MS
+  return push.running && (push.at === null || push.at >= now - RUNNING_MS)
 }
 
 function pushId(at) {
@@ -823,10 +829,14 @@ async function readNotes($, pr, note) {
     // A poll that left the round to another holds nothing back either: polls a few seconds apart
     // would otherwise each yield to the one before, round after round, and none would relay
     if (other.idle || other.deferred) continue
-    if (other.at > note.at) {
-      if (other.at <= (note.landedAt ?? note.at)) defers = true
+    // A note written while this one's was on its way, even in the same millisecond it was timed,
+    // may have been elected without seeing it
+    const landedAt = note.landedAt ?? note.at
+    if (landedAt > note.at && other.at >= note.at && other.at <= landedAt) {
+      defers = true
       continue
     }
+    if (other.at > note.at) continue
     if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
