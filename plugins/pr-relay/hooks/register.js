@@ -97,9 +97,10 @@ let noteSerial = 0
 // Whether the band offers to clean up after the watched pull request's merge
 let offersCleanup = false
 // The git push calls this session ran for the watched pull request that have not counted yet, each
-// { at, head, shas, running }: when it started, the head the pull request had as far as the session
-// knew then, and once it has finished, the commits it moved refs to (null when its output does not
-// say). A push becomes the baseline only once GitHub shows what it pushed, since one that changed
+// { id, pr, at, head, shas, refs, running }: its own id, the pull request it was bound to (null when
+// none was watched), when it started, the head the pull request had as far as the session knew
+// then, and once it has finished, the commits it moved refs to and the commit each branch moved to
+// (null when its output does not say). A push becomes the baseline only once GitHub shows what it pushed, since one that changed
 // nothing ("Everything up-to-date", another branch) must not hide the events that came before it.
 // Notes hold the same objects, so a push that finishes after the session turned to another pull
 // request still updates the note it was in.
@@ -200,7 +201,8 @@ export function register(on) {
     // already applies it, and put back if the push failed.
     let push = null
     if (pushing) {
-      push = { at: startedAt, head: null, shas: null, running: true }
+      // id tells parallel pushes started in the same millisecond apart, in this session and others
+      push = { id: pushId(startedAt), pr: prId, at: startedAt, head: null, shas: null, running: true }
       if (prId) pushStarts.set(prId, (pushStarts.get(prId) ?? 0) + 1)
       // A watch that turned to another pull request while the time was read cleared the last one's
       // pushes: this one goes only into that pull request's notes
@@ -345,9 +347,9 @@ function watch($, { url, since, sessionFile = null }) {
   // while this watch's first poll reads the session file; watching the same pull request again, its
   // first poll takes up what the note held
   if (lastNote) retire($)
-  // A push still waiting for its head to move belongs to the pull request watched before; with
-  // none watched, or the one watched ended, it is the push that led here
-  if (watched && !watched.ended && watched.id !== pr.id) pushes = []
+  // A push still waiting for its head to move stays with the pull request it was bound to, even one
+  // that ended; one made while none was watched is the push that led here
+  if (watched?.id !== pr.id) pushes = pushes.filter((push) => !push.pr)
   // Watching the same pull request again keeps the baseline its polls learned
   if (watched?.id !== pr.id) knownSince = 0
   watched = { ...pr, since, sessionFile }
@@ -507,9 +509,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   // So may one another session started after its notes were read, which only they say
   if (sends.length && !pushedSince) {
     const again = await readNotes($, pr, note).catch(() => null)
-    const known = new Set(pending.map((push) => push.at))
+    const known = new Set(pending.map(pushKey))
     pushedSince =
-      !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(push.at))
+      !again || again.pushing || again.since > noted || again.pending.some((push) => !known.has(pushKey(push)))
     // A read the store kept waiting past the lease may have let another session take the round over
     // and relay the same, so this one leaves the marks as they are for it and sends nothing
     if (lapsed(now, await $.clock.now())) return late($, now, pr, note)
@@ -601,11 +603,13 @@ async function notePoll($, pr, gen) {
   } else if (stored?.pr === pr.id) {
     if (typeof stored.since === 'number') knownSince = Math.max(knownSince, stored.since)
     for (const push of [].concat(stored.pending ?? [])) {
-      if (typeof push?.at !== 'number' || pushes.some((p) => p.at === push.at)) continue
+      if (typeof push?.at !== 'number' || pushes.some((p) => pushKey(p) === pushKey(push))) continue
       // Whether a push the last module saw running pushed anything is unknown, so it counts once
       // the head moves
       const finished = !push.running
       pushes.push({
+        id: push.id ?? null,
+        pr: pr.id,
         at: push.at,
         head: push.head ?? null,
         shas: finished ? (push.shas ?? null) : null,
@@ -724,8 +728,17 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
 }
 
 // A push as a note hands it on, for the session that relays to apply
-function pushNote({ at, head, shas, refs, running }) {
-  return { at, head, ...(shas ? { shas } : {}), ...(refs ? { refs } : {}), ...(running ? { running } : {}) }
+function pushNote({ id, at, head, shas, refs, running }) {
+  return { ...(id ? { id } : {}), at, head, ...(shas ? { shas } : {}), ...(refs ? { refs } : {}), ...(running ? { running } : {}) }
+}
+
+function pushId(at) {
+  return `${at.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+// What tells one push from another: its id, or for a note written without one, its start
+function pushKey(push) {
+  return push.id ?? `at:${push.at}`
 }
 
 // Whether a push moved the pull request to the head GitHub shows now: once it has finished, by the

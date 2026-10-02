@@ -2257,3 +2257,41 @@ test('pruning leaves this session\'s note a watch took up while it was deciding'
   expect(w.deleted).not.toContain(NOTE)
   expect(w.store.has(NOTE)).toBe(true)
 })
+
+test('a push still pending for a pull request that ended stays out of the next one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // A quiet push leaves the head where it was, so it never counts, and the pull request is merged
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+
+  // The next pull request was approved before that push, at a head of its own
+  w.pulls = { 9: { head: 'c3c3c3c', branch: 'next', thumbsUpAt: NOW + 10_000 } }
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved')])
+})
+
+test('a module started afresh keeps every push its note held, even two started at the same moment', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'b2b2b2b0123456789', reviews: [{ id: 1, at: NOW - 20_000, comments: 1 }] } })
+  // One push moved another branch, the other the pull request's own, in the same millisecond
+  w.store.set(NOTE, {
+    ...pollNote(NOW - 2 * MINUTE),
+    idle: true,
+    since: LAST_PUSH,
+    pending: [
+      { id: 'p1', at: NOW - 10_000, head: 'a1', shas: ['d4d4d4d'], refs: { other: 'd4d4d4d' } },
+      { id: 'p2', at: NOW - 10_000, head: 'a1', shas: ['b2b2b2b'], refs: { feature: 'b2b2b2b' } },
+    ],
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
