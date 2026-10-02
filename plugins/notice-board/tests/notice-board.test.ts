@@ -47,11 +47,20 @@ type Host = {
 // failure logs, and that line stands in for the row the append would have added.
 function stubHost(
   on: On,
-  { store = new Map<string, unknown>(), repo = (): SessionRepo | null => HTTPS, keepsRows = true } = {},
+  {
+    store = new Map<string, unknown>(),
+    repo = (): SessionRepo | null => HTTPS,
+    keepsRows = true,
+    // Holds a read of the conversation back, as a slow host would
+    beforeRead = async (): Promise<void> => {},
+  } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
   on('session.id', () => ({ value: 'this' }))
-  on('session.messages', () => ({ value: host.transcript }))
+  on('session.messages', async () => {
+    await beforeRead()
+    return { value: host.transcript }
+  })
   on('session.repo', () => ({ value: repo() }))
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -67,9 +76,9 @@ function stubHost(
   })
   on('ui.log', ($, e) => {
     if (e.text.startsWith('notice-board could not tell the model: ')) {
-      const lines = e.text.split('\n').slice(1)
-      host.passedOn.push(...lines)
-      if (keepsRows) host.transcript = [...host.transcript, said('user', lines.join('\n'))]
+      const row = e.text.slice(e.text.indexOf('\n') + 1)
+      host.passedOn.push(row)
+      if (keepsRows) host.transcript = [...host.transcript, said('user', row)]
     }
     return { value: undefined }
   })
@@ -80,6 +89,14 @@ function stubHost(
 
 function said(role: 'user' | 'assistant', text: string): SessionMessage {
   return { role, text, toolUses: [] }
+}
+
+// The test environment has timers, which the es2023 lib the tsconfig names leaves untyped
+const later = (globalThis as unknown as { setTimeout: (run: () => void, ms: number) => void }).setTimeout
+
+// Lets the hooks already dispatched run up to their next wait on the host
+function settle() {
+  return new Promise<void>((resolve) => later(resolve, 5))
 }
 
 function notice(text: string, repo: string | null, postedAt: number) {
@@ -357,6 +374,19 @@ test('a notice /rewind took out of the conversation is told again before the nex
   expect(host.passedOn).toEqual([told, told])
 })
 
+test('a notice whose body holds a line like a withdrawal is told once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const body = 'first line\nThis notice no longer applies: first line'
+  const store = new Map<string, unknown>([['notice:1-a', notice(body, APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+
+  await clock.advance(2 * MINUTE)
+  // A reload forgets every refusal, so only the conversation keeps it from being told again
+  await $.session.start(START)
+  expect(host.passedOn).toEqual(['Notice to every Claude Code session in this repository, posted 0m ago with /notice: ' + body])
+})
+
 test("the person's own prompt that quotes a notice line is not taken for one", async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
@@ -368,6 +398,48 @@ test("the person's own prompt that quotes a notice line is not taken for one", a
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
   ])
+})
+
+test('a refusal met by a load a restart overtook is tried again after the restart', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  // The first load waits on the conversation until the restart has begun
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  let reads = 0
+  const beforeRead = async () => {
+    reads += 1
+    if (reads === 1) await gate
+  }
+  const host = stubHost(on, { store, keepsRows: false, beforeRead })
+  const first = $.session.start(START)
+  while (reads === 0) await settle()
+  const second = $.session.start(START)
+  await settle()
+  release()
+  await Promise.all([first, second])
+  expect(host.passedOn).toHaveLength(2)
+})
+
+test('a refused line is tried again after a rewind, even in a conversation past the window', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store, keepsRows: false })
+  on('prompt.submit', ($, e) => e as never)
+  const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
+  const window = (from: number) => Array.from({ length: 4096 }, (_, i) => message(from + i))
+  host.transcript = window(100)
+  await $.session.start(START)
+  expect(host.passedOn).toHaveLength(1)
+
+  // New messages push the oldest out of the window: the same conversation, carried on
+  host.transcript = window(110)
+  await clock.advance(MINUTE)
+  expect(host.passedOn).toHaveLength(1)
+  // Rewinding ten messages still leaves a full window, now reaching further back
+  host.transcript = window(100)
+  await $.prompt.submit({ text: 'again', origin: { kind: 'composer' } } as never)
+  expect(host.passedOn).toHaveLength(2)
 })
 
 test('a refused line is not retried every tick', async ($, on) => {

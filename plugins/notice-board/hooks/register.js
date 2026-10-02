@@ -9,11 +9,14 @@ let sessionId = null
 let ticker = null
 // Loads run one at a time, so a tick and a command can't pass the same notice on twice
 let queue = Promise.resolve()
-// The lines the host refused to add, by key, so a refusal is not retried every tick. Forgotten
-// when the conversation is replaced or shrinks (/rewind), which may want them again.
+// The rows the host refused to add, by key, so a refusal is not retried every tick. Forgotten
+// when the conversation is replaced or rewound, which may want them again.
 const refused = new Set()
-// How many messages the conversation held at the last load
-let lastLength = 0
+// The conversation as the last load read it while refusals were held, one fingerprint per message
+let seen = []
+// Bumped by every session.start and conversation switch, so a load begun before one doesn't record
+// its refusals against the conversation that follows
+let generation = 0
 // Counts this module's posts, so two in the same millisecond get keys of their own
 let posts = 0
 
@@ -21,11 +24,13 @@ let posts = 0
 // another session's notice, and clearing deletes keys instead of rewriting a shared list
 const KEY_PREFIX = 'notice:'
 // What the model was told is read back from the conversation itself, so a reload, /clear,
-// compaction, /resume, /rewind and /branch each leave it right: the lines this module added start
-// with these, and a row made of nothing else is one of them
+// compaction, /resume, /rewind and /branch each leave it right. Each notice or withdrawal is a row
+// of its own, whose whole text is one of these, so a notice's body may hold anything, new lines
+// that look like another row included
 const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)$/
 const WITHDRAWN = /^This notice no longer applies: ([\s\S]*)$/
-const LINE_START = /\n(?=Notice to every Claude Code session |This notice no longer applies: )/
+// $.session.messages() returns at most this many, the newest
+const WINDOW = 4096
 // How often to pick up notices other sessions posted or cleared
 const TICK_MS = 60_000
 // The band shows this many notices, newest first, and counts the rest
@@ -42,7 +47,7 @@ export function register(on) {
     ticker?.cancel()
     // The queue stays: a load the previous start began may still be running
     notices = []
-    refused.clear()
+    forgetRefusals()
     sessionId = await $.session.id()
     await $.command.register({
       name: 'notice',
@@ -59,7 +64,7 @@ export function register(on) {
   // so a tick in between may tell the outgoing one, and the load after it tells the new one
   on('classic.SessionStart', { source: ['clear', 'compact', 'resume', 'fork'] }, async ($, e, next) => {
     sessionId = await $.session.id()
-    refused.clear()
+    forgetRefusals()
     return next(e)
   })
 
@@ -157,14 +162,18 @@ async function load($) {
   shown.sort((a, b) => b.postedAt - a.postedAt || (a.id < b.id ? 1 : -1))
   notices = shown
 
+  const started = generation
   const messages = await $.session.messages()
-  if (messages.length < lastLength) refused.clear()
-  lastLength = messages.length
+  if (refused.size > 0) {
+    const now = messages.map(fingerprint)
+    if (!continues(seen, now)) refused.clear()
+    seen = now
+  }
   const told = toldIn(messages)
   const toldTexts = new Set(told.values())
   const shownTexts = new Set(shown.map((notice) => notice.text))
   // This session's own posts too: a command's output is not part of what the model reads. Oldest
-  // first, and one line for notices that read the same
+  // first, and one row for notices that read the same
   const fresh = []
   for (const notice of [...shown].reverse()) {
     const key = toldKey(notice)
@@ -176,43 +185,50 @@ async function load($) {
   if (fresh.length === 0 && withdrawn.length === 0) return
 
   const now = await $.clock.now()
-  const lines = [
-    ...fresh.map(
-      (notice) =>
+  const rows = [
+    ...fresh.map((notice) => ({
+      key: toldKey(notice),
+      text:
         'Notice to every Claude Code session ' +
         (notice.repo === null ? 'on this machine' : 'in this repository') +
         ', posted ' + ago(now - notice.postedAt) + ' ago with /notice: ' + notice.text,
-    ),
-    ...withdrawn.map((text) => 'This notice no longer applies: ' + text),
+    })),
+    ...withdrawn.map((text) => ({ key: 'withdrawn\n' + text, text: 'This notice no longer applies: ' + text })),
   ]
-  const text = lines.join('\n')
-  const result = await $.session
-    .append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-    .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
-  if (result.deny === undefined) return
-  // A run no plugin may shape refuses the row; the band still shows the notices
-  for (const notice of fresh) refused.add(toldKey(notice))
-  for (const text of withdrawn) refused.add('withdrawn\n' + text)
-  $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + text, { to: 'debug' })
+  for (const row of rows) {
+    const result = await $.session
+      .append({ message: { type: 'user', content: [{ type: 'text', text: row.text }] } })
+      .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
+    if (result.deny === undefined) continue
+    // A run no plugin may shape refuses the row; the band still shows the notices. A refusal met
+    // before a restart or a switch is not held against what follows it.
+    if (generation === started) {
+      if (refused.size === 0) seen = messages.map(fingerprint)
+      refused.add(row.key)
+    }
+    $.ui.log('notice-board could not tell the model: ' + result.deny + '\n' + row.text, { to: 'debug' })
+  }
 }
 
-// The notices the conversation tells the model of, by key, with their text: each line this module
+function forgetRefusals() {
+  generation += 1
+  refused.clear()
+  seen = []
+}
+
+// The notices the conversation tells the model of, by key, with their text: each row this module
 // added in order, a withdrawal taking back every notice of its text
 function toldIn(messages) {
   const told = new Map()
   for (const message of messages) {
     if (message.role !== 'user') continue
-    const parts = message.text.split(LINE_START)
-    if (!parts.every((part) => TOLD.test(part) || WITHDRAWN.test(part))) continue
-    for (const part of parts) {
-      const added = TOLD.exec(part)
-      if (added) {
-        told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
-        continue
-      }
-      const text = WITHDRAWN.exec(part)[1]
-      for (const [key, value] of told) if (value === text) told.delete(key)
+    const added = TOLD.exec(message.text)
+    if (added) {
+      told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
+      continue
     }
+    const withdrawn = WITHDRAWN.exec(message.text)
+    if (withdrawn) for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
   }
   return told
 }
@@ -220,6 +236,27 @@ function toldIn(messages) {
 // Notices of one scope that read the same are told once
 function toldKey(notice) {
   return (notice.repo === null ? 'all' : 'repo') + '\n' + notice.text
+}
+
+function fingerprint(message) {
+  const ids = [...message.toolUses, ...(message.toolResults ?? [])].map((t) => t.tool_use_id)
+  return message.role + '\n' + ids.join(' ') + '\n' + message.text
+}
+
+// Whether now is before carried on: before's messages, less the oldest ones the capped window
+// dropped, start it, so nothing before held was rewound or replaced
+function continues(before, now) {
+  if (before.length === 0) return true
+  // Where before's newest message sits in now, tried from the newest so a repeated one doesn't hide
+  // a longer match
+  for (let end = now.length - 1; end >= 0; end--) {
+    if (now[end] !== before[before.length - 1]) continue
+    const dropped = before.length - 1 - end
+    // Only a full window drops its oldest messages
+    if (dropped < 0 || (dropped > 0 && now.length < WINDOW)) continue
+    if (now.slice(0, end + 1).every((fp, i) => fp === before[dropped + i])) return true
+  }
+  return false
 }
 
 // Names a repository the same in each of its worktrees and clones: the origin remote as
