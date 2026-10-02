@@ -805,6 +805,9 @@ test('watching the next pull request takes the last one\'s cleanup button away',
   expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
 })
 
+// This session's poll note on the pull request
+const NOTE = 'poll:session-b:' + URL.toLowerCase()
+
 // Another session's poll note, as that session writes it before asking GitHub
 const pollNote = (at: number, pr = URL.toLowerCase()) => ({ pr, at })
 
@@ -865,7 +868,7 @@ test('a push seen by a session that leaves the waking to another goes out in its
   w.pull.head = 'b2'
   w.store.set('poll:session-a', pollNote(NOW + MINUTE - 1_000))
   await clock.advance(40_000)
-  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW + MINUTE, since: NOW + 20_000 })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW + MINUTE, since: NOW + 20_000 })
 })
 
 test('the session that relays takes the last push from the other sessions\' notes', async ($, on) => {
@@ -902,7 +905,7 @@ test('a tick that comes while a poll still waits on GitHub leaves that poll its 
 
   await clock.advance(MINUTE)
   expect(w.queries).toBe(1)
-  expect(w.store.get('poll:session-b')).toMatchObject({ at: NOW })
+  expect(w.store.get(NOTE)).toMatchObject({ at: NOW })
 })
 
 test('a poll that could not ask GitHub leaves its note idle, with the push it knows', async ($, on) => {
@@ -911,7 +914,7 @@ test('a poll that could not ask GitHub leaves its note idle, with the push it kn
   await $.session.start(START)
   await clock.settle()
   expect(w.status).toBe('PR #7 確認失敗 21:00: HTTP 502')
-  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
 })
 
 test('a session that ends leaves its poll note idle', async ($, on) => {
@@ -920,10 +923,10 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
   on('session.end', () => ({ sessionId: 'session-b' }))
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.get('poll:session-b')).toMatchObject(pollNote(NOW))
+  expect(w.store.get(NOTE)).toMatchObject(pollNote(NOW))
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  expect(w.store.get('poll:session-b')).toMatchObject({ idle: true })
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
 })
 
 test('a lookup that succeeds after failing clears the failure from the status line', async ($, on) => {
@@ -977,10 +980,10 @@ test('a poll note carries the push the session file records from the start', asy
   await $.session.start(START)
   await clock.settle()
   // Still waiting on GitHub, so a session that relays meanwhile counts the push
-  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, running: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, running: true })
 
   await clock.advance(10_000)
-  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
 })
 
 test('an idle note holds nothing back but its push still counts', async ($, on) => {
@@ -1001,11 +1004,58 @@ test('resuming another conversation mid-poll leaves the note idle rather than ru
   on('classic.SessionStart', () => ({}))
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.get('poll:session-b')).toMatchObject({ running: true })
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
 
   // The resumed conversation has no pull request to watch
   w.devSessions = {}
   await $.classic.SessionStart({ source: 'resume' })
   await clock.advance(10_000)
-  expect(w.store.get('poll:session-b')).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+})
+
+test('turning to another pull request leaves the last one\'s note behind', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  const other = 'https://github.com/HolyGrail/claude-mods/pull/9'
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: other })
+  await clock.settle()
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get('poll:session-b:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
+})
+
+test('a push another session ran counts once the head has moved past the one it saw', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Codex approved the head before the other session's push, which GitHub now has
+  const w = stubWorld(on, { pull: { head: 'b2', thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - 2 * MINUTE, head: 'a1' } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push another session ran that left the head where it was does not count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { head: 'a1', thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('poll:session-a', { ...pollNote(NOW - 40_000), since: 0, pending: { at: NOW - 2 * MINUTE, head: 'a1' } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a poll note carries a push this session ran before GitHub has its head', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  await clock.advance(20_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  // The next poll is still waiting on GitHub
+  w.answers = () => clock.sleep(10_000)
+  await clock.advance(40_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: { at: NOW + 20_000, head: 'a1' }, running: true })
 })
