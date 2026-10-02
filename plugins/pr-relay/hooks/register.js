@@ -28,6 +28,7 @@ const ROUND_MS = 30_000
 // A poll still running holds back the later ones of other sessions past its round, since it has not
 // written what it relayed yet; one this old is taken to belong to a session that died mid-poll
 const RUNNING_MS = 10 * 60_000
+const LATE = 'poll outlasted its turn'
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // What gh pr view says when the branch has no pull request, as opposed to failing to ask
 const NO_PR = /no pull requests found/i
@@ -198,11 +199,12 @@ export function register(on) {
       }
       pushesRunning += 1
       push.head = await headBefore($, prId)
-      // A watch that turned to another pull request before this one had a note leaves the push
-      // nowhere else, so it gets an idle note of its own
-      if (prId && prId !== watched?.id && !notesOf(prId).length) {
+      // A pull request with no note yet (its first poll still reads the session file, or the watch
+      // turned away first) gets an idle one, so the other sessions see the push run; the first poll
+      // takes it up
+      if (prId && !notesOf(prId).length) {
         const key = `${POLL_PREFIX}${await $.session.id()}:${prId}`
-        if (!retired.has(key)) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
+        if (!notesOf(prId).length) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
       }
       // The other sessions hold back their relays only if they can see the push; a store that
       // will not take it is shown rather than holding up the push
@@ -211,26 +213,28 @@ export function register(on) {
         showStatus($)
       })
     }
+    // The other sessions hold back their relays only while the push runs
+    const finish = async ({ dropped = false, shas = null } = {}) => {
+      pushesRunning -= 1
+      push.running = false
+      if (dropped) push.dropped = true
+      else push.shas = shas
+      pushes = pushes.filter((p) => !p.dropped)
+      for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
+      await refreshNote($)
+    }
     let ran
     try {
       ran = await next(e)
-    } finally {
-      if (push) {
-        pushesRunning -= 1
-        push.running = false
-      }
+    } catch (error) {
+      // Whether it pushed is unknown, so it counts only once the head moves
+      if (push) await finish().catch(() => {})
+      throw error
     }
     // A push that failed or moved nothing says nothing about what Codex reviewed
     const failed = ran.deny !== undefined || ran.isError
     const shas = push && !failed ? pushedCommits(ran) : null
-    if (push) {
-      if (failed || shas?.length === 0) push.dropped = true
-      else push.shas = shas
-      pushes = pushes.filter((p) => !p.dropped)
-      for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
-      // The other sessions hold back their relays only while the push runs
-      await refreshNote($)
-    }
+    if (push) await finish({ dropped: failed || shas?.length === 0, shas })
     if (failed) return ran
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
@@ -396,7 +400,7 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   if (gen !== generation) return
   // A query that outlasted the time the others wait on a running note may have seen another
   // session take the round over, which this one's election cannot tell: it relays nothing
-  if (!answer.error && seenAt >= now + RUNNING_MS - ROUND_MS) answer.error = new Error('GitHub answered too late')
+  if (!answer.error && lapsed(now, seenAt)) answer.error = new Error(LATE)
   if (answer.error) {
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
@@ -417,6 +421,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     showStatus($)
     return
   }
+  // So may one whose store answered too late
+  if (lapsed(now, await $.clock.now())) return late($, now)
   const { defers, since: othersSince, pending, pushing } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) lastNote.deferred = true
@@ -442,6 +448,8 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     const record = normalize(await $.store.get(key))
     // A watch that began while this waited its turn owns the pushes and the marks now
     if (gen !== generation && !ended) return null
+    // Checked once more just before the record is written, since the store may have kept it waiting
+    if (lapsed(now, await $.clock.now())) return LATE
     const sends = update($, pr, data, record, recordedPush, Math.max(othersSince, knownSince), pending, defers, pushing)
     // The session that relays writes the record at about this moment, so a copy read before its
     // marks must not land over them: one that leaves it the waking writes only its own note
@@ -457,11 +465,24 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
     return sends
   })
   if (sends === null) return
+  if (sends === LATE) return late($, now)
   // Only once the record says they were relayed, so a send that fails can take its mark back. A
   // watch that began during the write (an ended pull request stopped the timers itself) takes
   // the marks back instead, and a later watch of this pull request sends them.
   const current = gen === generation || ended
   for (const send of sends) current ? deliver($, key, send) : takeBack($, key, send.undo)
+  showStatus($)
+}
+
+// Whether a poll started at now has run so long that another session may have taken its round over
+function lapsed(now, at) {
+  return at >= now + RUNNING_MS - ROUND_MS
+}
+
+// A poll that lapsed relays nothing, and says so
+async function late($, now) {
+  await retire($)
+  lastCheck = { at: now, error: LATE }
   showStatus($)
 }
 
@@ -472,11 +493,14 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers, p
   // presence would read as an approval of every later push.
   const committedAt = Date.parse(data.commits?.nodes?.[0]?.commit?.committedDate ?? '') || 0
   record.since = Math.max(record.since, pr.since, recordedPush, committedAt, notedPush)
-  pushes = pushes.filter((push) => {
-    if (!pushCounts(push, data, { recordHead: record.head })) return true
-    record.since = Math.max(record.since, push.at)
-    return false
-  })
+  // An ended poll that finishes after the watch turned leaves the next pull request's pushes alone
+  if (watched?.id === pr.id) {
+    pushes = pushes.filter((push) => {
+      if (!pushCounts(push, data, { recordHead: record.head })) return true
+      record.since = Math.max(record.since, push.at)
+      return false
+    })
+  }
   // Another session's push counts by the same rule; one that knew no head before it cannot tell a
   // push that moved nothing from one that did, so it waits for that session's own poll
   for (const push of pending) {
@@ -652,7 +676,9 @@ function pushedCommits(ran) {
 async function headBefore($, prId) {
   if (!prId) return null
   const own = watched?.id === prId ? lastHead : null
-  const record = await $.store.get(KEY_PREFIX + prId).catch(() => undefined)
+  // A record it cannot read may hold a fresher head than this session saw, so the head is unknown
+  const record = await $.store.get(KEY_PREFIX + prId).catch(() => null)
+  if (record === null) return null
   return record?.head && (!own || (record.headAt ?? record.at ?? 0) > lastHeadAt) ? record.head : own
 }
 
@@ -739,7 +765,10 @@ function relay($, pr, signals, record) {
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
 function deliver($, key, { text, undo }) {
-  submit($, text).then((entered) => entered || takeBack($, key, undo))
+  // A mark the store would not take back stays, and that prompt is not sent again
+  submit($, text)
+    .then((entered) => entered || takeBack($, key, undo))
+    .catch(() => {})
 }
 
 function takeBack($, key, undo) {

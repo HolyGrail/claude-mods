@@ -100,6 +100,10 @@ type World = {
   gets?: (key: string) => Promise<void>
   // What writing a key of the store waits for before the value lands
   sets?: (key: string) => Promise<void>
+  // Whether reading a key of the store fails
+  getFails?: (key: string) => boolean
+  // The pull requests other than the one in pull, by number
+  pulls?: Record<number, Pull>
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -162,13 +166,15 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     await w.answers()
     if (w.queryError) return run(1, '', w.queryError)
     const before = e.argv.find((arg) => arg.startsWith('before='))?.slice('before='.length)
-    return run(0, graphql(w.pull, before))
+    const number = Number(e.argv.find((arg) => arg.startsWith('number='))?.slice('number='.length))
+    return run(0, graphql(w.pulls?.[number] ?? w.pull, before))
   })
   on('store.keys', () => {
     if (w.keysError) throw new Error(w.keysError)
     return { value: [...w.store.keys()] }
   })
   on('store.get', async ($, e) => {
+    if (w.getFails?.(e.key)) throw new Error('store busy')
     const value = w.store.get(e.key)
     await w.gets?.(e.key)
     return { value }
@@ -1733,5 +1739,102 @@ test('a poll whose query outlasted its turn relays nothing beside the one that t
   w.store.set('poll:session-a', { ...pollNote(NOW + 10 * MINUTE + 30_000), running: true })
   await clock.advance(30_000)
   expect(w.prompts).toEqual([])
-  expect(w.status).toContain('GitHub answered too late')
+  expect(w.status).toContain('poll outlasted its turn')
+})
+
+test('a push whose record could not be read knows no head before it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // Another session saw the head move to b2, and Codex reviewed it
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(record, { ...(w.store.get(record) as object), head: 'b2', headAt: NOW + 10_000 })
+  w.pull.head = 'b2'
+  w.pull.reviews = [{ id: 1, at: NOW + 20_000, comments: 1 }]
+  await clock.advance(30_000)
+  // A push that names no commit starts while the record cannot be read
+  w.getFails = (key) => key === record
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.getFails = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a poll whose record the store kept waiting past its turn relays nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.answers = () => clock.sleep(9 * MINUTE)
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.advance(1_000)
+  // GitHub answers in time, then the record is slow to read
+  w.gets = async (key) => {
+    if (key.startsWith('pr:')) await clock.sleep(MINUTE)
+  }
+  await clock.advance(10 * MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('poll outlasted its turn')
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  w.gets = undefined
+  w.answers = async () => {}
+  await clock.advance(10 * MINUTE)
+})
+
+test('a push started while the first poll reads the session file is seen running at once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { reads: () => clock.sleep(10_000) })
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.advance(10_500)
+  expect(w.store.has(NOTE)).toBe(false)
+
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(1_000)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 10_500, running: true }] })
+  await clock.advance(MINUTE)
+  await push
+})
+
+test('a push whose run threw is no longer shown running', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, () => {
+    throw new Error('runner gone')
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  await expect($.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })).rejects.toThrow()
+  await clock.settle()
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW }] })
+  expect((w.store.get(NOTE) as { pending: object[] }).pending[0]).not.toHaveProperty('running')
+})
+
+test('a merge seen as the watch turns leaves the next pull request\'s pushes alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pulls: { 9: { head: 'b2' } } })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  // The merged pull request's record is slow to read while the watch turns and a push runs
+  const record = 'pr:' + URL.toLowerCase()
+  w.pull.state = 'MERGED'
+  w.gets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.advance(1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(10_000)
+  w.gets = undefined
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE9)).toMatchObject({ pending: [{ at: NOW + MINUTE + 2_000, head: 'b2' }] })
 })
