@@ -327,7 +327,13 @@ async function pollOnce($, gen) {
   // Noted before asking, so a session that starts polling while this one waits on GitHub finds it,
   // with the pushes known already, so a session that relays before this one finishes counts them
   knownSince = Math.max(knownSince, pr.since, recordedPush)
-  const note = await notePoll($, pr, now)
+  // A poll the other sessions cannot see would relay beside the one they elect, so it waits a tick
+  const note = await notePoll($, pr, now).catch((error) => {
+    lastCheck = { at: now, error: `poll note: ${error?.message ?? error}` }
+    showStatus($)
+    return null
+  })
+  if (!note) return
   try {
     await pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floor, note })
   } finally {
@@ -354,7 +360,9 @@ async function pollNoted($, gen, { pr, key, now, sessionFile, recordedPush, floo
   lastHead = data.headRefOid ?? lastHead
   lastCheck = { at: now }
   watched = { ...watched, pagedAt: now, ...(sessionFile ? { sessionFile } : {}) }
-  const ended = data.state === 'MERGED' || data.state === 'CLOSED'
+  // One that leaves the waking to another session leaves the end to it too, and sees it next round
+  // from the record, as the session that relays: only then does it stop and offer the cleanup
+  const ended = !defers && (data.state === 'MERGED' || data.state === 'CLOSED')
   if (ended) {
     stop()
     watched = { ...watched, ended: data.state }
@@ -405,7 +413,7 @@ function update($, pr, data, record, recordedPush, notedPush, pending, defers) {
   }
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
-    if (!record.ended) {
+    if (!record.ended && !defers) {
       record.ended = data.state
       $.ui.toast(`PR #${pr.number} が${ENDED[data.state]}されました`)
     }
@@ -423,7 +431,7 @@ async function notePoll($, pr, at) {
   // The note under the id before /clear or /resume would read as another session's poll
   if (lastNote && lastNote.key !== key) await retire($)
   lastNote = { key, pr: pr.id, at, since: knownSince, pending: pendingPush(), running: true }
-  await writeNote($, lastNote)
+  await writeNote($, lastNote, { strict: true })
   return { ...lastNote }
 }
 
@@ -461,9 +469,10 @@ function catchUp(note) {
   note.pending = pendingPush()
 }
 
-function writeNote($, { key, pr, at, since, pending, running, idle }) {
+function writeNote($, { key, pr, at, since, pending, running, idle }, { strict = false } = {}) {
   const value = { pr, at, since, ...(pending ? { pending } : {}), ...(running ? { running } : {}), ...(idle ? { idle } : {}) }
-  return $.store.set(key, value).catch(() => {})
+  const write = $.store.set(key, value)
+  return strict ? write : write.catch(() => {})
 }
 
 // What the other sessions' notes on the same pull request say: defers, whether one of them started
@@ -725,12 +734,19 @@ async function prune($) {
       const record = await $.store.get(key)
       let limit
       if (key.startsWith(KEY_PREFIX)) limit = record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS)
-      // A poll note matters for one round; one left by a session that did not end cleanly goes later
-      else if (key.startsWith(POLL_PREFIX)) limit = now - HOUR_MS
+      // A poll note matters for one round; one left by a session that did not end cleanly goes later,
+      // unless it holds a push the pull request's record has not counted yet
+      else if (key.startsWith(POLL_PREFIX)) limit = (await counted($, record)) ? now - HOUR_MS : cutoff
       else return
       if (!(record?.at >= limit)) await $.store.delete(key)
     }),
   )
+}
+
+// Whether the pushes a poll note hands on are in its pull request's record already
+async function counted($, note) {
+  const since = normalize(await $.store.get(KEY_PREFIX + note?.pr)).since
+  return !(note?.since > since) && !(note?.pending?.at > since)
 }
 
 function normalize(record) {

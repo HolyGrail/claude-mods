@@ -92,6 +92,8 @@ type World = {
   reads: () => Promise<void>
   // What gh api graphql fails with, when it does
   queryError?: string
+  // What writing a poll note fails with, when it does
+  noteError?: string
   // The argument vectors of the gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -159,6 +161,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   on('store.keys', () => ({ value: [...w.store.keys()] }))
   on('store.get', ($, e) => ({ value: w.store.get(e.key) }))
   on('store.set', ($, e) => {
+    if (w.noteError && e.key.startsWith('poll:')) throw new Error(w.noteError)
     w.store.set(e.key, e.value)
     return { value: undefined }
   })
@@ -1114,4 +1117,56 @@ test('a push another session ran before it saw any head does not count', async (
   await $.session.start(START)
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+})
+
+test('a merge seen by a session that leaves the waking to another is left to that one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { state: 'MERGED' } })
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.toasts).toEqual([])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+
+  // The other session raised the toast and recorded the merge; this one learns it from the record
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'MERGED', at: NOW })
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual([])
+  expect(w.status).toBe('PR #7 マージ済み')
+  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+  await clock.advance(5 * MINUTE)
+  expect(w.queries).toBe(2)
+})
+
+test('a poll whose note cannot be written asks nothing and relays nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] }, noteError: 'disk full' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.queries).toBe(0)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('PR #7 確認失敗 21:00: poll note:')
+
+  w.noteError = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('an old idle note is kept while it holds a push the record has not counted', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { thumbsUpAt: NOW - 5 * MINUTE } })
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - 2 * 60 * MINUTE })
+  // Both sessions' queries kept failing for hours; only the first knew of the push after the approval
+  w.store.set('poll:session-a', { ...pollNote(NOW - 2 * 60 * MINUTE), since: NOW - 2 * MINUTE, idle: true })
+  w.store.set('poll:session-c', { ...pollNote(NOW - 2 * 60 * MINUTE), since: LAST_PUSH, idle: true })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.store.has('poll:session-c')).toBe(false)
+  expect(w.prompts).toEqual([])
+  // Once the record counts the push, the note goes like any other
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.has('poll:session-a')).toBe(false)
 })
