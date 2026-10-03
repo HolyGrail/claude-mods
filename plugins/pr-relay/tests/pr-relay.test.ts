@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { ProcessRunInit } from 'claude-code'
 
 const MINUTE = 60_000
 const NOW = Date.UTC(2026, 9, 1, 12)
@@ -157,6 +158,7 @@ type World = {
   toolLists: number
   desktopCalls: number
   branchLookups: number
+  processRuns: { argv: readonly string[]; init?: ProcessRunInit }[]
   // What gh pr view answers for the branch, null when it has no pull request, or 'error' when gh fails
   branchPr: { url: string; state: string } | null | 'error'
   // What a submitted prompt waits for before its turn starts
@@ -210,6 +212,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     toolLists: 0,
     desktopCalls: 0,
     branchLookups: 0,
+    processRuns: [],
     sessionId: 'session-b',
     queryArgv: [],
     detailsArgv: [],
@@ -222,6 +225,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     await w.ids?.()
     return { value: w.sessionId }
   })
+  on('session.cwd', () => ({ value: '/repo' }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-relay__${e.name}` } }))
   on('tool.list', () => {
     w.toolLists += 1
@@ -253,6 +257,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { result: text, text }
   })
   on('process.run', async ($, e) => {
+    w.processRuns.push({ argv: e.argv, init: e.init })
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
@@ -1363,6 +1368,75 @@ test('a pull request the session creates is watched from then on, without holdin
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
 })
 
+for (const command of [
+  'gh pr new',
+  'gh -R HolyGrail/claude-mods pr create',
+  'gh --repo=HolyGrail/claude-mods pr create',
+  'gh --repo HolyGrail/claude-mods pr create',
+  'gh -R "HolyGrail/claude-mods" pr new',
+  'gh --repo=\'HolyGrail/claude-mods\' pr create',
+  'cd x && gh pr new',
+]) {
+  test(`${command} watches the printed pull request URL`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { branchPr: null })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: URL + '\n', stderr: '', interrupted: false }, text: URL }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    await $.tool.call({ tool: 'Bash', command })
+    await clock.settle()
+    expect(w.queries).toBe(1)
+    expect(w.queryArgv[0]).toContain('number=7')
+    expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+  })
+}
+
+for (const command of [
+  'git pushx',
+  'gh prx create',
+  'git log --grep push',
+]) {
+  test(`${command} does not start watching or look up a pull request`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { branchPr: null })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: URL, stderr: '', interrupted: false }, text: URL }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    w.branchPr = { url: URL, state: 'OPEN' }
+
+    await $.tool.call({ tool: 'Bash', command })
+    await clock.settle()
+    expect(w.branchLookups).toBe(1)
+    expect(w.queries).toBe(0)
+  })
+}
+
+for (const command of [
+  'git -C ../other push',
+  'git -c push.default=current push',
+  'git --no-pager -C "/repo/.wt/x" push',
+  'git --git-dir=/repo/.git push',
+  'git --work-tree=\'/repo/other tree\' push',
+  'git -c "push.default=current" --git-dir="/repo/other tree/.git" --work-tree /repo --no-pager -C ../other push',
+  'cd x && git push',
+]) {
+  test(`${command} excludes a thumbs-up from before the push`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on)
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    w.pull.thumbsUpAt = NOW + 10_000
+    await clock.advance(30_000)
+    await $.tool.call({ tool: 'Bash', command })
+    w.pull.head = 'b2'
+    await clock.advance(30_000)
+    expect(w.prompts).toEqual([])
+  })
+}
+
 test('a push moves the baseline, so a thumbs-up from before it is not an approval', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
@@ -1578,6 +1652,55 @@ test('a pull request found after a push takes that push as its baseline', async 
   await clock.settle()
   expect(w.queries).toBe(1)
   expect(w.prompts).toEqual([])
+})
+
+for (const [command, cwd] of [
+  ['git -C /repo/.wt/other push', '/repo/.wt/other'],
+  ['git -C ../other push', '/other'],
+  ['git -C .wt/other push', '/repo/.wt/other'],
+  ['git --no-pager -C "/repo/.wt/other tree" push', '/repo/.wt/other tree'],
+  ['git -C \'../other tree\' push', '/other tree'],
+  ['git -C /repo -c push.default=current -C .wt -C ../other push', '/repo/other'],
+  ['git -C ../ignored -C /repo/.wt/other push', '/repo/.wt/other'],
+  ['git -C /repo/.wt -C "" -C other push', '/repo/.wt/other'],
+  ['git -c "alias.example=!git -C /wrong push" -C .wt/other push', '/repo/.wt/other'],
+  ['git push', undefined],
+  ['git -c "alias.example=!git -C /wrong push" --git-dir=/repo/.git --work-tree=/repo push', undefined],
+] as const) {
+  test(`${command} looks up the branch in ${cwd ?? 'the session directory'}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { branchPr: null })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    w.branchPr = { url: URL, state: 'OPEN' }
+
+    await $.tool.call({ tool: 'Bash', command })
+    await clock.settle()
+    const lookups = w.processRuns.filter((run) => run.argv[1] === 'pr')
+    expect(lookups).toEqual([
+      { argv: ['gh', 'pr', 'view', '--json', 'url,state'], init: undefined },
+      { argv: ['gh', 'pr', 'view', '--json', 'url,state'], init: cwd === undefined ? undefined : { cwd } },
+    ])
+    expect(w.queries).toBe(1)
+  })
+}
+
+test('a failed lookup after git -C push retries in the same directory', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { branchPr: null })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  w.branchPr = 'error'
+
+  await $.tool.call({ tool: 'Bash', command: 'git -C /repo/.wt/other push' })
+  await clock.settle()
+  w.branchPr = { url: URL, state: 'OPEN' }
+  await clock.advance(MINUTE)
+  const lookups = w.processRuns.filter((run) => run.argv[1] === 'pr')
+  expect(lookups.map((run) => run.init)).toEqual([undefined, { cwd: '/repo/.wt/other' }, { cwd: '/repo/.wt/other' }])
+  expect(w.queries).toBe(1)
 })
 
 test('the same pull request spelled in another case is one pull request', async ($, on) => {

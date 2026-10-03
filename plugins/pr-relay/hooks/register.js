@@ -30,6 +30,14 @@ const ROUND_MS = 30_000
 const RUNNING_MS = 10 * 60_000
 const LATE = 'poll outlasted its turn'
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
+// Option values are one unquoted, single-quoted or double-quoted shell word
+const SHELL_WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';&|<>]+)`
+// Accepts gh pr create or new, optionally preceded by -R repo, --repo repo or --repo=repo
+const GH_PR_CREATE = new RegExp(String.raw`\bgh\s+(?:(?:-R\s+|--repo(?:\s+|=))${SHELL_WORD}\s+)*pr\s+(?:create|new)\b`)
+const GIT_OPTION = String.raw`(?:-C\s+(${SHELL_WORD})|-c\s+${SHELL_WORD}|--(?:git-dir|work-tree)(?:=|\s+)${SHELL_WORD}|--no-pager)`
+// Accepts git push with any combination of -C dir, -c key=value, --git-dir=dir,
+// --work-tree=dir and --no-pager before push, including space-separated directory values
+const GIT_PUSH = new RegExp(String.raw`\bgit\s+((?:${GIT_OPTION}\s+)*)push\b`)
 // What gh pr view says when the branch has no pull request, as opposed to failing to ask
 const NO_PR = /no pull requests found/i
 // The session.end reasons after which this module stops
@@ -206,8 +214,8 @@ export function register(on) {
     const command = e.command ?? ''
     // Best effort: a push made another way is caught by the head commit's date, and session.start
     // looks up the branch's pull request
-    const creates = /\bgh\s+pr\s+create\b/.test(command)
-    const pushing = !creates && /\bgit\s+push\b/.test(command)
+    const creates = GH_PR_CREATE.test(command)
+    const pushing = !creates && GIT_PUSH.exec(command)
     if (!creates && !pushing) return next(e)
     // Bound to the pull request watched as the push starts, before anything else can turn the
     // watch to another
@@ -300,7 +308,10 @@ export function register(on) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
     } else {
-      if (!watched || watched.ended) timers.push($.clock.after(0, () => discover($, { branchOnly: true })))
+      if (!watched || watched.ended) timers.push($.clock.after(0, async () => discover($, {
+        branchOnly: true,
+        cwd: await pushDirectory($, pushing[1]),
+      })))
     }
     return ran
   })
@@ -366,7 +377,7 @@ function reset($) {
 }
 
 // Looks for the pull request to watch, and asks again a tick later when gh could not answer
-async function discover($, { branchOnly = false } = {}) {
+async function discover($, { branchOnly = false, cwd } = {}) {
   if (watched && !watched.ended) return
   const gen = generation
   // Pruning is startup housekeeping, skipped for a lookup after a push; a store that fails it
@@ -377,7 +388,7 @@ async function discover($, { branchOnly = false } = {}) {
   if (gen !== generation) return
   const found = desktop?.primary?.state === 'OPEN'
     ? { url: desktop.primary.url, since: 0 }
-    : await findForBranch($)
+    : await findForBranch($, cwd)
   const at = await $.clock.now()
   if ((watched && !watched.ended) || gen !== generation) return
   if (desktop) {
@@ -387,7 +398,7 @@ async function discover($, { branchOnly = false } = {}) {
     // Shown in place of the watch's line, or of the ended pull request's when a push looks again
     lookupFailure = { at, error: found.error }
     showStatus($)
-    timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly })))
+    timers.push($.clock.after(TICK_MS, () => discover($, { branchOnly, cwd })))
     return
   }
   if (lookupFailure) {
@@ -1383,11 +1394,29 @@ async function reviewDetails($, reviews) {
   return nodes
 }
 
-// The open pull request of the branch checked out here: null when there is none, { error } when gh
+// Git applies -C options in order, with each relative directory based on the preceding one
+async function pushDirectory($, options) {
+  let cwd
+  for (const match of options.matchAll(new RegExp(GIT_OPTION, 'g'))) {
+    if (match[1] === undefined) continue
+    const dir = match[1].replace(/^(["'])(.*)\1$/s, '$2')
+    if (!dir) continue
+    cwd = dir.startsWith('/') ? dir : `${cwd ?? await $.session.cwd()}/${dir}`
+  }
+  if (cwd === undefined) return
+  const parts = []
+  for (const part of cwd.split('/')) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  return '/' + parts.join('/')
+}
+
+// The open pull request of the branch checked out at cwd: null when there is none, { error } when gh
 // could not tell
-async function findForBranch($) {
+async function findForBranch($, cwd) {
   try {
-    const ran = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'])
+    const ran = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'], cwd === undefined ? undefined : { cwd })
     if (ran.exitCode !== 0) {
       if (NO_PR.test(ran.stderr)) return null
       return { error: ran.stderr.trim().split('\n')[0] || `gh exited ${ran.exitCode}` }
