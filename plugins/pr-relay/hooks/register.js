@@ -53,7 +53,7 @@ const PAGE = 'last: 100, before: $before'
 const PAGE_INFO = 'pageInfo { hasPreviousPage startCursor }'
 const CONNECTIONS = {
   reactors: `reactionGroups { content reactors(${PAGE}) { ${PAGE_INFO} edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }`,
-  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId submittedAt author { login } comments { totalCount } } }`,
+  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId fullDatabaseId submittedAt author { login } comments { totalCount } } }`,
   comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { createdAt author { login } body } }`,
 }
 const MAX_PAGES = 10
@@ -64,8 +64,8 @@ const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { c
 // Review bodies stay out of the per-minute query so gh's output does not get cut
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
-    databaseId url submittedAt commit { oid } body
-    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated } }
+    databaseId fullDatabaseId url submittedAt commit { oid } body
+    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated replyTo { id } subjectType } }
   } }
 }`
 // The most characters of a body to include before linking to the full text
@@ -962,7 +962,7 @@ async function readNotes($, pr, note) {
 // limit. A newer approval is marked with the reviews, and mentioned only if it came after them.
 // Review details are fetched at delivery, once the record is written, outside the write queue
 function relay($, pr, signals, record) {
-  const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id)).sort((a, b) => a.at - b.at)
+  const fresh = signals.reviews.filter((r) => !record.reviews.some((id) => String(id) === String(r.id))).sort((a, b) => a.at - b.at)
   if (fresh.length > 0) {
     const previous = record.approvedAt
     const approvedAt = signals.approvedAt > previous ? signals.approvedAt : 0
@@ -975,8 +975,8 @@ function relay($, pr, signals, record) {
         approvedAt: approvedAt > fresh[fresh.length - 1].at ? approvedAt : 0,
         undo: (r) => {
           if (approvedAt && r.approvedAt === approvedAt) r.approvedAt = previous
-          const pending = fresh.map((f) => f.id)
-          r.reviews = r.reviews.filter((id) => !pending.includes(id))
+          const pending = fresh.map((f) => String(f.id))
+          r.reviews = r.reviews.filter((id) => !pending.includes(String(id)))
         },
       },
     ]
@@ -1018,13 +1018,14 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   if (toast) return $.ui.toast(toast)
   const gen = generation
   const id = watched?.id
+  const started = pushStarts.get(id) ?? 0
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
     : Promise.resolve(text)
   ready
-    // A conversation or watch that changed while details were fetched must not receive the prompt
-    .then((text) => gen === generation && id === watched?.id ? submit($, text) : false)
+    // A new conversation, watch or push makes these details stale before they can be delivered
+    .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
 }
@@ -1033,7 +1034,7 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
 function reviewPromptParts(pr, reviews, approvedAt) {
   const count = reviews.reduce((sum, r) => sum + r.comments, 0)
   const endpoint = `repos/${pr.owner}/${pr.name}/pulls/${pr.number}/comments`
-  const selection = reviews.map((r) => `.pull_request_review_id == ${r.id}`).join(' or ')
+  const selection = reviews.map((r) => `(.pull_request_review_id | tostring) == "${r.id}"`).join(' or ')
   const text =
     `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${reviews.length} 件、inline コメント ${count} 件）。\n` +
     '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
@@ -1044,7 +1045,7 @@ function reviewPromptParts(pr, reviews, approvedAt) {
   return {
     text,
     approval,
-    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(${selection}) | {id, path, line, body}' で確認してください。${approval}`,
+    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(.in_reply_to_id == null and (${selection})) | {id, path, line, body}' で確認してください。${approval}`,
   }
 }
 
@@ -1058,18 +1059,22 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
   let remaining = 0
   let remainingBodies = 0
   for (const review of reviews) {
-    const detail = details.find((r) => r?.databaseId === review.id)
+    const detail = details.find((r) => r && (r.fullDatabaseId ?? String(r.databaseId)) === review.id)
     const nodes = Array.isArray(detail?.comments?.nodes) ? detail.comments.nodes : []
     const comments = nodes.filter((c) =>
-      (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
+      !c?.replyTo && (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
     )
-    const total = Math.max(review.comments, detail?.comments?.totalCount ?? 0, comments.length)
+    const replies = nodes.filter((c) => c?.replyTo).length
+    const total = Math.max(review.comments, (detail?.comments?.totalCount ?? 0) - replies, comments.length)
     remaining += total
     for (const comment of comments) {
-      const outdated = comment.line == null || comment.outdated
+      const outdated = comment.outdated || (comment.line == null && comment.subjectType !== 'FILE')
       const line = outdated ? comment.originalLine : comment.line
+      const location = comment.subjectType === 'FILE'
+        ? `${comment.path} (file)`
+        : `${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''}`
       sections.push({
-        text: `### ${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
+        text: `### ${location} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
         comments: 1,
       })
     }
@@ -1161,7 +1166,7 @@ function read(data, since) {
   }
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
-    .map((r) => ({ id: r.databaseId, nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
+    .map((r) => ({ id: r.fullDatabaseId ?? String(r.databaseId), nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
   return { approvedAt, usageLimitAt, reviews }
 }
 
@@ -1305,7 +1310,7 @@ function normalize(record) {
     headAt: record?.headAt ?? 0,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
-    reviews: Array.isArray(record?.reviews) ? record.reviews : [],
+    reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],
     ended: record?.ended ?? null,
     at: record?.at ?? 0,
   }
