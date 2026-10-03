@@ -55,7 +55,7 @@ const PAGE = 'last: 100, before: $before'
 const PAGE_INFO = 'pageInfo { hasPreviousPage startCursor }'
 const CONNECTIONS = {
   reactors: `reactionGroups { content reactors(${PAGE}) { ${PAGE_INFO} edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }`,
-  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId submittedAt author { login } comments { totalCount } } }`,
+  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId fullDatabaseId submittedAt author { login } comments { totalCount } } }`,
   comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { createdAt author { login } body } }`,
 }
 const MAX_PAGES = 10
@@ -66,8 +66,8 @@ const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { c
 // Review bodies stay out of the per-minute query so gh's output does not get cut
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
-    databaseId url submittedAt commit { oid } body
-    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated } }
+    databaseId fullDatabaseId url submittedAt commit { oid } body
+    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated replyTo { id } subjectType } }
   } }
 }`
 // The most characters of a body to include before linking to the full text
@@ -115,6 +115,8 @@ let desktopTimer = null
 let desktopPolling = null
 // Successful desktop reads keep the last primary URL here
 let lastPrimary = null
+// A primary becoming open counts as a change even when its URL stays the same
+let lastPrimaryOpen = false
 // This map keeps the last known bound states in this conversation by parsed URL id
 let boundStates = new Map()
 // The desktop CI monitor relays comments for these pull requests in this conversation
@@ -370,6 +372,7 @@ function reset($) {
   desktopAvailable = null
   desktopPolling = null
   lastPrimary = null
+  lastPrimaryOpen = false
   boundStates = new Map()
   monitored.clear()
   pushes = []
@@ -463,7 +466,7 @@ async function readDesktop($) {
     if (ran.deny !== undefined || ran.isError) return null
     const status = JSON.parse(ran.text)
     if (!status || typeof status !== 'object' || Array.isArray(status)) return null
-    if (status.bound === false) return { primary: null, others: [] }
+    if (status.bound === false) return { bound: false, primary: null, others: [] }
     const pull = (url, state) => {
       if (typeof url !== 'string' || url.match(PR_URL)?.index !== 0) return null
       const pr = parse(url)
@@ -472,13 +475,17 @@ async function readDesktop($) {
     }
     const pr = status.pr
     const primary = pr?.host == null || pr.host.toLowerCase?.() === 'github.com' ? pull(pr?.url, pr?.state) : null
-    const others = (Array.isArray(status.otherBoundPrs) ? status.otherBoundPrs : []).flatMap((other) => {
+    const others = Array.isArray(status.otherBoundPrs) ? status.otherBoundPrs.flatMap((other) => {
       if (typeof other?.repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(other.repo)) return []
       if (!Number.isSafeInteger(other.number) || other.number <= 0) return []
       const parsed = pull(`https://github.com/${other.repo}/pull/${other.number}`, other.state)
       return parsed ? [parsed] : []
-    })
-    return { primary: primary ? { url: primary.url, state: primary.state, autoFix: status.monitor?.auto_fix } : null, others }
+    }) : null
+    return {
+      bound: status.bound,
+      primary: primary ? { url: primary.url, state: primary.state, autoFix: status.monitor?.auto_fix } : null,
+      others,
+    }
   } catch {
     return null
   }
@@ -494,7 +501,7 @@ async function refreshDesktop($) {
     if (!desktop || gen !== generation) return
     const primary = desktop.primary
     const id = primary ? parse(primary.url).id : null
-    const changed = id !== (lastPrimary ? parse(lastPrimary).id : null) && id !== watched?.id
+    const changed = (id !== (lastPrimary ? parse(lastPrimary).id : null) || !lastPrimaryOpen) && id !== watched?.id
     const reopened = id === watched?.id && watched.ended
     if (primary?.state === 'OPEN' && (changed || reopened)) {
       watch($, { url: primary.url, since: 0 })
@@ -506,7 +513,13 @@ async function refreshDesktop($) {
 }
 
 // Bound states include the watched pull request, whose notifications still come from its poll
-function trackBound($, { primary, others }) {
+function trackBound($, { bound, primary, others }) {
+  if (bound === false) {
+    lastPrimary = null
+    lastPrimaryOpen = false
+    boundStates.clear()
+    return
+  }
   if (primary) {
     const { id } = parse(primary.url)
     const previous = monitored.has(id)
@@ -515,17 +528,24 @@ function trackBound($, { primary, others }) {
     if (id === watched?.id && monitored.has(id) !== previous) showStatus($)
   }
   // An incomplete primary must not hide a later open state for the same URL
-  if (!primary || ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) lastPrimary = primary?.url ?? null
-  const entries = [...others, ...(primary ? [primary] : [])]
-  const ids = new Set(entries.map((entry) => parse(entry.url).id))
-  // A pull request no longer listed starts fresh if it is bound again later
-  for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  if (primary && ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) {
+    lastPrimary = primary.url
+    lastPrimaryOpen = primary.state === 'OPEN'
+  }
+  const entries = [...(others ?? []), ...(primary ? [primary] : [])]
+  // Only a supplied list can unbind other pull requests; an omitted primary remains known
+  if (Array.isArray(others)) {
+    const ids = new Set(entries.map((entry) => parse(entry.url).id))
+    if (!primary && lastPrimary) ids.add(parse(lastPrimary).id)
+    for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  }
   for (const entry of entries) {
     const pr = parse(entry.url)
     const { state } = entry
     if (state !== 'OPEN' && state !== 'MERGED' && state !== 'CLOSED') continue
     const previous = boundStates.get(pr.id)
     boundStates.set(pr.id, state)
+    if (state === 'OPEN') removeCleanup($, pr.id)
     if (pr.id === watched?.id || previous !== 'OPEN' || !ENDED[state]) continue
     $.ui.toast(`PR #${pr.number} が${ENDED[state]}されました`)
     if (state === 'MERGED') offerCleanup($, pr)
@@ -540,7 +560,7 @@ function offerCleanup($, { url, number }) {
   $.ui.invalidate('ui.render')
 }
 
-// Watching a pull request again removes only its own offer, including one awaiting a prompt
+// Watching or seeing a pull request open removes its own offer, including one awaiting a prompt
 function removeCleanup($, id) {
   const remaining = cleanupOffers.filter((offer) => parse(offer.url).id !== id)
   if (remaining.length === cleanupOffers.length) return
@@ -1112,7 +1132,7 @@ async function readNotes($, pr, note) {
 // limit. A newer approval is marked with the reviews, and mentioned only if it came after them.
 // Review details are fetched at delivery, once the record is written, outside the write queue
 function relay($, pr, signals, record) {
-  const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id)).sort((a, b) => a.at - b.at)
+  const fresh = signals.reviews.filter((r) => !record.reviews.some((id) => String(id) === String(r.id))).sort((a, b) => a.at - b.at)
   const usesMonitor = monitored.has(pr.id)
   if (usesMonitor) {
     // The monitor owns these comments, so their silent marks survive a failed approval prompt
@@ -1134,8 +1154,8 @@ function relay($, pr, signals, record) {
         approvedAt: approvedAt > fresh[fresh.length - 1].at ? approvedAt : 0,
         undo: (r) => {
           if (approvedAt && r.approvedAt === approvedAt) r.approvedAt = previous
-          const pending = fresh.map((f) => f.id)
-          r.reviews = r.reviews.filter((id) => !pending.includes(id))
+          const pending = fresh.map((f) => String(f.id))
+          r.reviews = r.reviews.filter((id) => !pending.includes(String(id)))
         },
       },
     ]
@@ -1180,13 +1200,14 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   if (toast) return $.ui.toast(toast)
   const gen = generation
   const id = watched?.id
+  const started = pushStarts.get(id) ?? 0
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
     : Promise.resolve(text)
   ready
-    // A conversation or watch that changed while details were fetched must not receive the prompt
-    .then((text) => gen === generation && id === watched?.id ? submit($, text) : false)
+    // A new conversation, watch or push makes these details stale before they can be delivered
+    .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
 }
@@ -1195,7 +1216,7 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
 function reviewPromptParts(pr, reviews, approvedAt) {
   const count = reviews.reduce((sum, r) => sum + r.comments, 0)
   const endpoint = `repos/${pr.owner}/${pr.name}/pulls/${pr.number}/comments`
-  const selection = reviews.map((r) => `.pull_request_review_id == ${r.id}`).join(' or ')
+  const selection = reviews.map((r) => `(.pull_request_review_id | tostring) == "${r.id}"`).join(' or ')
   const text =
     `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${reviews.length} 件、inline コメント ${count} 件）。\n` +
     '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
@@ -1206,7 +1227,7 @@ function reviewPromptParts(pr, reviews, approvedAt) {
   return {
     text,
     approval,
-    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(${selection}) | {id, path, line, body}' で確認してください。${approval}`,
+    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(.in_reply_to_id == null and (${selection})) | {id, path, line, body}' で確認してください。${approval}`,
   }
 }
 
@@ -1220,18 +1241,22 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
   let remaining = 0
   let remainingBodies = 0
   for (const review of reviews) {
-    const detail = details.find((r) => r?.databaseId === review.id)
+    const detail = details.find((r) => r && (r.fullDatabaseId ?? String(r.databaseId)) === review.id)
     const nodes = Array.isArray(detail?.comments?.nodes) ? detail.comments.nodes : []
     const comments = nodes.filter((c) =>
-      (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
+      !c?.replyTo && (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
     )
-    const total = Math.max(review.comments, detail?.comments?.totalCount ?? 0, comments.length)
+    const replies = nodes.filter((c) => c?.replyTo).length
+    const total = Math.max(review.comments, (detail?.comments?.totalCount ?? 0) - replies, comments.length)
     remaining += total
     for (const comment of comments) {
-      const outdated = comment.line == null || comment.outdated
+      const outdated = comment.outdated || (comment.line == null && comment.subjectType !== 'FILE')
       const line = outdated ? comment.originalLine : comment.line
+      const location = comment.subjectType === 'FILE'
+        ? `${comment.path} (file)`
+        : `${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''}`
       sections.push({
-        text: `### ${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
+        text: `### ${location} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
         comments: 1,
       })
     }
@@ -1323,7 +1348,7 @@ function read(data, since) {
   }
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
-    .map((r) => ({ id: r.databaseId, nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
+    .map((r) => ({ id: r.fullDatabaseId ?? String(r.databaseId), nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
   return { approvedAt, usageLimitAt, reviews }
 }
 
@@ -1467,7 +1492,7 @@ function normalize(record) {
     headAt: record?.headAt ?? 0,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
-    reviews: Array.isArray(record?.reviews) ? record.reviews : [],
+    reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],
     ended: record?.ended ?? null,
     at: record?.at ?? 0,
   }
