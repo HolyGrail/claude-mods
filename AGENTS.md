@@ -71,6 +71,15 @@ Mods run on an early-access Claude Code API that is not documented publicly. Thi
 
 Every event and call, with doc comments and examples, is declared in `plugins/<name>/.claude-plugin/types/claude-code/index.d.ts` (about 15,000 lines; the testing kit is the `declare module 'claude-code/testing'` block near the end). Grep it for the name you need (`'tool.call'`, `run: (`, `ProcessRunResult`, `mock`) and read the declaration it lands on rather than the whole file. The folder is not in git: a person regenerates it from an interactive Claude Code session with `/plugin-types plugins/<name>/.claude-plugin/types`. If it is missing for the plugin you work on, copy another plugin's folder rather than guessing at the API.
 
+## Desktop App Integration
+
+Verified in a live desktop session on 2026-10-03:
+
+- The app exposes `mcp__ccd_pr__get_status`, `mcp__ccd_pr__bind_pr`, `mcp__ccd_pr__set_monitor`, `mcp__ccd_pr__unbind_pr` and `mcp__ccd_pr__set_auto_merge` in the model's tool list. Mods can find them through `$.tool.list()` (`ToolInfo[]`, each with `name`) and call them through `$.tool.call()`. Terminal sessions have none of these tools.
+- `$.tool.call({ tool: 'mcp__ccd_pr__get_status' })` takes no arguments and reads the app's cache without a GitHub request. It goes through the tool's permission check; the live call returned immediately without a dialog. It resolves to `{ text, result, isError? }` or `{ deny }`, and rejects for a missing tool or an aborted call.
+- `get_status` puts JSON in `text`: `{ bound, pr, checks, mergeable, mergeStateStatus, mergeQueue, monitor, otherBoundPrs }`. `pr` is the most recently bound PR and has `number`, `url`, `repo` (`owner/name`), `host`, `title`, `state`, `draft`, `base` and `head`. `otherBoundPrs` entries have only `number`, `repo` and `state`; their GitHub URLs are `https://github.com/<repo>/pull/<number>`. States are case-insensitive `open`, `merged` or `closed`. Nothing bound means `bound: false` with no `pr`; tolerate any missing field. pr-relay supports only `github.com`, so ignore primaries on other hosts.
+- When a PR's Auto-fix is on, the app's CI monitor wakes the session through `prompt.submit` with `e.origin.kind === 'sdk'` and text starting with `<ci-monitor-event>`. These prompts carry CI failures, merge conflicts and review comments quoted in full with their `comment_id`s.
+
 ## Coding Style & Naming Conventions
 
 Match existing JavaScript and TypeScript: two-space indentation, single quotes, no semicolons, and trailing commas in multiline structures. Use `camelCase` for functions and variables, `UPPER_SNAKE_CASE` for constants, and kebab-case plugin directories. Keep runtime hooks in JavaScript. No formatter or linter is configured.
