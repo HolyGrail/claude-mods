@@ -544,6 +544,9 @@ function trackBound($, { bound, primary, others }) {
     const ids = new Set(entries.map((entry) => parse(entry.url).id))
     if (!primary && lastPrimary) ids.add(parse(lastPrimary).id)
     for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+    const wasMonitored = monitored.has(watched?.id)
+    for (const id of monitored) if (!ids.has(id)) monitored.delete(id)
+    if (wasMonitored !== monitored.has(watched?.id)) showStatus($)
   }
   for (const entry of entries) {
     const pr = parse(entry.url)

@@ -447,6 +447,55 @@ test('unbinding the desktop clears monitoring for the primary and noticed pull r
   expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
 })
 
+test('a noticed secondary removed from the desktop binding list relays new reviews again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const secondary: Pull = {}
+  const w = stubWorld(on, {
+    desktop: {
+      primary: { number: 7, state: 'open' },
+      monitor: { auto_fix: true },
+      others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }],
+    },
+    pulls: { 9: secondary },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await $.prompt.submit({ text: monitorNotice(9), origin: { kind: 'sdk' }, wait: false })
+  await $.prompt.submit({ text: monitorNotice(10), origin: { kind: 'sdk' }, wait: false })
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  secondary.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認 · CI モニター併用')
+
+  w.desktop = {
+    primary: { number: 7, state: 'open' },
+    monitor: { auto_fix: true },
+    others: [{ number: 10, state: 'open' }],
+  }
+  w.answers = () => clock.sleep(10_000)
+  await clock.advance(MINUTE)
+  // Losing the binding updates the status before the pending GitHub poll finishes
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  await clock.advance(10_000)
+  w.answers = async () => {}
+  secondary.reviews.push({ id: 2, at: NOW + 2 * MINUTE + 20_000, comments: 1 })
+  await clock.advance(MINUTE - 10_000)
+  expect(w.prompts).toEqual([expect.stringContaining(`PR #9 (${PR9}) にレビューを付けました（レビュー 1 件`)])
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.detailsArgv[0]?.slice(5)).toEqual(['-f', 'ids[]=review-2'])
+  expect(w.store.get('pr:' + PR9.toLowerCase())).toMatchObject({ reviews: ['1', '2'] })
+  expect(w.status).toBe('PR #9 監視中 · 21:03 確認')
+
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  expect(w.status).toBe('PR #7 監視中 · 21:03 確認 · CI モニター併用')
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
+  await clock.settle()
+  expect(w.status).toBe('PR #10 監視中 · 21:03 確認 · CI モニター併用')
+})
+
 test('a primary auto-fix flag overrides a monitor notice on the next read', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } } })
