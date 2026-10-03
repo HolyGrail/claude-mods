@@ -67,7 +67,7 @@ const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { c
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
     databaseId url submittedAt commit { oid } body
-    comments(first: 100) { totalCount nodes { databaseId path line originalLine url body outdated } }
+    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated } }
   } }
 }`
 // The most characters of a body to include before linking to the full text
@@ -1134,12 +1134,15 @@ function relay($, pr, signals, record) {
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
 function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   if (toast) return $.ui.toast(toast)
+  const gen = generation
+  const id = watched?.id
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
     : Promise.resolve(text)
   ready
-    .then((text) => submit($, text))
+    // A conversation or watch that changed while details were fetched must not receive the prompt
+    .then((text) => gen === generation && id === watched?.id ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
 }
@@ -1148,6 +1151,7 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
 function reviewPromptParts(pr, reviews, approvedAt) {
   const count = reviews.reduce((sum, r) => sum + r.comments, 0)
   const endpoint = `repos/${pr.owner}/${pr.name}/pulls/${pr.number}/comments`
+  const selection = reviews.map((r) => `.pull_request_review_id == ${r.id}`).join(' or ')
   const text =
     `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${reviews.length} 件、inline コメント ${count} 件）。\n` +
     '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
@@ -1155,7 +1159,11 @@ function reviewPromptParts(pr, reviews, approvedAt) {
   const approval = approvedAt
     ? `\n\nなお、このレビューの後（${clock(approvedAt)}）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。`
     : ''
-  return { text, approval, fallback: `${text}\nコメントは gh api ${endpoint} で確認してください。${approval}` }
+  return {
+    text,
+    approval,
+    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(${selection}) | {id, path, line, body}' で確認してください。${approval}`,
+  }
 }
 
 // The review prompt carries its comments, or instructions to read them if details are unavailable
@@ -1166,11 +1174,12 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
   const details = await reviewDetails($, reviews).catch(() => [])
   const sections = []
   let remaining = 0
+  let remainingBodies = 0
   for (const review of reviews) {
     const detail = details.find((r) => r?.databaseId === review.id)
     const nodes = Array.isArray(detail?.comments?.nodes) ? detail.comments.nodes : []
     const comments = nodes.filter((c) =>
-      c?.databaseId != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
+      (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
     )
     const total = Math.max(review.comments, detail?.comments?.totalCount ?? 0, comments.length)
     remaining += total
@@ -1178,27 +1187,34 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
       const outdated = comment.line == null || comment.outdated
       const line = outdated ? comment.originalLine : comment.line
       sections.push({
-        text: `### ${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''} (comment ${comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
+        text: `### ${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
         comments: 1,
       })
     }
     if (total === 0 && typeof detail?.body === 'string') {
       const body = detail.body.replace(/<details\b[^>]*>[\s\S]*?<\/details\s*>/gi, '').trim()
-      if (body) sections.push({ text: `### レビュー ${review.id}\n${cappedBody(body)}\n${detail.url}`, comments: 0 })
+      if (body) {
+        sections.push({ text: `### レビュー ${review.id}\n${cappedBody(body)}\n${detail.url}`, comments: 0 })
+        remainingBodies++
+      }
     }
   }
   if (sections.length === 0) {
     return fallback
   }
-  const rest = (n) => n > 0 ? `\n\n残り ${n} 件のコメントは ${pr.url}/files で確認してください。` : ''
+  const rest = (comments, bodies) => bodies > 0
+    ? `\n\n残り ${comments + bodies} 件のコメントとレビュー本文は ${pr.url} で確認してください。`
+    : comments > 0 ? `\n\n残り ${comments} 件のコメントは ${pr.url}/files で確認してください。` : ''
   for (const section of sections) {
     const addition = `\n\n${section.text}`
+    const bodies = remainingBodies - (section.comments === 0 ? 1 : 0)
     // Leave room for the omitted count and approval so the whole prompt stays within the cap
-    if (text.length + addition.length + rest(remaining - section.comments).length + approval.length > PROMPT_LIMIT) break
+    if (text.length + addition.length + rest(remaining - section.comments, bodies).length + approval.length > PROMPT_LIMIT) break
     text += addition
     remaining -= section.comments
+    remainingBodies = bodies
   }
-  return text + rest(remaining) + approval
+  return text + rest(remaining, remainingBodies) + approval
 }
 
 // A trimmed body with a link notice when its text exceeds the per-body cap
