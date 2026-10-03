@@ -353,6 +353,92 @@ test('an incomplete desktop primary does not become or replace the known baselin
   expect(w.status).toBe('PR #10 監視中 · 21:05 確認')
 })
 
+// A partial snapshot must not erase an open state before the app reports its merge
+for (const field of ['omitted', 'not an array'] as const) {
+  test(`other bound merges survive a snapshot whose otherBoundPrs is ${field}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+    await $.session.start(START)
+    await clock.settle()
+    w.desktopResponse = JSON.stringify({
+      bound: true,
+      pr: { url: URL, state: 'open' },
+      otherBoundPrs: field === 'omitted' ? undefined : {},
+    })
+    await clock.advance(MINUTE)
+    w.desktopResponse = undefined
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+    await clock.advance(MINUTE)
+
+    expect(w.toasts).toEqual(['PR #9 がマージされました'])
+    const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+    expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+    expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  })
+}
+
+// A primary first seen ended takes over from the branch watch only once it becomes open
+for (const state of ['merged', 'closed'] as const) {
+  test(`a desktop primary first seen ${state} takes over when it opens`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 9, state } } })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+    expect(w.branchLookups).toBe(1)
+    w.desktop = { primary: { number: 9, state: 'open' } }
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+    expect(w.queryArgv[w.queryArgv.length - 1]).toEqual(expect.arrayContaining(['number=9']))
+
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+    await clock.settle()
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  })
+}
+
+test('an omitted primary preserves an explicit watch and the primary state history', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
+  await clock.settle()
+  w.desktopResponse = JSON.stringify({ bound: true })
+  await clock.advance(MINUTE)
+  w.desktopResponse = undefined
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #10 監視中 · 21:02 確認')
+
+  // A complete list of other PRs does not imply that the omitted primary was unbound
+  w.desktopResponse = JSON.stringify({ bound: true, otherBoundPrs: [{ number: 9, repo: 'HolyGrail/claude-mods', state: 'open' }] })
+  await clock.advance(MINUTE)
+  w.desktopResponse = undefined
+  w.desktop = { primary: { number: 7, state: 'closed' }, others: [{ number: 9, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #9 がマージされました', 'PR #7 がクローズされました'])
+  expect(w.status).toBe('PR #10 監視中 · 21:04 確認')
+})
+
+test('an unwatched bound PR reopening removes only its cleanup row', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'merged' }] }
+  await clock.advance(MINUTE)
+
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
+  expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  expect(w.prompts).toEqual([])
+})
+
 test('a newly bound desktop primary takes over on the next tick', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'OPEN' } } })
@@ -458,7 +544,7 @@ for (const all of [true, false]) {
     const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
     await $.session.start(START)
     await clock.settle()
-    w.desktop = all ? {} : { primary: { number: 7, state: 'open' } }
+    w.desktop = all ? {} : { primary: { number: 7, state: 'open' }, others: [] }
     await clock.advance(MINUTE)
     await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
     await clock.settle()
@@ -512,6 +598,9 @@ test('a primary outside the explicit watch is followed for close and merge only'
   expect(await ui.findAll({ type: 'Button', text: 'cleanup' })).toHaveLength(0)
   w.desktop = { primary: { number: 7, state: 'open' } }
   await clock.advance(MINUTE)
+  // Reopening takes over the watch, so switch away again to follow the merge as another PR
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
   w.desktop = { primary: { number: 7, state: 'merged' } }
   await clock.advance(MINUTE)
   expect(w.toasts).toEqual(['PR #7 がクローズされました', 'PR #7 がマージされました'])

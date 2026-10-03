@@ -115,6 +115,8 @@ let desktopTimer = null
 let desktopPolling = null
 // Successful desktop reads keep the last primary URL here
 let lastPrimary = null
+// A primary becoming open counts as a change even when its URL stays the same
+let lastPrimaryOpen = false
 // This map keeps the last known bound states in this conversation by parsed URL id
 let boundStates = new Map()
 // The git push calls this session ran for the watched pull request that have not counted yet, each
@@ -356,6 +358,7 @@ function reset($) {
   desktopAvailable = null
   desktopPolling = null
   lastPrimary = null
+  lastPrimaryOpen = false
   boundStates = new Map()
   pushes = []
   $.ui.invalidate('ui.render')
@@ -448,7 +451,7 @@ async function readDesktop($) {
     if (ran.deny !== undefined || ran.isError) return null
     const status = JSON.parse(ran.text)
     if (!status || typeof status !== 'object' || Array.isArray(status)) return null
-    if (status.bound === false) return { primary: null, others: [] }
+    if (status.bound === false) return { bound: false, primary: null, others: [] }
     const pull = (url, state) => {
       if (typeof url !== 'string' || url.match(PR_URL)?.index !== 0) return null
       const pr = parse(url)
@@ -457,13 +460,13 @@ async function readDesktop($) {
     }
     const pr = status.pr
     const primary = pr?.host == null || pr.host.toLowerCase?.() === 'github.com' ? pull(pr?.url, pr?.state) : null
-    const others = (Array.isArray(status.otherBoundPrs) ? status.otherBoundPrs : []).flatMap((other) => {
+    const others = Array.isArray(status.otherBoundPrs) ? status.otherBoundPrs.flatMap((other) => {
       if (typeof other?.repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(other.repo)) return []
       if (!Number.isSafeInteger(other.number) || other.number <= 0) return []
       const parsed = pull(`https://github.com/${other.repo}/pull/${other.number}`, other.state)
       return parsed ? [parsed] : []
-    })
-    return { primary: primary ? { url: primary.url, state: primary.state } : null, others }
+    }) : null
+    return { bound: status.bound, primary: primary ? { url: primary.url, state: primary.state } : null, others }
   } catch {
     return null
   }
@@ -479,7 +482,7 @@ async function refreshDesktop($) {
     if (!desktop || gen !== generation) return
     const primary = desktop.primary
     const id = primary ? parse(primary.url).id : null
-    const changed = id !== (lastPrimary ? parse(lastPrimary).id : null) && id !== watched?.id
+    const changed = (id !== (lastPrimary ? parse(lastPrimary).id : null) || !lastPrimaryOpen) && id !== watched?.id
     const reopened = id === watched?.id && watched.ended
     if (primary?.state === 'OPEN' && (changed || reopened)) {
       watch($, { url: primary.url, since: 0 })
@@ -491,19 +494,32 @@ async function refreshDesktop($) {
 }
 
 // Bound states include the watched pull request, whose notifications still come from its poll
-function trackBound($, { primary, others }) {
+function trackBound($, { bound, primary, others }) {
+  if (bound === false) {
+    lastPrimary = null
+    lastPrimaryOpen = false
+    boundStates.clear()
+    return
+  }
   // An incomplete primary must not hide a later open state for the same URL
-  if (!primary || ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) lastPrimary = primary?.url ?? null
-  const entries = [...others, ...(primary ? [primary] : [])]
-  const ids = new Set(entries.map((entry) => parse(entry.url).id))
-  // A pull request no longer listed starts fresh if it is bound again later
-  for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  if (primary && ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) {
+    lastPrimary = primary.url
+    lastPrimaryOpen = primary.state === 'OPEN'
+  }
+  const entries = [...(others ?? []), ...(primary ? [primary] : [])]
+  // Only a supplied list can unbind other pull requests; an omitted primary remains known
+  if (Array.isArray(others)) {
+    const ids = new Set(entries.map((entry) => parse(entry.url).id))
+    if (!primary && lastPrimary) ids.add(parse(lastPrimary).id)
+    for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  }
   for (const entry of entries) {
     const pr = parse(entry.url)
     const { state } = entry
     if (state !== 'OPEN' && state !== 'MERGED' && state !== 'CLOSED') continue
     const previous = boundStates.get(pr.id)
     boundStates.set(pr.id, state)
+    if (state === 'OPEN') removeCleanup($, pr.id)
     if (pr.id === watched?.id || previous !== 'OPEN' || !ENDED[state]) continue
     $.ui.toast(`PR #${pr.number} が${ENDED[state]}されました`)
     if (state === 'MERGED') offerCleanup($, pr)
@@ -518,7 +534,7 @@ function offerCleanup($, { url, number }) {
   $.ui.invalidate('ui.render')
 }
 
-// Watching a pull request again removes only its own offer, including one awaiting a prompt
+// Watching or seeing a pull request open removes its own offer, including one awaiting a prompt
 function removeCleanup($, id) {
   const remaining = cleanupOffers.filter((offer) => parse(offer.url).id !== id)
   if (remaining.length === cleanupOffers.length) return
