@@ -354,6 +354,8 @@ export function register(on) {
       return elements.Box({
         flexDirection: 'row',
         columnGap: 2,
+        // On the desktop each offer is a card of its own, apart from the meters below it
+        ...(e.surface === 'desktop' && { borderStyle: 'round', paddingX: 1 }),
         children: [
           elements.Text({ children: [`PR #${number} がマージされました`] }),
           elements.Button({
@@ -381,7 +383,11 @@ export function register(on) {
     })
     // Keep what the mods after this one draw in the band
     const rest = await next(e)
-    return elements.Box({ flexDirection: 'column', children: [...lines, ...(rest ? [rest] : [])] })
+    return elements.Box({
+      flexDirection: 'column',
+      ...(e.surface === 'desktop' && { rowGap: 1 }),
+      children: [...lines, ...(rest ? [rest] : [])],
+    })
   })
 }
 
