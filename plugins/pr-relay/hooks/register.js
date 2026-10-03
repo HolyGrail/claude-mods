@@ -117,6 +117,8 @@ let desktopPolling = null
 let lastPrimary = null
 // This map keeps the last known bound states in this conversation by parsed URL id
 let boundStates = new Map()
+// The desktop CI monitor relays comments for these pull requests in this conversation
+const monitored = new Set()
 // The git push calls this session ran for the watched pull request that have not counted yet, each
 // { id, pr, at, head, shas, refs, running }: its own id, the pull request it was bound to (null when
 // none was watched), when it started, the head the pull request had as far as the session knew
@@ -198,6 +200,18 @@ export function register(on) {
       watch($, { url: e.pr_url, since: Number.isNaN(since) ? 0 : since })
     }
     return { result: describe() }
+  })
+
+  on('prompt.submit', ($, e, next) => {
+    try {
+      if (e.origin?.kind === 'sdk' && e.text.startsWith('<ci-monitor-event>')) {
+        // Only the notice's first line names its pull request; later lines may quote GitHub text
+        const firstLine = e.text.slice('<ci-monitor-event>'.length).trimStart().split(/\r?\n/, 1)[0]
+        const match = firstLine.match(/\bwatching ([\w.-]+\/[\w.-]+) PR #(\d+)\b/)
+        if (match) monitored.add(parse(`https://github.com/${match[1]}/pull/${match[2]}`).id)
+      }
+    } catch {}
+    return next(e)
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -357,6 +371,7 @@ function reset($) {
   desktopPolling = null
   lastPrimary = null
   boundStates = new Map()
+  monitored.clear()
   pushes = []
   $.ui.invalidate('ui.render')
   showStatus($)
@@ -463,7 +478,7 @@ async function readDesktop($) {
       const parsed = pull(`https://github.com/${other.repo}/pull/${other.number}`, other.state)
       return parsed ? [parsed] : []
     })
-    return { primary: primary ? { url: primary.url, state: primary.state } : null, others }
+    return { primary: primary ? { url: primary.url, state: primary.state, autoFix: status.monitor?.auto_fix } : null, others }
   } catch {
     return null
   }
@@ -492,6 +507,13 @@ async function refreshDesktop($) {
 
 // Bound states include the watched pull request, whose notifications still come from its poll
 function trackBound($, { primary, others }) {
+  if (primary) {
+    const { id } = parse(primary.url)
+    const previous = monitored.has(id)
+    if (primary.autoFix === true) monitored.add(id)
+    else if (primary.autoFix === false) monitored.delete(id)
+    if (id === watched?.id && monitored.has(id) !== previous) showStatus($)
+  }
   // An incomplete primary must not hide a later open state for the same URL
   if (!primary || ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) lastPrimary = primary?.url ?? null
   const entries = [...others, ...(primary ? [primary] : [])]
@@ -1091,7 +1113,16 @@ async function readNotes($, pr, note) {
 // Review details are fetched at delivery, once the record is written, outside the write queue
 function relay($, pr, signals, record) {
   const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id)).sort((a, b) => a.at - b.at)
-  if (fresh.length > 0) {
+  const usesMonitor = monitored.has(pr.id)
+  if (usesMonitor) {
+    // The monitor owns these comments, so their silent marks survive a failed approval prompt
+    record.reviews.push(...fresh.map((r) => r.id))
+    record.usageLimitAt = Math.max(record.usageLimitAt, signals.usageLimitAt)
+    if (fresh.length && signals.approvedAt <= fresh[fresh.length - 1].at) {
+      record.approvedAt = Math.max(record.approvedAt, signals.approvedAt)
+    }
+  }
+  if (fresh.length > 0 && !usesMonitor) {
     const previous = record.approvedAt
     const approvedAt = signals.approvedAt > previous ? signals.approvedAt : 0
     record.reviews.push(...fresh.map((r) => r.id))
@@ -1117,7 +1148,10 @@ function relay($, pr, signals, record) {
       {
         text:
           `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}）。` +
-          'CI の結果を確かめ、問題がなければ作業の完了を報告してください。',
+          'CI の結果を確かめ、問題がなければ作業の完了を報告してください。' +
+          (usesMonitor && fresh.length
+            ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
+            : ''),
         undo: (r) => {
           if (r.approvedAt === approvedAt) r.approvedAt = previous
         },
@@ -1455,7 +1489,7 @@ function showStatus($) {
   const label = `PR #${watched.number}`
   if (watched.ended) return $.ui.status(`${label} ${ENDED[watched.ended]}済み`)
   if (lastCheck?.error) return $.ui.status(`${label} 確認失敗 ${clock(lastCheck.at)}: ${lastCheck.error}`)
-  $.ui.status(`${label} 監視中 · ${clock(lastCheck?.at ?? 0)} 確認`)
+  $.ui.status(`${label} 監視中 · ${clock(lastCheck?.at ?? 0)} 確認${monitored.has(watched.id) ? ' · CI モニター併用' : ''}`)
 }
 
 function describe() {

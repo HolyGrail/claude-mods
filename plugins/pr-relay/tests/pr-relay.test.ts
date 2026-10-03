@@ -140,7 +140,11 @@ function reviewDetails(pulls: Pull[], ids: string[]) {
 type World = {
   pull: Pull
   // The app's cached primary and other bound pull requests, with no desktop tool by default
-  desktop?: { primary?: { number: number; state?: string }; others?: { number: number; state?: string }[] } | 'error' | 'deny'
+  desktop?: {
+    primary?: { number: number; state?: string }
+    monitor?: { auto_fix?: boolean }
+    others?: { number: number; state?: string }[]
+  } | 'error' | 'deny'
   desktopAvailable?: boolean
   desktopResponse?: string
   desktopThrows?: boolean
@@ -236,6 +240,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
         repo: 'HolyGrail/claude-mods',
         host: 'github.com',
       } : undefined,
+      monitor: typeof desktop === 'object' ? desktop.monitor : undefined,
       otherBoundPrs: typeof desktop === 'object' ? desktop.others?.map((pr) => ({ ...pr, repo: 'HolyGrail/claude-mods' })) : undefined,
     })
     await w.desktopAnswers?.()
@@ -290,6 +295,8 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { value: undefined }
   })
   on('prompt.submit', async ($, e) => {
+    // Host notices pass through without counting as prompts sent by pr-relay
+    if (e.origin.kind !== 'plugin') return { text: e.text, origin: e.origin }
     w.prompts.push(e.text)
     await w.turnStarts()
     return w.dropPrompt ? { drop: 'the queue is closed' } : { text: e.text }
@@ -306,6 +313,263 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
   return w
 }
+
+// The monitor identifies its pull request before quoting any GitHub comments
+function monitorNotice(number = 7) {
+  return `<ci-monitor-event>\n"Auto-fix pull requests" is watching HolyGrail/claude-mods PR #${number} and detected the following.\n\n` +
+    'Review comment: quoted GitHub text\n</ci-monitor-event>'
+}
+
+// An approval that follows fresh monitored reviews points to the monitor's findings
+const MONITORED_APPROVAL_NOTE = 'なお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
+
+test('an auto-fix primary marks reviews without fetching details or prompting and shows the monitor', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1] })
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認 · CI モニター併用')
+})
+
+test('turning off auto-fix relays the next review without resending silently marked reviews', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+
+  w.pull.reviews?.push({ id: 2, at: NOW + MINUTE, comments: 1 })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件、inline コメント 1 件')])
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.detailsArgv[0]?.slice(5)).toEqual(['-f', 'ids[]=review-2'])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1, 2] })
+})
+
+// Only the SDK's leading notice may identify the watched pull request
+for (const notice of [
+  { name: 'SDK notice', text: monitorNotice(), kind: 'sdk', monitored: true },
+  { name: 'SDK notice on the tag line', text: monitorNotice().replace('>\n', '>'), kind: 'sdk', monitored: true },
+  { name: 'case-insensitive repository', text: monitorNotice().replace('HolyGrail/claude-mods', 'holygrail/CLAUDE-MODS'), kind: 'sdk', monitored: true },
+  { name: 'composer notice', text: monitorNotice(), kind: 'composer', monitored: false },
+  { name: 'another pull request', text: monitorNotice(9), kind: 'sdk', monitored: false },
+  { name: 'repository named only in a quoted comment', text: '<ci-monitor-event>\n"Auto-fix pull requests" was just enabled for this session.\n\n> watching HolyGrail/claude-mods PR #7\n</ci-monitor-event>', kind: 'sdk', monitored: false },
+  { name: 'enable notice without a pull request', text: '<ci-monitor-event>\n"Auto-fix pull requests" was just enabled for this session.\n</ci-monitor-event>', kind: 'sdk', monitored: false },
+  { name: 'tag below the first line', text: 'Quoted event:\n' + monitorNotice(), kind: 'sdk', monitored: false },
+] as const) {
+  test(`a ${notice.name} passes through unchanged and ${notice.monitored ? 'suppresses' : 'keeps'} review delivery`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    const origin = { kind: notice.kind }
+    expect(await $.prompt.submit({ text: notice.text, origin, wait: false })).toEqual({ text: notice.text, origin })
+    expect(w.prompts).toEqual([])
+
+    w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(notice.monitored ? 0 : 1)
+    expect(w.detailsArgv.length).toBe(notice.monitored ? 0 : 1)
+    expect(w.status?.endsWith(' · CI モニター併用')).toBe(notice.monitored)
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1] })
+  })
+}
+
+test('a primary auto-fix flag overrides a monitor notice on the next read', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await $.prompt.submit({ text: monitorNotice(), origin: { kind: 'sdk' }, wait: false })
+  await clock.advance(MINUTE)
+  w.pull.reviews = [{ id: 1, at: NOW + MINUTE, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+})
+
+test('a noticed non-primary stays monitored across watch changes and absent desktop entries', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await $.prompt.submit({ text: monitorNotice(9), origin: { kind: 'sdk' }, wait: false })
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  w.desktop = {}
+  await clock.advance(MINUTE)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  w.pull.reviews = [{ id: 2, at: NOW + 2 * MINUTE, comments: 1 }]
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  expect(w.prompts.length).toBe(1)
+  expect(w.store.get('pr:' + PR9.toLowerCase())).toMatchObject({ reviews: [1, 2] })
+  expect(w.status).toBe('PR #9 監視中 · 21:02 確認 · CI モニター併用')
+})
+
+// Every conversation reset forgets notices even when the same pull request is found again
+for (const source of ['start', 'resume', 'clear', 'fork'] as const) {
+  test(`${source} forgets which pull requests the CI monitor watched`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+    on('classic.SessionStart', () => ({}))
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    await $.prompt.submit({ text: monitorNotice(), origin: { kind: 'sdk' }, wait: false })
+    w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+    await clock.advance(MINUTE)
+    expect(w.prompts).toEqual([])
+
+    if (source === 'start') await $.session.start({ ...START, surface: 'desktop' })
+    else await $.classic.SessionStart({ source })
+    await clock.settle()
+    w.pull.reviews?.push({ id: 2, at: NOW + MINUTE, comments: 1 })
+    await clock.advance(MINUTE)
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+    expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  })
+}
+
+test('a monitored review followed by a thumbs-up sends only an approval with the monitor note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([
+    `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。\n` + MONITORED_APPROVAL_NOTE,
+  ])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1], approvedAt: NOW - MINUTE })
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a monitored thumbs-up alone sends the usual approval prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { thumbsUpAt: NOW - MINUTE },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([
+    `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+  ])
+})
+
+// The newest fresh review supersedes approvals both before it and at its own timestamp
+for (const offset of [0, MINUTE]) {
+  test(`a monitored thumbs-up ${offset ? 'before' : 'at'} the newest review is marked silently`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const approvedAt = NOW - MINUTE - offset
+    const w = stubWorld(on, {
+      desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+      pull: { thumbsUpAt: approvedAt, reviews: [
+        { id: 2, at: NOW - MINUTE, comments: 1 },
+        { id: 1, at: NOW - 3 * MINUTE, comments: 1 },
+      ] },
+    })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    await clock.advance(MINUTE)
+    expect(w.prompts).toEqual([])
+    expect(w.detailsArgv).toEqual([])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1, 2], approvedAt })
+  })
+}
+
+test('a monitored usage limit is marked without a toast even after auto-fix is disabled', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }] },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ usageLimitAt: NOW - MINUTE })
+  expect(w.toasts).toEqual([])
+  w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
+  await clock.advance(2 * MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts).toEqual([])
+})
+
+// A failed approval delivery rolls back only the mark owned by that prompt
+for (const failure of ['dropped', 'rejected']) {
+  test(`a ${failure} monitored approval retries while keeping silent review and usage-limit marks`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    let refuses = true
+    const w = stubWorld(on, {
+      desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+      pull: {
+        thumbsUpAt: NOW - MINUTE,
+        reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }],
+        comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }],
+      },
+      dropPrompt: failure === 'dropped',
+      turnStarts: async () => {
+        if (refuses && failure === 'rejected') throw new Error('the queue is closed')
+      },
+    })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    expect(w.prompts.length).toBe(1)
+    expect(w.prompts[0]?.endsWith(MONITORED_APPROVAL_NOTE)).toBe(true)
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1], approvedAt: 0, usageLimitAt: NOW - MINUTE })
+    refuses = false
+    w.dropPrompt = false
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(2)
+    expect(w.prompts[1]).toContain('approved にしました')
+    expect(w.prompts[1]).not.toContain(MONITORED_APPROVAL_NOTE)
+    expect(w.detailsArgv).toEqual([])
+    expect(w.toasts).toEqual([])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1], approvedAt: NOW - MINUTE, usageLimitAt: NOW - MINUTE })
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(2)
+  })
+}
+
+test('an unmonitored desktop primary still relays review details and usage-limit toasts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } },
+    pull: {
+      thumbsUpAt: NOW - MINUTE,
+      reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }],
+      comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }],
+    },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件、inline コメント 1 件')])
+  expect(w.prompts[0]).toContain('### src/file-1.ts:1 (comment 1001)')
+  expect(w.prompts[0]).toContain('なお、このレビューの後（20:59）')
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.toasts).toEqual(['PR #7: Codex の利用上限に達し、レビューが付きません'])
+})
 
 test('watches the desktop primary at startup without asking gh for the branch', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
