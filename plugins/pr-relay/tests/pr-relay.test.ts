@@ -319,6 +319,32 @@ test('watches the desktop primary at startup without asking gh for the branch', 
   expect(w.status).toBe('PR #9 監視中 · 21:00 確認')
 })
 
+test('an incomplete desktop primary does not become or replace the known baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9 } } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.branchLookups).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+
+  w.desktop = { primary: { number: 9, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  w.desktop = { primary: { number: 10, state: 'unknown' } }
+  await clock.advance(MINUTE)
+  w.desktop = { primary: { number: 9, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #7 監視中 · 21:03 確認')
+
+  w.desktop = { primary: { number: 10, state: 'unknown' } }
+  await clock.advance(MINUTE)
+  w.desktop = { primary: { number: 10, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #10 監視中 · 21:05 確認')
+})
+
 test('a newly bound desktop primary takes over on the next tick', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'OPEN' } } })
@@ -381,7 +407,10 @@ test('other bound merges have independent cleanup rows while the watched pull re
   expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
   await ui.press({ key: `cleanup-${PR9.toLowerCase()}` })
   expect(w.prompts).toEqual([
-    `PR ${PR9} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`,
+    `PR ${PR9} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+    `gh pr view ${PR9} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
   ])
   expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
@@ -389,6 +418,77 @@ test('other bound merges have independent cleanup rows while the watched pull re
   expect(w.queries).toBe(3)
   expect(w.toasts).toHaveLength(2)
 })
+
+test('cleanup identifies a bound pull request by its URL and checks its repository and worktree', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const foreign = 'https://github.com/Other/project/pull/9'
+  const status = (state: string) => JSON.stringify({
+    pr: { url: URL, state: 'open' },
+    otherBoundPrs: [{ number: 9, repo: 'Other/project', state }],
+  })
+  const w = stubWorld(on, { desktopAvailable: true, desktopResponse: status('open') })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktopResponse = status('merged')
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: `cleanup-${foreign.toLowerCase()}` })
+
+  expect(w.prompts).toHaveLength(1)
+  expect(w.prompts[0]).toContain(`PR ${foreign} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。`)
+  expect(w.prompts[0]).toContain(`gh pr view ${foreign} --json headRefName,headRepository`)
+  expect(w.prompts[0]).toContain('git worktree list でそのブランチを checkout している worktree を探してください。')
+  expect(w.prompts[0]).toContain('見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。')
+  expect(w.prompts[0]).toContain('未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。')
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+})
+
+// Removing all bindings and removing just one PR both make a later binding a first sighting
+for (const all of [true, false]) {
+  test(`a merged PR rebound after ${all ? 'all bindings were cleared' : 'it left the bound list'} raises no stale notification`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+    await $.session.start(START)
+    await clock.settle()
+    w.desktop = all ? {} : { primary: { number: 7, state: 'open' } }
+    await clock.advance(MINUTE)
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
+    await clock.settle()
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+    await clock.advance(MINUTE)
+
+    expect(w.toasts).toEqual([])
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.findAll({ type: 'Button', text: 'cleanup' })).toHaveLength(0)
+    // Clearing every binding also clears the primary baseline; removing only the other PR does not.
+    expect(w.status).toBe(`PR #${all ? 7 : 10} 監視中 · 21:02 確認`)
+  })
+}
+
+// An open cache entry resumes an ended watch and removes any cleanup row it left
+for (const state of ['CLOSED', 'MERGED'] as const) {
+  test(`an ended desktop primary resumes polling when ${state.toLowerCase()} becomes open`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+    await $.session.start(START)
+    await clock.settle()
+    w.pull.state = state
+    w.desktop = { primary: { number: 7, state: state.toLowerCase() } }
+    await clock.advance(2 * MINUTE)
+    expect(w.queries).toBe(2)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    if (state === 'MERGED') expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
+
+    w.pull.state = 'OPEN'
+    w.desktop = { primary: { number: 7, state: 'open' } }
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #7 監視中 · 21:03 確認')
+    expect(w.queries).toBe(3)
+    expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
+    await clock.advance(MINUTE)
+    expect(w.queries).toBe(4)
+  })
+}
 
 test('a primary outside the explicit watch is followed for close and merge only', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -433,6 +533,7 @@ test('dismissing one merged pull request leaves the other cleanup rows', async (
   await clock.advance(MINUTE)
   // The watched pull request contributes to the same list when its GraphQL poll sees the merge.
   w.pull.state = 'MERGED'
+  w.desktop = { primary: { number: 7, state: 'merged' }, others: [{ number: 9, state: 'merged' }] }
   await clock.advance(MINUTE)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
@@ -1033,7 +1134,10 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   expect(await ui.find({ type: 'Text', text: 'PR #7 がマージされました' })).toBeDefined()
   await ui.press({ key: `cleanup-${URL.toLowerCase()}` })
   expect(w.prompts).toEqual([
-    `PR ${URL} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`,
+    `PR ${URL} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+    `gh pr view ${URL} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
   ])
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
 })

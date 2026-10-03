@@ -325,7 +325,11 @@ export function register(on) {
             onPress: async () => {
               cleanupPending.add(offer)
               $.ui.invalidate('ui.render')
-              const text = `PR ${url} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`
+              const text =
+                `PR ${url} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+                `gh pr view ${url} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+                '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+                '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。'
               // A prompt that did not enter reveals its row in place, unless a new watch or a
               // conversation reset removed that offer while it waited
               if (await submit($, text)) close()
@@ -374,7 +378,6 @@ async function discover($, { branchOnly = false } = {}) {
   const at = await $.clock.now()
   if ((watched && !watched.ended) || gen !== generation) return
   if (desktop) {
-    lastPrimary = desktop.primary?.url ?? null
     trackBound($, desktop)
   }
   if (found?.error !== undefined) {
@@ -466,7 +469,7 @@ async function readDesktop($) {
   }
 }
 
-// Only a changed open primary takes over a watch explicitly set by the model
+// A changed open primary takes over the watch, and an ended primary resumes when reopened
 async function refreshDesktop($) {
   const gen = generation
   if (desktopPolling === gen) return
@@ -476,10 +479,11 @@ async function refreshDesktop($) {
     if (!desktop || gen !== generation) return
     const primary = desktop.primary
     const id = primary ? parse(primary.url).id : null
-    if (primary?.state === 'OPEN' && id !== (lastPrimary ? parse(lastPrimary).id : null) && id !== watched?.id) {
+    const changed = id !== (lastPrimary ? parse(lastPrimary).id : null) && id !== watched?.id
+    const reopened = id === watched?.id && watched.ended
+    if (primary?.state === 'OPEN' && (changed || reopened)) {
       watch($, { url: primary.url, since: 0 })
     }
-    lastPrimary = primary?.url ?? null
     trackBound($, desktop)
   } finally {
     if (desktopPolling === gen) desktopPolling = null
@@ -488,7 +492,13 @@ async function refreshDesktop($) {
 
 // Bound states include the watched pull request, whose notifications still come from its poll
 function trackBound($, { primary, others }) {
-  for (const entry of [...others, ...(primary ? [primary] : [])]) {
+  // An incomplete primary must not hide a later open state for the same URL
+  if (!primary || ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) lastPrimary = primary?.url ?? null
+  const entries = [...others, ...(primary ? [primary] : [])]
+  const ids = new Set(entries.map((entry) => parse(entry.url).id))
+  // A pull request no longer listed starts fresh if it is bound again later
+  for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  for (const entry of entries) {
     const pr = parse(entry.url)
     const { state } = entry
     if (state !== 'OPEN' && state !== 'MERGED' && state !== 'CLOSED') continue
