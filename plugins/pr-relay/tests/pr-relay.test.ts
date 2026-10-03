@@ -890,6 +890,31 @@ test('an unwatched bound PR reopening removes only its cleanup row', async ($, o
   expect(w.prompts).toEqual([])
 })
 
+// The desktop sets each cleanup row apart from the meters as a card; the terminal keeps one line each
+for (const surface of ['desktop', 'terminal'] as const) {
+  test(`cleanup rows on the ${surface} ${surface === 'desktop' ? 'are' : 'are not'} drawn as cards`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+    await $.session.start(START)
+    await clock.settle()
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+    await clock.advance(MINUTE)
+    const ui = await $.ui.mount({ ...BAND, surface })
+
+    const band = (await ui.drawn()) as { props: Record<string, unknown>; children: { props: Record<string, unknown> }[] }
+    const [row] = band.children
+    expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+    if (surface === 'desktop') {
+      expect(band.props).toMatchObject({ flexDirection: 'column', rowGap: 1 })
+      expect(row?.props).toMatchObject({ flexDirection: 'row', borderStyle: 'round', paddingX: 1 })
+    } else {
+      expect(band.props.rowGap).toBeUndefined()
+      expect(row?.props.borderStyle).toBeUndefined()
+      expect(row?.props.paddingX).toBeUndefined()
+    }
+  })
+}
+
 test('a newly bound desktop primary takes over on the next tick', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'OPEN' } } })
