@@ -146,6 +146,8 @@ test('draws context, both limits and the other mods on each surface', async ($, 
     expect(await ui.find({ type: 'Text', text: '62% 2h13m (23:13)' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^5% 4d18h$/ })).toMatchObject({ props: { color: 'success' } })
     expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+    // No row between the meters and the other mods: a mod that wants one draws it itself
+    expect((await ui.find({ type: 'Box' }))?.props.rowGap).toBeUndefined()
     await ui.unmount()
   }
 })
