@@ -204,16 +204,19 @@ export function register(on) {
     return { result: describe() }
   })
 
-  on('prompt.submit', ($, e, next) => {
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin?.kind !== 'sdk' || typeof e.text !== 'string' || !e.text.startsWith('<ci-monitor-event>')) return next(e)
+    let result
     try {
-      if (e.origin?.kind === 'sdk' && e.text.startsWith('<ci-monitor-event>')) {
+      result = await next(e)
+      if (result?.drop === undefined) {
         // Only the notice's first line names its pull request; later lines may quote GitHub text
         const firstLine = e.text.slice('<ci-monitor-event>'.length).trimStart().split(/\r?\n/, 1)[0]
         const match = firstLine.match(/\bwatching ([\w.-]+\/[\w.-]+) PR #(\d+)\b/)
         if (match) monitored.add(parse(`https://github.com/${match[1]}/pull/${match[2]}`).id)
       }
     } catch {}
-    return next(e)
+    return result
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -518,6 +521,9 @@ function trackBound($, { bound, primary, others }) {
     lastPrimary = null
     lastPrimaryOpen = false
     boundStates.clear()
+    const wasMonitored = monitored.has(watched?.id)
+    monitored.clear()
+    if (wasMonitored) showStatus($)
     return
   }
   if (primary) {
@@ -1134,13 +1140,14 @@ async function readNotes($, pr, note) {
 function relay($, pr, signals, record) {
   const fresh = signals.reviews.filter((r) => !record.reviews.some((id) => String(id) === String(r.id))).sort((a, b) => a.at - b.at)
   const usesMonitor = monitored.has(pr.id)
+  const approvedAt = usesMonitor ? signals.reactedAt : signals.approvedAt
+  const previous = record.approvedAt
   if (usesMonitor) {
     // The monitor owns these comments, so their silent marks survive a failed approval prompt
     record.reviews.push(...fresh.map((r) => r.id))
     record.usageLimitAt = Math.max(record.usageLimitAt, signals.usageLimitAt)
-    if (fresh.length && signals.approvedAt <= fresh[fresh.length - 1].at) {
-      record.approvedAt = Math.max(record.approvedAt, signals.approvedAt)
-    }
+    record.approvedAt = Math.max(record.approvedAt, signals.approvedAt)
+    if (fresh.length && approvedAt <= fresh[fresh.length - 1].at) return []
   }
   if (fresh.length > 0 && !usesMonitor) {
     const previous = record.approvedAt
@@ -1160,10 +1167,9 @@ function relay($, pr, signals, record) {
       },
     ]
   }
-  if (signals.approvedAt > record.approvedAt) {
-    const approvedAt = signals.approvedAt
-    const previous = record.approvedAt
-    record.approvedAt = approvedAt
+  if (approvedAt > previous) {
+    record.approvedAt = Math.max(record.approvedAt, approvedAt)
+    const markedAt = record.approvedAt
     return [
       {
         text:
@@ -1173,7 +1179,7 @@ function relay($, pr, signals, record) {
             ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
             : ''),
         undo: (r) => {
-          if (r.approvedAt === approvedAt) r.approvedAt = previous
+          if (r.approvedAt === markedAt) r.approvedAt = previous
         },
       },
     ]
@@ -1332,13 +1338,14 @@ function read(data, since) {
     return at > since ? at : 0
   }
   const byCodex = (node) => node?.login === CODEX
-  let approvedAt = 0
+  let reactedAt = 0
   for (const group of data.reactionGroups ?? []) {
     if (group.content !== 'THUMBS_UP') continue
     for (const edge of group.reactors?.edges ?? []) {
-      if (byCodex(edge.node)) approvedAt = Math.max(approvedAt, after(edge.reactedAt))
+      if (byCodex(edge.node)) reactedAt = Math.max(reactedAt, after(edge.reactedAt))
     }
   }
+  let approvedAt = reactedAt
   let usageLimitAt = 0
   for (const comment of data.comments?.nodes ?? []) {
     if (!byCodex(comment.author)) continue
@@ -1349,7 +1356,7 @@ function read(data, since) {
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
     .map((r) => ({ id: r.fullDatabaseId ?? String(r.databaseId), nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
-  return { approvedAt, usageLimitAt, reviews }
+  return { approvedAt, reactedAt, usageLimitAt, reviews }
 }
 
 // The pull request, with every connection followed back until it reaches the last push: the

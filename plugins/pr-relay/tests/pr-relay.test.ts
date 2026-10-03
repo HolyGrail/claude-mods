@@ -166,6 +166,7 @@ type World = {
   // What a submitted prompt waits for before its turn starts
   turnStarts: () => Promise<void>
   dropPrompt?: boolean
+  noticeError?: string
   // What gh api graphql waits for before it answers
   answers: () => Promise<void>
   // What gh api graphql fails with, when it does
@@ -304,7 +305,10 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   })
   on('prompt.submit', async ($, e) => {
     // Host notices pass through without counting as prompts sent by pr-relay
-    if (e.origin.kind !== 'plugin') return { text: e.text, origin: e.origin }
+    if (e.origin.kind !== 'plugin') {
+      if (w.noticeError) throw new Error(w.noticeError)
+      return w.dropPrompt ? { drop: 'the queue is closed' } : { text: e.text, origin: e.origin }
+    }
     w.prompts.push(e.text)
     await w.turnStarts()
     return w.dropPrompt ? { drop: 'the queue is closed' } : { text: e.text }
@@ -395,6 +399,54 @@ for (const notice of [
   })
 }
 
+for (const failure of ['dropped', 'rejected']) {
+  test(`a ${failure} CI-monitor notice leaves review delivery enabled`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      desktop: { primary: { number: 7, state: 'open' } },
+      dropPrompt: failure === 'dropped',
+      noticeError: failure === 'rejected' ? 'the queue is closed' : undefined,
+    })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    const submission = $.prompt.submit({ text: monitorNotice(), origin: { kind: 'sdk' }, wait: false })
+    if (failure === 'dropped') expect(await submission).toEqual({ drop: 'the queue is closed' })
+    // A throwing bottom stub leaves the test engine without an implementation
+    else await expect(submission).rejects.toThrow('no implementation for prompt.submit')
+    w.dropPrompt = false
+    w.noticeError = undefined
+    w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+    await clock.advance(MINUTE)
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+    expect(w.detailsArgv.length).toBe(1)
+    expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  })
+}
+
+test('unbinding the desktop clears monitoring for the primary and noticed pull requests', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await $.prompt.submit({ text: monitorNotice(9), origin: { kind: 'sdk' }, wait: false })
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認 · CI モニター併用')
+
+  w.desktop = {}
+  w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
+  w.answers = () => clock.sleep(10_000)
+  await clock.advance(MINUTE)
+  // The desktop read clears the status suffix even while the GitHub poll is still pending
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+  await clock.advance(10_000)
+  expect(w.prompts).toEqual([expect.stringContaining('PR #7')])
+  w.answers = async () => {}
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('PR #7'), expect.stringContaining('PR #9')])
+  expect(w.detailsArgv.length).toBe(2)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+})
+
 test('a primary auto-fix flag overrides a monitor notice on the next read', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } } })
@@ -419,7 +471,7 @@ test('a noticed non-primary stays monitored across watch changes and absent desk
   w.pull.reviews = [{ id: 1, at: NOW + 10_000, comments: 1 }]
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
-  w.desktop = {}
+  w.desktopResponse = '{}'
   await clock.advance(MINUTE)
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
   await clock.settle()
@@ -469,6 +521,87 @@ test('a monitored review followed by a thumbs-up sends only an approval with the
   expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
+})
+
+for (const autoFix of [false, true]) {
+  test(`an approval comment ${autoFix ? 'is left to the monitor and stays marked after auto-fix is disabled' : 'still prompts without auto-fix'}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: autoFix } },
+      pull: { comments: [{ at: NOW - MINUTE, body: 'Didn\'t find any major issues' }] },
+    })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    expect(w.prompts).toEqual(autoFix ? [] : [
+      `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+    ])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - MINUTE })
+    w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
+    await clock.advance(2 * MINUTE)
+    expect(w.prompts.length).toBe(autoFix ? 0 : 1)
+  })
+}
+
+for (const commentAt of [NOW - 2 * MINUTE, NOW]) {
+  test(`a monitored thumbs-up keeps its own timestamp beside an approval comment ${commentAt === NOW ? 'after' : 'before'} it`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+      pull: { thumbsUpAt: NOW - MINUTE, comments: [{ at: commentAt, body: 'Didn\'t find any major issues' }] },
+    })
+    await $.session.start({ ...START, surface: 'desktop' })
+    await clock.settle()
+    expect(w.prompts).toEqual([
+      `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+    ])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: Math.max(NOW - MINUTE, commentAt) })
+    w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
+    await clock.advance(2 * MINUTE)
+    expect(w.prompts.length).toBe(1)
+  })
+}
+
+test('a monitored review supersedes an earlier thumbs-up even when an approval comment comes later', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: {
+      thumbsUpAt: NOW - 3 * MINUTE,
+      reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }],
+      comments: [{ at: NOW - MINUTE, body: 'Didn\'t find any major issues' }],
+    },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+})
+
+test('a dropped monitored thumbs-up retries when the same poll marks a later approval comment', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { thumbsUpAt: NOW - 2 * MINUTE, comments: [{ at: NOW - MINUTE, body: 'Didn\'t find any major issues' }] },
+    dropPrompt: true,
+  })
+  const record = 'pr:' + URL.toLowerCase()
+  const previous = NOW - 3 * MINUTE
+  w.store.set(record, { since: LAST_PUSH, approvedAt: previous, at: NOW - MINUTE })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました（20:58）')])
+  expect(w.store.get(record)).toMatchObject({ approvedAt: previous })
+  w.dropPrompt = false
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(2)
+  expect(w.prompts[1]).toBe(w.prompts[0])
+  expect(w.store.get(record)).toMatchObject({ approvedAt: NOW - MINUTE })
+  w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(2)
 })
 
 test('a monitored thumbs-up alone sends the usual approval prompt', async ($, on) => {
