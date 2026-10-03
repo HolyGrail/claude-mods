@@ -38,7 +38,8 @@ type Review = {
   body?: string
   url?: string
   details?: {
-    id: number
+    id: number | null
+    fullDatabaseId?: string | null
     path: string
     line: number | null
     originalLine?: number | null
@@ -122,11 +123,12 @@ function reviewDetails(pulls: Pull[], ids: string[]) {
         totalCount: review.comments,
         nodes: comments.map((c) => ({
           databaseId: c.id,
+          fullDatabaseId: c.fullDatabaseId,
           path: c.path,
           line: c.line,
           originalLine: c.originalLine ?? c.line,
           body: c.body,
-          url: c.url ?? `${URL}#discussion_r${c.id}`,
+          url: c.url ?? `${URL}#discussion_r${c.fullDatabaseId ?? c.id}`,
           outdated: c.outdated ?? false,
         })),
       },
@@ -376,6 +378,26 @@ test('outdated inline comments use the original line for both GitHub signals', a
   expect(w.prompts[0]).toContain('### src/b.ts:10 (outdated) (comment 12)')
 })
 
+test('inline comment ids use fullDatabaseId without losing large ids or changing review marks', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 3, details: [
+      { id: null, fullDatabaseId: '4170981226', path: 'large.ts', line: 1, body: 'Beyond 32 bits' },
+      { id: 17, fullDatabaseId: '9007199254740993', path: 'precise.ts', line: 2, body: 'Keep every digit' },
+      { id: 19, fullDatabaseId: null, path: 'legacy.ts', line: 3, body: 'Legacy id' },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.detailsArgv[0]?.join(' ')).toContain('databaseId fullDatabaseId path')
+  expect(w.prompts[0]).toContain(`### large.ts:1 (comment 4170981226)\nBeyond 32 bits\n${URL}#discussion_r4170981226`)
+  expect(w.prompts[0]).toContain('### precise.ts:2 (comment 9007199254740993)\nKeep every digit')
+  expect(w.prompts[0]).toContain('### legacy.ts:3 (comment 19)\nLegacy id')
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1] })
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
 test('inline bodies are trimmed and cut at 4000 characters before the truncation notice', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, {
@@ -416,6 +438,27 @@ test('a review with more than 100 comments links to the comments beyond the deta
   expect(w.detailsArgv.length).toBe(1)
 })
 
+for (const withComments of [false, true]) {
+  test(`the prompt cap reports omitted review bodies${withComments ? ' together with unfetched comments' : ''}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const reviews: Review[] = Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1, at: NOW - (11 - i) * MINUTE, comments: 0, body: 'x'.repeat(4_000),
+    }))
+    if (withComments) reviews.unshift({
+      id: 100, at: NOW - 12 * MINUTE, comments: 5,
+      details: [{ id: 1001, path: 'file.ts', line: 1, body: 'x'.repeat(4_000) }],
+    })
+    const w = stubWorld(on, { pull: { reviews } })
+    await $.session.start(START)
+    await clock.settle()
+    const lastBody = withComments ? 6 : 7
+    expect(w.prompts[0]?.length).toBeLessThanOrEqual(30_000)
+    expect(w.prompts[0]).toContain(`### レビュー ${lastBody}\n`)
+    expect(w.prompts[0]).not.toContain(`### レビュー ${lastBody + 1}\n`)
+    expect(w.prompts[0]?.endsWith(`残り ${withComments ? 8 : 3} 件のコメントとレビュー本文は ${URL} で確認してください。`)).toBe(true)
+  })
+}
+
 test('a review without inline comments includes its capped body without details blocks', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, {
@@ -452,7 +495,7 @@ for (const failure of [
       `Codex が PR #7 (${URL}) にレビューを付けました（レビュー 1 件、inline コメント 3 件）。\n` +
       '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
       '返信は gh api repos/HolyGrail/claude-mods/pulls/7/comments/<comment id>/replies -f body=\'...\' で送れます。\n' +
-      'コメントは gh api repos/HolyGrail/claude-mods/pulls/7/comments で確認してください。',
+      'コメントは gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.pull_request_review_id == 1) | {id, path, line, body}\' で確認してください。',
     ])
     expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [1] })
     await clock.advance(2 * MINUTE)
@@ -460,6 +503,29 @@ for (const failure of [
     expect(w.detailsArgv.length).toBe(1)
   })
 }
+
+test('the fallback paginates comments and filters to every review reported by the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [
+      { id: 11, at: NOW - 3 * MINUTE, comments: 1 },
+      { id: 12, at: NOW - 2 * MINUTE, comments: 2 },
+      { id: 13, at: LAST_PUSH - MINUTE, comments: 1 },
+      { id: 14, at: NOW - MINUTE, comments: 1, by: 'someone' },
+      { id: 15, at: NOW - MINUTE, comments: 1 },
+    ] },
+    detailsError: 'error connecting to api.github.com',
+  })
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', reviews: [15], at: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('レビュー 2 件、inline コメント 3 件')
+  expect(w.prompts[0]?.split('\n').pop()).toBe(
+    'コメントは gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.pull_request_review_id == 11 or .pull_request_review_id == 12) | {id, path, line, body}\' で確認してください。',
+  )
+  await clock.advance(2 * MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
 
 test('review details wait for the record write and do not hold up later polls', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -482,6 +548,39 @@ test('review details wait for the record write and do not hold up later polls', 
   expect(w.prompts.length).toBe(1)
   expect(w.detailsArgv.length).toBe(1)
 })
+
+for (const source of ['resume', 'clear', 'fork'] as const) {
+  test(`a ${source} during review details takes back the old prompt and lets the next watch resend it`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+      pulls: { 9: {} },
+      detailsAnswer: () => clock.sleep(20_000),
+    })
+    on('classic.SessionStart', () => ({}))
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.detailsArgv.length).toBe(1)
+    const record = 'pr:' + URL.toLowerCase()
+    expect(w.store.get(record)).toMatchObject({ reviews: [1], approvedAt: NOW - MINUTE })
+
+    // A resume of the same pull request also changes the conversation that owns this delivery
+    w.branchPr = { url: source === 'resume' ? URL : PR9, state: 'OPEN' }
+    w.sessionId = 'session-c'
+    await $.classic.SessionStart({ source })
+    await clock.advance(20_000)
+    expect(w.prompts).toEqual([])
+    expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: 0 })
+
+    w.detailsAnswer = undefined
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
+    await clock.settle()
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+    expect(w.store.get(record)).toMatchObject({ reviews: [1], approvedAt: NOW - MINUTE })
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(1)
+  })
+}
 
 test('unrelayed reviews precede a later thumbs-up and carry its approval in one prompt', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
