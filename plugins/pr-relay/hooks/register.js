@@ -33,11 +33,11 @@ const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // Option values are one unquoted, single-quoted or double-quoted shell word
 const SHELL_WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';&|<>]+)`
 // Accepts gh pr create or new, optionally preceded by -R repo, -Rrepo, --repo repo or --repo=repo
-const GH_PR_CREATE = new RegExp(String.raw`\bgh\s+(?:(?:-R\s*|--repo(?:\s+|=))${SHELL_WORD}\s+)*pr\s+(?:create|new)\b`)
+const GH_PR_CREATE = new RegExp(String.raw`\bgh\s+(?:(?:-R\s*|--repo(?:\s+|=))${SHELL_WORD}\s+)*pr\s+(?:create|new)(?=$|[\s;&|)])`)
 const GIT_OPTION = String.raw`(?:-C\s+(${SHELL_WORD})|--work-tree(?:=|\s+)(${SHELL_WORD})|-c\s+${SHELL_WORD}|--git-dir(?:=|\s+)${SHELL_WORD}|--no-pager)`
 // Accepts git push with any combination of -C dir, -c key=value, --git-dir=dir,
 // --work-tree=dir and --no-pager before push, including space-separated directory values
-const GIT_PUSH = new RegExp(String.raw`\bgit\s+((?:${GIT_OPTION}\s+)*)push\b`)
+const GIT_PUSH = new RegExp(String.raw`\bgit\s+((?:${GIT_OPTION}\s+)*)push(?=$|[\s;&|)])`, 'g')
 // What gh pr view says when the branch has no pull request, as opposed to failing to ask
 const NO_PR = /no pull requests found/i
 // The session.end reasons after which this module stops
@@ -232,7 +232,8 @@ export function register(on) {
     // Best effort: a push made another way is caught by the head commit's date, and session.start
     // looks up the branch's pull request
     const creates = GH_PR_CREATE.test(command)
-    const pushing = !creates && GIT_PUSH.exec(command)
+    const pushMatches = creates ? [] : [...command.matchAll(GIT_PUSH)]
+    const pushing = pushMatches.length > 0
     if (!creates && !pushing) return next(e)
     // Bound to the pull request watched as the push starts, before anything else can turn the
     // watch to another
@@ -326,8 +327,15 @@ export function register(on) {
       if (url) watch($, { url, since: startedAt })
     } else {
       if (!watched || watched.ended) timers.push($.clock.after(0, async () => {
-        const cwd = await pushDirectory($, pushing[1])
-        if (cwd !== null) await discover($, { branchOnly: true, cwd })
+        const directories = await Promise.all(pushMatches.map((match) => pushDirectory($, match[1])))
+        if (directories.includes(null)) return
+        const cwd = directories[0]
+        // A Bash call may push several repositories, so only an unambiguous directory is looked up
+        if (directories.length > 1) {
+          const sessionCwd = directories.includes(undefined) ? await $.session.cwd() : undefined
+          if (directories.some((dir) => (dir ?? sessionCwd) !== (cwd ?? sessionCwd))) return
+        }
+        await discover($, { branchOnly: true, cwd })
       }))
     }
     return ran
@@ -1450,9 +1458,11 @@ async function pushDirectory($, options) {
   for (const match of options.matchAll(new RegExp(GIT_OPTION, 'g'))) {
     const word = match[1] ?? match[2]
     if (word === undefined) continue
-    let dir = word.replace(/^(["'])(.*)\1$/s, '$2')
-    if (/[$`]|^~[^/]/.test(dir)) return null
-    if (dir.startsWith('~')) {
+    const quoted = /^["']/.test(word)
+    let dir = quoted ? word.slice(1, -1) : word
+    if (/[$`]/.test(dir)) return null
+    if (!quoted && dir.startsWith('~')) {
+      if (/^~[^/]/.test(dir)) return null
       const home = await $.env.get('HOME')
       if (!home) return null
       dir = home + dir.slice(1)

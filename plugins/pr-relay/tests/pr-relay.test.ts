@@ -1823,6 +1823,10 @@ for (const command of [
   'gh -R "HolyGrail/claude-mods" pr new',
   'gh --repo=\'HolyGrail/claude-mods\' pr create',
   'cd x && gh pr new',
+  'gh pr create; echo done',
+  'gh pr new& wait',
+  'gh pr create|cat',
+  '(gh pr new)',
 ]) {
   test(`${command} watches the printed pull request URL`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
@@ -1841,6 +1845,9 @@ for (const command of [
 
 for (const command of [
   'git pushx',
+  'git -C other push-deploy',
+  'gh pr create-extra',
+  'gh pr new-extra',
   'gh prx create',
   'gh --repoHolyGrail/claude-mods pr create',
   'git log --grep push',
@@ -2121,12 +2128,26 @@ for (const [command, cwd] of [
   ['git -C /repo/.wt --work-tree=/other push', '/other'],
   ['git --work-tree=/first --work-tree=/other push', '/other'],
   ['git -C ~/other push', '/home/tester/other'],
+  ['git -C "~/other" push', '/repo/~/other'],
+  ['git -C \'~/other\' push', '/repo/~/other'],
+  ['git -C "~" push', '/repo/~'],
+  ['git -C "~someone/other" push', '/repo/~someone/other'],
   ['git -C ~ push', '/home/tester'],
   ['git -C /repo/.wt --work-tree=~/other push', '/home/tester/other'],
+  ['git -C /repo/.wt --work-tree="~/other" push', '/repo/.wt/~/other'],
   ['git -C ~ -C projects --work-tree ../other push', '/home/tester/projects/../other'],
   ['git push', undefined],
   ['git --git-dir=/other/.git push', undefined],
   ['git -c "alias.example=!git -C /wrong push" --git-dir=/repo/.git --work-tree=/repo push', '/repo'],
+  ['git -C other push; echo done', '/repo/other'],
+  ['git -C other push&& echo done', '/repo/other'],
+  ['git -C other push|cat', '/repo/other'],
+  ['(git -C other push)', '/repo/other'],
+  ['git -C actual push || git -C actual push', '/repo/actual'],
+  ['git -C actual push; git --work-tree=/repo/actual push', '/repo/actual'],
+  ['git push && git push', undefined],
+  ['git push || git -C /repo push', undefined],
+  ['git -C /repo push || git push', '/repo'],
 ] as const) {
   test(`${command} looks up the branch in ${cwd ?? 'the session directory'}`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
@@ -2158,8 +2179,14 @@ for (const command of [
   'git --work-tree ~someone/other push',
   'git -C "$WORKTREE" --work-tree=/other push',
   'git -C ~/other push',
+  'git -C missing push || git -C actual push',
+  'git push || git -C actual push',
+  'git -C actual push || git push',
+  'git -C actual push || git -C actual push || git -C other push',
+  'git -C actual push || git -C "$WORKTREE" push',
+  'git -C "$WORKTREE" push || git -C actual push',
 ]) {
-  test(`${command} skips an unresolved directory lookup but still tracks the push`, async ($, on) => {
+  test(`${command} skips an unresolved or ambiguous directory lookup but still tracks the push`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     const w = stubWorld(on, { branchPr: null })
     mock.env(on, {})
