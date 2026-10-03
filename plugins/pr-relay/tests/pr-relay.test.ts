@@ -147,6 +147,16 @@ function reviewDetails(pulls: Pull[], ids: string[]) {
 
 type World = {
   pull: Pull
+  // The app's cached primary and other bound pull requests, with no desktop tool by default
+  desktop?: { primary?: { number: number; state?: string }; others?: { number: number; state?: string }[] } | 'error' | 'deny'
+  desktopAvailable?: boolean
+  desktopResponse?: string
+  desktopThrows?: boolean
+  desktopAnswers?: () => Promise<void>
+  toolListError?: boolean
+  toolLists: number
+  desktopCalls: number
+  branchLookups: number
   // What gh pr view answers for the branch, null when it has no pull request, or 'error' when gh fails
   branchPr: { url: string; state: string } | null | 'error'
   // What a submitted prompt waits for before its turn starts
@@ -197,6 +207,9 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     toasts: [],
     status: undefined,
     queries: 0,
+    toolLists: 0,
+    desktopCalls: 0,
+    branchLookups: 0,
     sessionId: 'session-b',
     queryArgv: [],
     detailsArgv: [],
@@ -210,11 +223,41 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { value: w.sessionId }
   })
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-relay__${e.name}` } }))
+  on('tool.list', () => {
+    w.toolLists += 1
+    if (w.toolListError) throw new Error('tool list unavailable')
+    return { value: [
+      { name: 'Bash', description: 'Runs commands', mcp: false },
+      ...(w.desktopAvailable ?? w.desktop !== undefined
+        ? [{ name: 'mcp__ccd_pr__get_status', description: 'Reads bound pull requests', mcp: true }]
+        : []),
+    ] }
+  })
+  on('tool.call', { tool: 'mcp__ccd_pr__get_status' }, async () => {
+    w.desktopCalls += 1
+    const desktop = w.desktop
+    const text = w.desktopResponse ?? JSON.stringify({
+      bound: typeof desktop === 'object' && Boolean(desktop.primary || desktop.others?.length),
+      pr: typeof desktop === 'object' && desktop.primary ? {
+        ...desktop.primary,
+        url: `https://github.com/HolyGrail/claude-mods/pull/${desktop.primary.number}`,
+        repo: 'HolyGrail/claude-mods',
+        host: 'github.com',
+      } : undefined,
+      otherBoundPrs: typeof desktop === 'object' ? desktop.others?.map((pr) => ({ ...pr, repo: 'HolyGrail/claude-mods' })) : undefined,
+    })
+    await w.desktopAnswers?.()
+    if (w.desktopThrows) throw new Error('tool unavailable or aborted')
+    if (desktop === 'deny') return { deny: 'permission denied' }
+    if (desktop === 'error') return { result: 'desktop unavailable', text: 'desktop unavailable', isError: true }
+    return { result: text, text }
+  })
   on('process.run', async ($, e) => {
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
     if (e.argv[1] === 'pr') {
+      w.branchLookups += 1
       if (w.branchPr === 'error') return run(1, '', 'error connecting to api.github.com')
       return w.branchPr ? run(0, JSON.stringify(w.branchPr)) : run(1, '', 'no pull requests found for branch "feature"')
     }
@@ -271,6 +314,546 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
   return w
 }
+
+test('watches the desktop primary at startup without asking gh for the branch', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9, state: 'open' } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+
+  expect(w.branchLookups).toBe(0)
+  expect(w.desktopCalls).toBe(1)
+  expect(w.queryArgv[0]).toEqual(expect.arrayContaining(['-F', 'number=9']))
+  expect(w.status).toBe('PR #9 監視中 · 21:00 確認')
+})
+
+test('an incomplete desktop primary does not become or replace the known baseline', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9 } } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.branchLookups).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+
+  w.desktop = { primary: { number: 9, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  w.desktop = { primary: { number: 10, state: 'unknown' } }
+  await clock.advance(MINUTE)
+  w.desktop = { primary: { number: 9, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #7 監視中 · 21:03 確認')
+
+  w.desktop = { primary: { number: 10, state: 'unknown' } }
+  await clock.advance(MINUTE)
+  w.desktop = { primary: { number: 10, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #10 監視中 · 21:05 確認')
+})
+
+// A partial snapshot must not erase an open state before the app reports its merge
+for (const field of ['omitted', 'not an array'] as const) {
+  test(`other bound merges survive a snapshot whose otherBoundPrs is ${field}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+    await $.session.start(START)
+    await clock.settle()
+    w.desktopResponse = JSON.stringify({
+      bound: true,
+      pr: { url: URL, state: 'open' },
+      otherBoundPrs: field === 'omitted' ? undefined : {},
+    })
+    await clock.advance(MINUTE)
+    w.desktopResponse = undefined
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+    await clock.advance(MINUTE)
+
+    expect(w.toasts).toEqual(['PR #9 がマージされました'])
+    const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+    expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+    expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  })
+}
+
+// A primary first seen ended takes over from the branch watch only once it becomes open
+for (const state of ['merged', 'closed'] as const) {
+  test(`a desktop primary first seen ${state} takes over when it opens`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 9, state } } })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+    expect(w.branchLookups).toBe(1)
+    w.desktop = { primary: { number: 9, state: 'open' } }
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+    expect(w.queryArgv[w.queryArgv.length - 1]).toEqual(expect.arrayContaining(['number=9']))
+
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+    await clock.settle()
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  })
+}
+
+test('an omitted primary preserves an explicit watch and the primary state history', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
+  await clock.settle()
+  w.desktopResponse = JSON.stringify({ bound: true })
+  await clock.advance(MINUTE)
+  w.desktopResponse = undefined
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #10 監視中 · 21:02 確認')
+
+  // A complete list of other PRs does not imply that the omitted primary was unbound
+  w.desktopResponse = JSON.stringify({ bound: true, otherBoundPrs: [{ number: 9, repo: 'HolyGrail/claude-mods', state: 'open' }] })
+  await clock.advance(MINUTE)
+  w.desktopResponse = undefined
+  w.desktop = { primary: { number: 7, state: 'closed' }, others: [{ number: 9, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #9 がマージされました', 'PR #7 がクローズされました'])
+  expect(w.status).toBe('PR #10 監視中 · 21:04 確認')
+})
+
+test('an unwatched bound PR reopening removes only its cleanup row', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'merged' }] }
+  await clock.advance(MINUTE)
+
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
+  expect(w.status).toBe('PR #7 監視中 · 21:02 確認')
+  expect(w.prompts).toEqual([])
+})
+
+test('a newly bound desktop primary takes over on the next tick', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'OPEN' } } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 9, state: 'Open' }, others: [{ number: 7, state: 'open' }] }
+  await clock.advance(MINUTE)
+
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  expect(w.queryArgv[w.queryArgv.length - 1]).toEqual(expect.arrayContaining(['number=9']))
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+  expect(w.branchLookups).toBe(0)
+  await clock.advance(MINUTE)
+  expect(w.desktopCalls).toBe(3)
+  expect(w.toolLists).toBe(1)
+})
+
+test('an unchanged desktop primary leaves an explicit watch alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  // Repository casing does not make the primary a different pull request.
+  w.desktopResponse = JSON.stringify({ pr: { url: URL.toLowerCase(), state: 'OPEN' } })
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+  expect(w.queryArgv[w.queryArgv.length - 1]).toEqual(expect.arrayContaining(['number=9']))
+})
+
+test('an unchanged desktop primary leaves a newly created pull request watched', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: PR9, stderr: '', interrupted: false }, text: PR9 }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create' })
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+})
+
+test('other bound merges have independent cleanup rows while the watched pull request keeps polling', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'MERGED' }] }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #9 がマージされました', 'PR #10 がマージされました'])
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  expect(w.queries).toBe(2)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+  await ui.press({ key: `cleanup-${PR9.toLowerCase()}` })
+  expect(w.prompts).toEqual([
+    `PR ${PR9} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+    `gh pr view ${PR9} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
+  ])
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(3)
+  expect(w.toasts).toHaveLength(2)
+})
+
+test('cleanup identifies a bound pull request by its URL and checks its repository and worktree', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const foreign = 'https://github.com/Other/project/pull/9'
+  const status = (state: string) => JSON.stringify({
+    pr: { url: URL, state: 'open' },
+    otherBoundPrs: [{ number: 9, repo: 'Other/project', state }],
+  })
+  const w = stubWorld(on, { desktopAvailable: true, desktopResponse: status('open') })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktopResponse = status('merged')
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: `cleanup-${foreign.toLowerCase()}` })
+
+  expect(w.prompts).toHaveLength(1)
+  expect(w.prompts[0]).toContain(`PR ${foreign} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。`)
+  expect(w.prompts[0]).toContain(`gh pr view ${foreign} --json headRefName,headRepository`)
+  expect(w.prompts[0]).toContain('git worktree list でそのブランチを checkout している worktree を探してください。')
+  expect(w.prompts[0]).toContain('見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。')
+  expect(w.prompts[0]).toContain('未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。')
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+})
+
+// Removing all bindings and removing just one PR both make a later binding a first sighting
+for (const all of [true, false]) {
+  test(`a merged PR rebound after ${all ? 'all bindings were cleared' : 'it left the bound list'} raises no stale notification`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+    await $.session.start(START)
+    await clock.settle()
+    w.desktop = all ? {} : { primary: { number: 7, state: 'open' }, others: [] }
+    await clock.advance(MINUTE)
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL.replace('/7', '/10') })
+    await clock.settle()
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+    await clock.advance(MINUTE)
+
+    expect(w.toasts).toEqual([])
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.findAll({ type: 'Button', text: 'cleanup' })).toHaveLength(0)
+    // Clearing every binding also clears the primary baseline; removing only the other PR does not.
+    expect(w.status).toBe(`PR #${all ? 7 : 10} 監視中 · 21:02 確認`)
+  })
+}
+
+// An open cache entry resumes an ended watch and removes any cleanup row it left
+for (const state of ['CLOSED', 'MERGED'] as const) {
+  test(`an ended desktop primary resumes polling when ${state.toLowerCase()} becomes open`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+    await $.session.start(START)
+    await clock.settle()
+    w.pull.state = state
+    w.desktop = { primary: { number: 7, state: state.toLowerCase() } }
+    await clock.advance(2 * MINUTE)
+    expect(w.queries).toBe(2)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    if (state === 'MERGED') expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
+
+    w.pull.state = 'OPEN'
+    w.desktop = { primary: { number: 7, state: 'open' } }
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #7 監視中 · 21:03 確認')
+    expect(w.queries).toBe(3)
+    expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
+    await clock.advance(MINUTE)
+    expect(w.queries).toBe(4)
+  })
+}
+
+test('a primary outside the explicit watch is followed for close and merge only', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'Closed' } }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #7 がクローズされました'])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.findAll({ type: 'Button', text: 'cleanup' })).toHaveLength(0)
+  w.desktop = { primary: { number: 7, state: 'open' } }
+  await clock.advance(MINUTE)
+  // Reopening takes over the watch, so switch away again to follow the merge as another PR
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'merged' } }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #7 がクローズされました', 'PR #7 がマージされました'])
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
+  expect(w.status).toBe('PR #9 監視中 · 21:03 確認')
+})
+
+test('bound pull requests first seen ended raise no toast or cleanup row', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9, state: 'merged' }, others: [{ number: 10, state: 'closed' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual([])
+  expect(w.branchLookups).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.findAll({ type: 'Button', text: 'cleanup' })).toHaveLength(0)
+})
+
+test('dismissing one merged pull request leaves the other cleanup rows', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  // The watched pull request contributes to the same list when its GraphQL poll sees the merge.
+  w.pull.state = 'MERGED'
+  w.desktop = { primary: { number: 7, state: 'merged' }, others: [{ number: 9, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  await ui.press({ key: `dismiss-${URL.toLowerCase()}` })
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  await clock.advance(MINUTE)
+  expect(w.desktopCalls).toBe(4)
+  expect(w.queries).toBe(3)
+})
+
+test('a rejected cleanup prompt restores its row beside the other offers', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] },
+    dropPrompt: true,
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: `cleanup-${PR9.toLowerCase()}` })
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
+})
+
+test('cleanup shows the three newest offers and keeps keys distinct across repositories', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const status = (state: string) => JSON.stringify({ otherBoundPrs: [
+    { number: 9, repo: 'HolyGrail/one', state },
+    { number: 9, repo: 'HolyGrail/two', state },
+    { number: 9, repo: 'HolyGrail/three', state },
+    { number: 9, repo: 'HolyGrail/four', state },
+  ] })
+  const w = stubWorld(on, { desktopAvailable: true, desktopResponse: status('open') })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktopResponse = status('merged')
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const rows = await ui.findAll({ type: 'Button', text: 'cleanup' })
+  expect(rows.map((row) => row.key)).toEqual(['four', 'three', 'two'].map((repo) => `cleanup-https://github.com/holygrail/${repo}/pull/9`))
+  await ui.press({ key: 'dismiss-https://github.com/holygrail/three/pull/9' })
+  expect(await ui.find({ key: 'cleanup-https://github.com/holygrail/four/pull/9' })).toBeDefined()
+  expect(await ui.find({ key: 'cleanup-https://github.com/holygrail/one/pull/9' })).toBeDefined()
+})
+
+test('a delayed cleanup rejection restores its row behind newer merges', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] },
+    dropPrompt: true,
+    turnStarts: () => clock.sleep(2 * MINUTE),
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'open' }] }
+  await clock.advance(MINUTE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const press = ui.press({ key: `cleanup-${PR9.toLowerCase()}` })
+  await clock.settle()
+  expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'merged' }] }
+  await clock.advance(2 * MINUTE)
+  await press
+  const rows = await ui.findAll({ type: 'Button', text: 'cleanup' })
+  expect(rows.map((row) => row.key)).toEqual([
+    `cleanup-${URL.toLowerCase().replace('/7', '/10')}`,
+    `cleanup-${PR9.toLowerCase()}`,
+  ])
+})
+
+// Each unavailable or malformed response leaves the gh path and the existing watch usable
+for (const failure of ['error', 'deny', 'unparsable', 'reject'] as const) {
+  test(`desktop ${failure} falls back at startup and leaves later watches unchanged`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      desktopAvailable: true,
+      desktop: failure === 'error' || failure === 'deny' ? failure : {},
+      desktopResponse: failure === 'unparsable' ? '{invalid json' : undefined,
+      desktopThrows: failure === 'reject',
+    })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.branchLookups).toBe(1)
+    expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+    await clock.settle()
+    await clock.advance(MINUTE)
+    expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+    expect(w.toasts).toEqual([])
+    expect(w.desktopCalls).toBe(2)
+    expect(w.toolLists).toBe(1)
+  })
+}
+
+test('absent fields and non-GitHub primaries leave branch discovery available', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktopAvailable: true, desktopResponse: '{}' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.branchLookups).toBe(1)
+  w.desktopResponse = JSON.stringify({ pr: { url: PR9, state: 'open', host: 'enterprise.example.com' }, otherBoundPrs: [null, {}, { repo: 'bad/repo/path', number: 9, state: 'open' }] })
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  expect(w.toasts).toEqual([])
+})
+
+test('a failed tool list stays unavailable until the conversation restarts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9, state: 'open' } }, toolListError: true })
+  await $.session.start(START)
+  await clock.settle()
+  w.toolListError = false
+  await clock.advance(MINUTE)
+  expect(w.desktopCalls).toBe(0)
+  expect(w.toolLists).toBe(1)
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.toolLists).toBe(2)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+})
+
+// Conversation switches must forget the previous primary, states, offers and tool availability
+for (const source of ['resume', 'clear', 'fork'] as const) {
+  test(`${source} starts fresh desktop tracking with one timer`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }, { number: 10, state: 'open' }] } })
+    on('classic.SessionStart', () => ({}))
+    await $.session.start(START)
+    await clock.settle()
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }, { number: 10, state: 'open' }] }
+    await clock.advance(MINUTE)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
+    w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 10, state: 'merged' }] }
+    w.sessionId = 'next-session'
+    await $.classic.SessionStart({ source })
+    await clock.settle()
+    expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
+    expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+    await clock.advance(MINUTE)
+    expect(w.toolLists).toBe(2)
+    expect(w.desktopCalls).toBe(4)
+    expect(w.toasts).toEqual(['PR #9 がマージされました'])
+  })
+}
+
+test('a desktop read begun before a newer watch cannot switch it or report other merges', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 10, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 9, state: 'open' }, others: [{ number: 10, state: 'merged' }] }
+  w.desktopAnswers = () => clock.sleep(10_000)
+  await clock.advance(MINUTE)
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  await clock.advance(10_000)
+  expect(w.toasts).toEqual([])
+  expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
+  w.desktopAnswers = undefined
+  await clock.advance(MINUTE - 10_000)
+  expect(w.status).toBe('PR #9 監視中 · 21:02 確認')
+  expect(w.toasts).toEqual(['PR #10 がマージされました'])
+})
+
+test('desktop discovery begun before an explicit watch leaves it alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 9, state: 'open' } }, desktopAnswers: () => clock.sleep(10_000) })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  await clock.advance(10_000)
+  expect(w.branchLookups).toBe(0)
+  expect(w.status).toBe('PR #7 監視中 · 21:00 確認')
+})
+
+test('a final session end cancels the desktop timer and ignores its pending read', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+  w.desktopAnswers = () => clock.sleep(10_000)
+  await clock.advance(MINUTE)
+  await $.session.end({ reason: 'other', sessionId: 'session-b', resume: { id: 'session-b' } })
+  const queries = w.queries
+  await clock.advance(3 * MINUTE)
+  expect(w.desktopCalls).toBe(2)
+  expect(w.queries).toBe(queries)
+  expect(w.toasts).toEqual([])
+})
+
+test('a failed desktop read preserves the primary baseline until it recovers', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' } } })
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+  await clock.settle()
+  w.desktop = 'deny'
+  await clock.advance(MINUTE)
+  w.desktop = { primary: { number: 7, state: 'open' } }
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:02 確認')
+})
+
+test('a terminal session never calls the desktop status tool', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.desktopCalls).toBe(0)
+  expect(w.toolLists).toBe(1)
+  expect(w.queries).toBe(4)
+})
 
 test('watches the branch pull request without reading skill session files', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -747,11 +1330,14 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'PR #7 がマージされました' })).toBeDefined()
-  await ui.press({ key: 'cleanup' })
+  await ui.press({ key: `cleanup-${URL.toLowerCase()}` })
   expect(w.prompts).toEqual([
-    `PR ${URL} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`,
+    `PR ${URL} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+    `gh pr view ${URL} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
   ])
-  expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
 })
 
 test('a pull request the session creates is watched from then on, without holding up the call', async ($, on) => {
@@ -1087,10 +1673,10 @@ test('the cleanup button comes back when its prompt does not enter', async ($, o
   await clock.advance(MINUTE)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'cleanup' })
+  await ui.press({ key: `cleanup-${URL.toLowerCase()}` })
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('未コミットの変更や push していないコミットが残っていないかを確かめ')])
-  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
 })
 
 test('a push still running when a poll sees its head already counts as the baseline', async ($, on) => {
@@ -1245,7 +1831,7 @@ test('what was relayed for an open pull request outlasts two weeks unwatched', a
   expect(w.prompts).toEqual([])
 })
 
-test('watching the next pull request takes the last one\'s cleanup button away', async ($, on) => {
+test('watching another pull request keeps the previous cleanup row until that pull request is watched again', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   await $.session.start(START)
@@ -1254,11 +1840,14 @@ test('watching the next pull request takes the last one\'s cleanup button away',
   await clock.advance(MINUTE)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
   w.pull.state = 'OPEN'
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: 'https://github.com/HolyGrail/claude-mods/pull/9' })
   await clock.settle()
-  expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
+  await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+  await clock.settle()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
 })
 
 // This session's poll note on the pull request
@@ -1577,14 +2166,14 @@ test('a merge seen by a session that leaves the waking to another is left to tha
   await clock.settle()
   expect(w.toasts).toEqual([])
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
 
   // The other session raised the toast and recorded the merge; this one learns it from the record
   w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'MERGED', at: NOW })
   await clock.advance(MINUTE)
   expect(w.toasts).toEqual([])
   expect(w.status).toBe('PR #7 マージ済み')
-  expect(await ui.find({ key: 'cleanup' })).toBeDefined()
+  expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
   await clock.advance(5 * MINUTE)
   expect(w.queries).toBe(2)
 })

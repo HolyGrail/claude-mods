@@ -4,6 +4,8 @@
 // How often to ask GitHub about the pull request. One GraphQL query a tick costs one point of the
 // 5,000 an hour, so even a dozen sessions polling at once stay far below the limit.
 const TICK_MS = 60_000
+// The desktop app exposes its cached pull requests through this tool
+const DESKTOP_STATUS = 'mcp__ccd_pr__get_status'
 // Codex's login as GraphQL spells it (REST adds "[bot]")
 const CODEX = 'chatgpt-codex-connector'
 // What this module has already relayed for a pull request lives under this prefix plus its URL, in
@@ -101,8 +103,22 @@ const retired = new Map()
 const noteWrites = new Map()
 // Tells apart the polls of one session, which may share a key and a time
 let noteSerial = 0
-// Whether the band offers to clean up after the watched pull request's merge
-let offersCleanup = false
+// Cleanup offers stay newest first, with at most three rows shown
+let cleanupOffers = []
+// Offers waiting for their prompts stay in order but are hidden until submission settles
+const cleanupPending = new Set()
+// Desktop availability is asked once per conversation and kept separately from watch timers
+let desktopAvailable = null
+// The desktop timer survives a watch change or the watched pull request ending
+let desktopTimer = null
+// This generation is reading the desktop cache, so slow calls do not pile up within a watch
+let desktopPolling = null
+// Successful desktop reads keep the last primary URL here
+let lastPrimary = null
+// A primary becoming open counts as a change even when its URL stays the same
+let lastPrimaryOpen = false
+// This map keeps the last known bound states in this conversation by parsed URL id
+let boundStates = new Map()
 // The git push calls this session ran for the watched pull request that have not counted yet, each
 // { id, pr, at, head, shas, refs, running }: its own id, the pull request it was bound to (null when
 // none was watched), when it started, the head the pull request had as far as the session knew
@@ -127,7 +143,7 @@ export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
     sessionIdOf($).catch(() => {})
-    stop()
+    stop({ desktop: true })
     await retire($)
     reset($)
     await $.tool.register({
@@ -146,14 +162,15 @@ export function register(on) {
         },
       },
     })
-    // Finding the pull request runs gh, so it starts once the session is ready rather than delaying it
+    startDesktop($)
+    // Finding the pull request calls tools, so it starts once the session is ready
     timers.push($.clock.after(0, () => discover($)))
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     if (FINAL_REASONS.includes(e.reason)) {
-      stop()
+      stop({ desktop: true })
       await retire($)
     }
     return next(e)
@@ -168,9 +185,10 @@ export function register(on) {
     // the last one's
     sessionId = null
     sessionIdOf($).catch(() => {})
-    stop()
+    stop({ desktop: true })
     await retire($)
     reset($)
+    startDesktop($)
     timers.push($.clock.after(0, () => discover($)))
     return next(e)
   })
@@ -288,39 +306,46 @@ export function register(on) {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!offersCleanup || !watched) return next(e)
+    if (!cleanupOffers.length) return next(e)
     const elements = $.ui.resolve(e)
-    const { url, number } = watched
-    const close = () => {
-      offersCleanup = false
-      $.ui.invalidate('ui.render')
-    }
-    const line = elements.Box({
-      flexDirection: 'row',
-      columnGap: 2,
-      children: [
-        elements.Text({ children: [`PR #${number} がマージされました`] }),
-        elements.Button({
-          key: 'cleanup',
-          label: 'cleanup',
-          variant: 'primary',
-          onPress: async () => {
-            close()
-            const text = `PR ${url} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`
-            // A prompt that did not enter leaves the button to press again
-            if (!(await submit($, text)) && watched?.url === url) {
-              offersCleanup = true
+    const lines = cleanupOffers.filter((offer) => !cleanupPending.has(offer)).slice(0, 3).map((offer) => {
+      const { url, number } = offer
+      const { id } = parse(url)
+      const close = () => {
+        cleanupOffers = cleanupOffers.filter((entry) => entry !== offer)
+        $.ui.invalidate('ui.render')
+      }
+      return elements.Box({
+        flexDirection: 'row',
+        columnGap: 2,
+        children: [
+          elements.Text({ children: [`PR #${number} がマージされました`] }),
+          elements.Button({
+            key: `cleanup-${id}`,
+            label: 'cleanup',
+            variant: 'primary',
+            onPress: async () => {
+              cleanupPending.add(offer)
               $.ui.invalidate('ui.render')
-            }
-          },
-        }),
-        elements.Button({ key: 'dismiss', label: '閉じる', role: 'dismiss', onPress: close }),
-      ],
+              const text =
+                `PR ${url} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
+                `gh pr view ${url} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
+                '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+                '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。'
+              // A prompt that did not enter reveals its row in place, unless a new watch or a
+              // conversation reset removed that offer while it waited
+              if (await submit($, text)) close()
+              cleanupPending.delete(offer)
+              $.ui.invalidate('ui.render')
+            },
+          }),
+          elements.Button({ key: `dismiss-${id}`, label: '閉じる', role: 'dismiss', onPress: close }),
+        ],
+      })
     })
     // Keep what the mods after this one draw in the band
     const rest = await next(e)
-    if (!rest) return line
-    return elements.Box({ flexDirection: 'column', children: [line, rest] })
+    return elements.Box({ flexDirection: 'column', children: [...lines, ...(rest ? [rest] : [])] })
   })
 }
 
@@ -328,8 +353,15 @@ function reset($) {
   watched = null
   lastCheck = null
   lookupFailure = null
-  offersCleanup = false
+  cleanupOffers = []
+  cleanupPending.clear()
+  desktopAvailable = null
+  desktopPolling = null
+  lastPrimary = null
+  lastPrimaryOpen = false
+  boundStates = new Map()
   pushes = []
+  $.ui.invalidate('ui.render')
   showStatus($)
 }
 
@@ -340,9 +372,17 @@ async function discover($, { branchOnly = false } = {}) {
   // Pruning is startup housekeeping, skipped for a lookup after a push; a store that fails it
   // does not keep the pull request unwatched
   if (!branchOnly) await prune($).catch(() => {})
-  const found = await findForBranch($)
+  if (gen !== generation) return
+  const desktop = branchOnly ? null : await readDesktop($)
+  if (gen !== generation) return
+  const found = desktop?.primary?.state === 'OPEN'
+    ? { url: desktop.primary.url, since: 0 }
+    : await findForBranch($)
   const at = await $.clock.now()
   if ((watched && !watched.ended) || gen !== generation) return
+  if (desktop) {
+    trackBound($, desktop)
+  }
   if (found?.error !== undefined) {
     // Shown in place of the watch's line, or of the ended pull request's when a push looks again
     lookupFailure = { at, error: found.error }
@@ -378,20 +418,128 @@ function watch($, { url, since }) {
   lookupFailure = null
   lastHead = null
   lastHeadAt = 0
-  // The band may still offer the cleanup of the pull request watched before
-  if (offersCleanup) {
-    offersCleanup = false
-    $.ui.invalidate('ui.render')
-  }
+  // Watching a pull request again removes only its own cleanup offer
+  removeCleanup($, pr.id)
   // Ask at once: a review or a merge may have come while no session watched
   timers.push($.clock.after(0, () => poll($, gen)))
   timers.push($.clock.every(TICK_MS, () => poll($, gen)))
 }
 
-function stop() {
+function stop({ desktop = false } = {}) {
   for (const timer of timers) timer?.cancel()
   timers = []
+  if (desktop) {
+    desktopTimer?.cancel()
+    desktopTimer = null
+  }
   generation += 1
+}
+
+// Each conversation starts its own desktop timer and asks once whether the tool is available
+function startDesktop($) {
+  desktopAvailable = $.tool.list().then(
+    (tools) => tools.some((tool) => tool.name === DESKTOP_STATUS),
+  ).catch(() => false)
+  desktopTimer = $.clock.every(TICK_MS, () => refreshDesktop($))
+}
+
+// This source reads only the app's cache and leaves gh discovery available after any tool failure
+async function readDesktop($) {
+  try {
+    if (!(await desktopAvailable)) return null
+    const ran = await $.tool.call({ tool: DESKTOP_STATUS })
+    if (ran.deny !== undefined || ran.isError) return null
+    const status = JSON.parse(ran.text)
+    if (!status || typeof status !== 'object' || Array.isArray(status)) return null
+    if (status.bound === false) return { bound: false, primary: null, others: [] }
+    const pull = (url, state) => {
+      if (typeof url !== 'string' || url.match(PR_URL)?.index !== 0) return null
+      const pr = parse(url)
+      if (!Number.isSafeInteger(pr.number) || pr.number <= 0) return null
+      return { url: pr.url, number: pr.number, state: typeof state === 'string' ? state.toUpperCase() : null }
+    }
+    const pr = status.pr
+    const primary = pr?.host == null || pr.host.toLowerCase?.() === 'github.com' ? pull(pr?.url, pr?.state) : null
+    const others = Array.isArray(status.otherBoundPrs) ? status.otherBoundPrs.flatMap((other) => {
+      if (typeof other?.repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(other.repo)) return []
+      if (!Number.isSafeInteger(other.number) || other.number <= 0) return []
+      const parsed = pull(`https://github.com/${other.repo}/pull/${other.number}`, other.state)
+      return parsed ? [parsed] : []
+    }) : null
+    return { bound: status.bound, primary: primary ? { url: primary.url, state: primary.state } : null, others }
+  } catch {
+    return null
+  }
+}
+
+// A changed open primary takes over the watch, and an ended primary resumes when reopened
+async function refreshDesktop($) {
+  const gen = generation
+  if (desktopPolling === gen) return
+  desktopPolling = gen
+  try {
+    const desktop = await readDesktop($)
+    if (!desktop || gen !== generation) return
+    const primary = desktop.primary
+    const id = primary ? parse(primary.url).id : null
+    const changed = (id !== (lastPrimary ? parse(lastPrimary).id : null) || !lastPrimaryOpen) && id !== watched?.id
+    const reopened = id === watched?.id && watched.ended
+    if (primary?.state === 'OPEN' && (changed || reopened)) {
+      watch($, { url: primary.url, since: 0 })
+    }
+    trackBound($, desktop)
+  } finally {
+    if (desktopPolling === gen) desktopPolling = null
+  }
+}
+
+// Bound states include the watched pull request, whose notifications still come from its poll
+function trackBound($, { bound, primary, others }) {
+  if (bound === false) {
+    lastPrimary = null
+    lastPrimaryOpen = false
+    boundStates.clear()
+    return
+  }
+  // An incomplete primary must not hide a later open state for the same URL
+  if (primary && ['OPEN', 'MERGED', 'CLOSED'].includes(primary.state)) {
+    lastPrimary = primary.url
+    lastPrimaryOpen = primary.state === 'OPEN'
+  }
+  const entries = [...(others ?? []), ...(primary ? [primary] : [])]
+  // Only a supplied list can unbind other pull requests; an omitted primary remains known
+  if (Array.isArray(others)) {
+    const ids = new Set(entries.map((entry) => parse(entry.url).id))
+    if (!primary && lastPrimary) ids.add(parse(lastPrimary).id)
+    for (const id of boundStates.keys()) if (!ids.has(id)) boundStates.delete(id)
+  }
+  for (const entry of entries) {
+    const pr = parse(entry.url)
+    const { state } = entry
+    if (state !== 'OPEN' && state !== 'MERGED' && state !== 'CLOSED') continue
+    const previous = boundStates.get(pr.id)
+    boundStates.set(pr.id, state)
+    if (state === 'OPEN') removeCleanup($, pr.id)
+    if (pr.id === watched?.id || previous !== 'OPEN' || !ENDED[state]) continue
+    $.ui.toast(`PR #${pr.number} が${ENDED[state]}されました`)
+    if (state === 'MERGED') offerCleanup($, pr)
+  }
+}
+
+// A merged pull request goes at the front without duplicating an existing offer
+function offerCleanup($, { url, number }) {
+  const { id } = parse(url)
+  if (cleanupOffers.some((offer) => parse(offer.url).id === id)) return
+  cleanupOffers.unshift({ url, number })
+  $.ui.invalidate('ui.render')
+}
+
+// Watching or seeing a pull request open removes its own offer, including one awaiting a prompt
+function removeCleanup($, id) {
+  const remaining = cleanupOffers.filter((offer) => parse(offer.url).id !== id)
+  if (remaining.length === cleanupOffers.length) return
+  cleanupOffers = remaining
+  $.ui.invalidate('ui.render')
 }
 
 async function poll($, gen) {
@@ -505,8 +653,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     endedGen = generation
     watched = { ...watched, ended: data.state }
     if (data.state === 'MERGED') {
-      offersCleanup = true
-      $.ui.invalidate('ui.render')
+      offerCleanup($, pr)
     }
   }
 
@@ -597,10 +744,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
 function reopen($, pr, gen) {
   if (gen !== generation || watched?.id !== pr.id || !watched.ended) return
   watched = { ...watched, ended: null }
-  if (offersCleanup) {
-    offersCleanup = false
-    $.ui.invalidate('ui.render')
-  }
+  removeCleanup($, pr.id)
   timers.push($.clock.every(TICK_MS, () => poll($, gen)))
   showStatus($)
 }
