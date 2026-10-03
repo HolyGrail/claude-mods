@@ -1371,6 +1371,7 @@ test('a pull request the session creates is watched from then on, without holdin
 for (const command of [
   'gh pr new',
   'gh -R HolyGrail/claude-mods pr create',
+  'gh -RHolyGrail/claude-mods pr create',
   'gh --repo=HolyGrail/claude-mods pr create',
   'gh --repo HolyGrail/claude-mods pr create',
   'gh -R "HolyGrail/claude-mods" pr new',
@@ -1395,6 +1396,7 @@ for (const command of [
 for (const command of [
   'git pushx',
   'gh prx create',
+  'gh --repoHolyGrail/claude-mods pr create',
   'git log --grep push',
 ]) {
   test(`${command} does not start watching or look up a pull request`, async ($, on) => {
@@ -1656,20 +1658,34 @@ test('a pull request found after a push takes that push as its baseline', async 
 
 for (const [command, cwd] of [
   ['git -C /repo/.wt/other push', '/repo/.wt/other'],
-  ['git -C ../other push', '/other'],
+  ['git -C ../other push', '/repo/../other'],
   ['git -C .wt/other push', '/repo/.wt/other'],
   ['git --no-pager -C "/repo/.wt/other tree" push', '/repo/.wt/other tree'],
-  ['git -C \'../other tree\' push', '/other tree'],
-  ['git -C /repo -c push.default=current -C .wt -C ../other push', '/repo/other'],
+  ['git -C \'../other tree\' push', '/repo/../other tree'],
+  ['git -C /repo -c push.default=current -C .wt -C ../other push', '/repo/.wt/../other'],
+  ['git -C /a/b -C ../c push', '/a/b/../c'],
   ['git -C ../ignored -C /repo/.wt/other push', '/repo/.wt/other'],
   ['git -C /repo/.wt -C "" -C other push', '/repo/.wt/other'],
   ['git -c "alias.example=!git -C /wrong push" -C .wt/other push', '/repo/.wt/other'],
+  ['git --git-dir=/other/.git --work-tree=/other push', '/other'],
+  ['git --git-dir=/other/.git --work-tree \'/other tree\' push', '/other tree'],
+  ['git --work-tree=other push', '/repo/other'],
+  ['git -C /repo/.wt --work-tree=../other push', '/repo/.wt/../other'],
+  ['git --work-tree ../other -C /repo -C .wt push', '/repo/.wt/../other'],
+  ['git -C /repo/.wt --work-tree=/other push', '/other'],
+  ['git --work-tree=/first --work-tree=/other push', '/other'],
+  ['git -C ~/other push', '/home/tester/other'],
+  ['git -C ~ push', '/home/tester'],
+  ['git -C /repo/.wt --work-tree=~/other push', '/home/tester/other'],
+  ['git -C ~ -C projects --work-tree ../other push', '/home/tester/projects/../other'],
   ['git push', undefined],
-  ['git -c "alias.example=!git -C /wrong push" --git-dir=/repo/.git --work-tree=/repo push', undefined],
+  ['git --git-dir=/other/.git push', undefined],
+  ['git -c "alias.example=!git -C /wrong push" --git-dir=/repo/.git --work-tree=/repo push', '/repo'],
 ] as const) {
   test(`${command} looks up the branch in ${cwd ?? 'the session directory'}`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     const w = stubWorld(on, { branchPr: null })
+    mock.env(on, { HOME: '/home/tester' })
     on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
     await $.session.start(START)
     await clock.settle()
@@ -1683,6 +1699,43 @@ for (const [command, cwd] of [
       { argv: ['gh', 'pr', 'view', '--json', 'url,state'], init: cwd === undefined ? undefined : { cwd } },
     ])
     expect(w.queries).toBe(1)
+  })
+}
+
+for (const command of [
+  'git -C "$WORKTREE" push',
+  'git -C \'$WORKTREE\' push',
+  'git -C `pwd` push',
+  'git -C ~someone/other push',
+  'git --work-tree="$WORKTREE" push',
+  'git --work-tree `pwd` push',
+  'git --work-tree ~someone/other push',
+  'git -C "$WORKTREE" --work-tree=/other push',
+  'git -C ~/other push',
+]) {
+  test(`${command} skips an unresolved directory lookup but still tracks the push`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { branchPr: null })
+    mock.env(on, {})
+    const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+    await $.session.start(START)
+    await clock.settle()
+    w.branchPr = { url: URL, state: 'OPEN' }
+    w.pull.thumbsUpAt = NOW + 10_000
+
+    await clock.advance(30_000)
+    await $.tool.call({ tool: 'Bash', command })
+    w.pull.head = 'b2b2b2b0123456789'
+    await clock.advance(MINUTE)
+    expect(w.branchLookups).toBe(1)
+    expect(w.queries).toBe(0)
+
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL })
+    await clock.settle()
+    expect(w.queries).toBe(1)
+    expect(w.prompts).toEqual([])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW + 30_000 })
   })
 }
 

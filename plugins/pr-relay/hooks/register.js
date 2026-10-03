@@ -32,9 +32,9 @@ const LATE = 'poll outlasted its turn'
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // Option values are one unquoted, single-quoted or double-quoted shell word
 const SHELL_WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';&|<>]+)`
-// Accepts gh pr create or new, optionally preceded by -R repo, --repo repo or --repo=repo
-const GH_PR_CREATE = new RegExp(String.raw`\bgh\s+(?:(?:-R\s+|--repo(?:\s+|=))${SHELL_WORD}\s+)*pr\s+(?:create|new)\b`)
-const GIT_OPTION = String.raw`(?:-C\s+(${SHELL_WORD})|-c\s+${SHELL_WORD}|--(?:git-dir|work-tree)(?:=|\s+)${SHELL_WORD}|--no-pager)`
+// Accepts gh pr create or new, optionally preceded by -R repo, -Rrepo, --repo repo or --repo=repo
+const GH_PR_CREATE = new RegExp(String.raw`\bgh\s+(?:(?:-R\s*|--repo(?:\s+|=))${SHELL_WORD}\s+)*pr\s+(?:create|new)\b`)
+const GIT_OPTION = String.raw`(?:-C\s+(${SHELL_WORD})|--work-tree(?:=|\s+)(${SHELL_WORD})|-c\s+${SHELL_WORD}|--git-dir(?:=|\s+)${SHELL_WORD}|--no-pager)`
 // Accepts git push with any combination of -C dir, -c key=value, --git-dir=dir,
 // --work-tree=dir and --no-pager before push, including space-separated directory values
 const GIT_PUSH = new RegExp(String.raw`\bgit\s+((?:${GIT_OPTION}\s+)*)push\b`)
@@ -308,10 +308,10 @@ export function register(on) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
     } else {
-      if (!watched || watched.ended) timers.push($.clock.after(0, async () => discover($, {
-        branchOnly: true,
-        cwd: await pushDirectory($, pushing[1]),
-      })))
+      if (!watched || watched.ended) timers.push($.clock.after(0, async () => {
+        const cwd = await pushDirectory($, pushing[1])
+        if (cwd !== null) await discover($, { branchOnly: true, cwd })
+      }))
     }
     return ran
   })
@@ -1394,22 +1394,32 @@ async function reviewDetails($, reviews) {
   return nodes
 }
 
-// Git applies -C options in order, with each relative directory based on the preceding one
+// Git applies -C options in order, then resolves --work-tree against that directory.
+// Leave .. for the filesystem to follow symlinks; null skips a lookup whose directory is unknown
 async function pushDirectory($, options) {
   let cwd
+  let workTree
   for (const match of options.matchAll(new RegExp(GIT_OPTION, 'g'))) {
-    if (match[1] === undefined) continue
-    const dir = match[1].replace(/^(["'])(.*)\1$/s, '$2')
+    const word = match[1] ?? match[2]
+    if (word === undefined) continue
+    let dir = word.replace(/^(["'])(.*)\1$/s, '$2')
+    if (/[$`]|^~[^/]/.test(dir)) return null
+    if (dir.startsWith('~')) {
+      const home = await $.env.get('HOME')
+      if (!home) return null
+      dir = home + dir.slice(1)
+    }
+    if (match[2] !== undefined) {
+      workTree = dir
+      continue
+    }
     if (!dir) continue
     cwd = dir.startsWith('/') ? dir : `${cwd ?? await $.session.cwd()}/${dir}`
   }
-  if (cwd === undefined) return
-  const parts = []
-  for (const part of cwd.split('/')) {
-    if (part === '..') parts.pop()
-    else if (part && part !== '.') parts.push(part)
+  if (workTree !== undefined) {
+    cwd = workTree.startsWith('/') ? workTree : `${cwd ?? await $.session.cwd()}/${workTree}`
   }
-  return '/' + parts.join('/')
+  return cwd
 }
 
 // The open pull request of the branch checked out at cwd: null when there is none, { error } when gh
