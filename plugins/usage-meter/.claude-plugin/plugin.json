@@ -1,6 +1,6 @@
 {
   "name": "usage-meter",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Shows context, 5-hour and weekly limit usage above the prompt",
   "author": { "name": "HolyGrail" }
 }

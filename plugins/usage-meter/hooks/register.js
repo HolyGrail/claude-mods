@@ -48,8 +48,6 @@ const BAR_CELLS = 10
 // Columns between two meters, and the band's last column, which the terminal may draw over
 const METER_GAP = 3
 const BAND_RESERVED_COLUMNS = 2
-// Rows between the meters and what later mods draw; the terminal has no rows to spare
-const DESKTOP_ROW_GAP = 1
 const SVG_BAR = { width: 96, height: 10 }
 const SVG_COLORS = { success: '#4caf50', warning: '#e0a526', error: '#e5534b', track: 'rgba(128,128,128,0.3)', marker: '#5b9bff' }
 // The terminal draws the time marker in this color
@@ -126,8 +124,7 @@ export function register(on) {
     // Keep what the mods after this one draw in the band
     const rest = await next(e)
     if (!rest) return line
-    const rowGap = e.surface === 'desktop' ? DESKTOP_ROW_GAP : 0
-    return elements.Box({ flexDirection: 'column', rowGap, children: [line, rest] })
+    return elements.Box({ flexDirection: 'column', children: [line, rest] })
   })
 }
 

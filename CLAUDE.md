@@ -28,7 +28,7 @@ Tests import `test`, `expect` and `mock` from `claude-code/testing`. Each test g
 
 ## usage-meter architecture
 
-`hooks/register.js` draws a band above the prompt (`ui.render` for `AbovePrompt`) with meters for context, the 5-hour limit and the 7-day limit. It always calls `next(e)` and stacks its line above whatever later mods draw.
+`hooks/register.js` draws a band above the prompt (`ui.render` for `AbovePrompt`) with meters for context, the 5-hour limit and the 7-day limit. It always calls `next(e)` and stacks its line above whatever later mods draw. It adds no row between its line and theirs on any surface: a mod that wants its rows set apart (pr-relay's desktop cards) spaces them itself.
 
 State lives in module-level variables, which may survive a re-fired `session.start` (enable or worker respawn), so `session.start` resets them and cancels the previous ticker.
 
