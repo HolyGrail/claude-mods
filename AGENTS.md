@@ -34,7 +34,7 @@ Mods run on an early-access Claude Code API that is not documented publicly. Thi
 - `next(e)` runs the plugins beneath this one and then Claude Code's own behavior, resolving to the event's result. A hook that returns without calling `next` answers the event itself; `next({ ...e, x })` rewrites what the rest of the chain sees.
 - `$` is the engine interface, each call spelled noun then method (`$.store.get(key)`). The module runs in a sandbox with no Node and no DOM: no `fs`, `child_process`, `process.env`, `fetch` or `setTimeout`. Everything outside the module goes through `$`.
 - A hook that throws is skipped and the chain goes on without it.
-- Module-level variables are the module's own state. A reload (an edit, a worker respawn, re-enabling the plugin) starts the module fresh, and `session.start` can also fire again on a module whose variables survived, so `session.start` resets them.
+- Module-level variables are the module's own state. A reload after an edit starts the module fresh, but re-enabling the plugin or a worker respawn fires `session.start` again on a module whose variables, timers and cached session id may have survived. So every stateful module's `session.start` resets its variables and cancels the timers a previous start left running.
 
 ### Events This Repository Hooks
 
@@ -42,7 +42,8 @@ Mods run on an early-access Claude Code API that is not documented publicly. Thi
 | --- | --- | --- |
 | `session.start` | none | The session is ready. Awaited before the first prompt, so `$.tool.register` and `$.command.register` here are listed from turn one. Start timers here. |
 | `session.end` | none | `e.reason`: `prompt_input_exit` and `other` are final; `clear`, `resume` and `logout` are not. |
-| `classic.SessionStart` | `{ source: ['resume', 'clear', 'fork'] }` | The settings hook of that name. `/resume`, `/clear` and `/branch` switch the conversation, and its session id, without a new `session.start`. |
+| `session.measure` | none | Fires after each turn and when a rate-limit window moves a whole point: `e.context`, `e.rateLimits`, `e.cost?` and `e.changed` (which of them moved). usage-meter's live readings come from here, not only from the `$.session.usage()` snapshot at startup. |
+| `classic.SessionStart` | `{ source: [...] }` from `'resume'`, `'clear'`, `'fork'`, `'compact'` | The settings hook of that name. `/resume`, `/clear` and `/branch` (`fork`) switch the conversation, and its session id, without a new `session.start`. Compaction (`compact`) keeps the session id but replaces the conversation, so a plugin whose state follows the conversation (usage-meter's context, notice-board's told notices) matches it too; pr-relay, whose state follows the pull request, does not. |
 | `tool.call` | `{ tool: 'Bash' }` or `{ tool: 'mcp__<plugin>__<name>' }` | A tool call; for Bash, `e.command` is the command. Return `{ deny: reason }` to block it, or `await next(e)` to run it and read the result (`ran.text`, `ran.isError`, `ran.deny`). A plugin answers its own tool by returning `{ result: text }`. |
 | `ui.render` | `{ component: 'AbovePrompt' }` | The band above the prompt. `const { Box, Text, Button } = $.ui.resolve(e)` gives the elements of the surface drawing it (`e.surface`). Return a tree, or `next(e)` when there is nothing to draw; put your line above `await next(e)` so later mods still draw. |
 | `prompt.submit` | none | A prompt as submitted. |
@@ -54,7 +55,7 @@ Mods run on an early-access Claude Code API that is not documented publicly. Thi
 | --- | --- |
 | `$.clock.now()` | Epoch ms. Use it rather than `Date.now()`, which tests cannot control. |
 | `$.clock.after(ms, fn)`, `$.clock.every(ms, fn)` | Timers; each returns an object with `cancel()`. They die with the module. |
-| `$.store.get(key)`, `.set(key, value)`, `.delete(key)`, `.keys()` | A JSON store per plugin, shared by every session on the machine. There is no atomic update, compare-and-set or snapshot: write only keys your session owns, and expect other sessions to write between your read and your write. |
+| `$.store.get(key)`, `.set(key, value)`, `.delete(key)`, `.keys()` | A JSON store per plugin, shared by every session on the machine. There is no atomic update, compare-and-set or snapshot, so expect other sessions to write between your read and your write. The usual pattern is a key per session (`reading:<sessionId>`, `poll:<sessionId>:<id>`) that only its session writes. A key several sessions write, like pr-relay's `pr:<id>` record, needs a protocol of its own; pr-relay elects the session that writes it through those per-session notes (see `CLAUDE.md`). |
 | `$.state.get(key)` | Per-session values typed by the plugin's `types/index.d.ts` contract. |
 | `$.process.run(argv, init?)` | Runs a host command by argv, with no shell. Resolves `{ exitCode, stdout, stderr, isStdoutTruncated, isStderrTruncated }`. |
 | `$.fs.read(path)`, `$.fs.list(dir)` | Files; `list` answers `{ name, kind, size, mtimeMs, isLink }[]`. |
@@ -111,7 +112,7 @@ test('what the plugin does', async ($, on) => {
 })
 ```
 
-- `$` raises `$.session.start`, `$.session.end`, `$.tool.call({ tool: 'Bash', command })`, `$.classic.SessionStart({ source: 'resume' })` and `$.ui.mount({ plugin, component, surface, props })`.
+- `$` raises `$.session.start`, `$.session.end`, `$.session.measure({ context, rateLimits, changed })`, `$.tool.call({ tool: 'Bash', command })`, `$.classic.SessionStart({ source: 'resume' })` and `$.ui.mount({ plugin, component, surface, props })`.
 - `on` stubs `session.id`, `session.cwd`, `store.*`, `process.run`, `fs.*`, `prompt.submit`, `ui.toast`, `ui.status`, `ui.render` and the rest; `mock.env` stubs the environment.
 - `mock.clock(on, { now })` fixes time and returns `{ settle, advance }`. Never sleep in a test.
 
