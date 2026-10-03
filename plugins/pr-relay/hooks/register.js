@@ -53,7 +53,7 @@ const PAGE = 'last: 100, before: $before'
 const PAGE_INFO = 'pageInfo { hasPreviousPage startCursor }'
 const CONNECTIONS = {
   reactors: `reactionGroups { content reactors(${PAGE}) { ${PAGE_INFO} edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }`,
-  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { databaseId submittedAt author { login } comments { totalCount } } }`,
+  reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId fullDatabaseId submittedAt author { login } comments { totalCount } } }`,
   comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { createdAt author { login } body } }`,
 }
 const MAX_PAGES = 10
@@ -61,6 +61,17 @@ const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
 const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
+// Review bodies stay out of the per-minute query so gh's output does not get cut
+const REVIEW_QUERY = `query($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on PullRequestReview {
+    databaseId fullDatabaseId url submittedAt commit { oid } body
+    comments(first: 100) { totalCount nodes { databaseId fullDatabaseId path line originalLine url body outdated replyTo { id } subjectType } }
+  } }
+}`
+// The most characters of a body to include before linking to the full text
+const BODY_LIMIT = 4_000
+// The most characters in a review prompt, including the omitted count and approval note
+const PROMPT_LIMIT = 30_000
 
 // The pull request this session watches: { url, id, owner, name, number, since, pagedAt?, ended? },
 // or null. since is the last push the watch started from.
@@ -295,7 +306,7 @@ export function register(on) {
           variant: 'primary',
           onPress: async () => {
             close()
-            const text = `PR ${url} がマージされました。/dev cleanup の手順で worktree とブランチを片付けてください。`
+            const text = `PR ${url} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`
             // A prompt that did not enter leaves the button to press again
             if (!(await submit($, text)) && watched?.url === url) {
               offersCleanup = true
@@ -947,45 +958,40 @@ async function readNotes($, pr, note) {
   return { defers, since, pending, pushing }
 }
 
-// Marks what is new since the last push as relayed: an approval, then a review, then the usage
-// limit. poll-codex-review.sh puts an unprocessed review before an approval instead, but the /dev
-// skill runs it once whenever it is woken and follows its signal, so a review the approval settles
-// here still reaches the skill. Returns each prompt to send with how to take its mark back.
+// Marks what is new since the last push as relayed: reviews before an approval, then the usage
+// limit. A newer approval is marked with the reviews, and mentioned only if it came after them.
+// Review details are fetched at delivery, once the record is written, outside the write queue
 function relay($, pr, signals, record) {
-  const fresh = signals.reviews.filter((r) => !record.reviews.includes(r.id))
-  if (signals.approvedAt > record.approvedAt) {
-    const approvedAt = signals.approvedAt
+  const fresh = signals.reviews.filter((r) => !record.reviews.some((id) => String(id) === String(r.id))).sort((a, b) => a.at - b.at)
+  if (fresh.length > 0) {
     const previous = record.approvedAt
-    record.approvedAt = approvedAt
-    // A review the approval came after is settled by it; a later one still waits its turn
-    const settled = fresh.filter((r) => r.at <= approvedAt).map((r) => r.id)
-    record.reviews.push(...settled)
+    const approvedAt = signals.approvedAt > previous ? signals.approvedAt : 0
+    record.reviews.push(...fresh.map((r) => r.id))
+    if (approvedAt) record.approvedAt = approvedAt
     return [
       {
-        text:
-          `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}）。` +
-          'CI の結果を確かめ、完了報告と ~/.claude/dev-sessions のセッションファイルの更新をしてください。',
-        // A newer approval recorded since keeps both its time and the reviews it settles
+        pr,
+        reviews: fresh,
+        approvedAt: approvedAt > fresh[fresh.length - 1].at ? approvedAt : 0,
         undo: (r) => {
-          if (r.approvedAt !== approvedAt) return
-          r.approvedAt = previous
-          r.reviews = r.reviews.filter((id) => !settled.includes(id))
+          if (approvedAt && r.approvedAt === approvedAt) r.approvedAt = previous
+          const pending = fresh.map((f) => String(f.id))
+          r.reviews = r.reviews.filter((id) => !pending.includes(String(id)))
         },
       },
     ]
   }
-  if (fresh.length > 0) {
-    record.reviews.push(...fresh.map((r) => r.id))
-    const comments = fresh.reduce((sum, r) => sum + r.comments, 0)
+  if (signals.approvedAt > record.approvedAt) {
+    const approvedAt = signals.approvedAt
+    const previous = record.approvedAt
+    record.approvedAt = approvedAt
     return [
       {
         text:
-          `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${fresh.length} 件、` +
-          `inline コメント ${comments} 件）。/dev の Phase 5.5 の手順で指摘を triage し、対応してください。`,
-        // A review an approval recorded since came after stays settled by it
+          `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}）。` +
+          'CI の結果を確かめ、問題がなければ作業の完了を報告してください。',
         undo: (r) => {
-          const pending = fresh.filter((f) => f.at > r.approvedAt).map((f) => f.id)
-          r.reviews = r.reviews.filter((id) => !pending.includes(id))
+          if (r.approvedAt === approvedAt) r.approvedAt = previous
         },
       },
     ]
@@ -1008,12 +1014,100 @@ function relay($, pr, signals, record) {
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, toast, undo }) {
+function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   if (toast) return $.ui.toast(toast)
+  const gen = generation
+  const id = watched?.id
+  const started = pushStarts.get(id) ?? 0
   // A mark the store would not take back stays, and that prompt is not sent again
-  submit($, text)
+  const ready = reviews
+    ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
+    : Promise.resolve(text)
+  ready
+    // A new conversation, watch or push makes these details stale before they can be delivered
+    .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
+}
+
+// The opening, approval note and fallback use only the review counts already read by the poll
+function reviewPromptParts(pr, reviews, approvedAt) {
+  const count = reviews.reduce((sum, r) => sum + r.comments, 0)
+  const endpoint = `repos/${pr.owner}/${pr.name}/pulls/${pr.number}/comments`
+  const selection = reviews.map((r) => `(.pull_request_review_id | tostring) == "${r.id}"`).join(' or ')
+  const text =
+    `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${reviews.length} 件、inline コメント ${count} 件）。\n` +
+    '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
+    `返信は gh api ${endpoint}/<comment id>/replies -f body='...' で送れます。`
+  const approval = approvedAt
+    ? `\n\nなお、このレビューの後（${clock(approvedAt)}）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。`
+    : ''
+  return {
+    text,
+    approval,
+    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(.in_reply_to_id == null and (${selection})) | {id, path, line, body}' で確認してください。${approval}`,
+  }
+}
+
+// The review prompt carries its comments, or instructions to read them if details are unavailable
+async function reviewPrompt($, pr, reviews, approvedAt) {
+  const parts = reviewPromptParts(pr, reviews, approvedAt)
+  let text = parts.text
+  const { approval, fallback } = parts
+  const details = await reviewDetails($, reviews).catch(() => [])
+  const sections = []
+  let remaining = 0
+  let remainingBodies = 0
+  for (const review of reviews) {
+    const detail = details.find((r) => r && (r.fullDatabaseId ?? String(r.databaseId)) === review.id)
+    const nodes = Array.isArray(detail?.comments?.nodes) ? detail.comments.nodes : []
+    const comments = nodes.filter((c) =>
+      !c?.replyTo && (c?.fullDatabaseId ?? c?.databaseId) != null && typeof c.path === 'string' && typeof c.body === 'string' && typeof c.url === 'string',
+    )
+    const replies = nodes.filter((c) => c?.replyTo).length
+    const total = Math.max(review.comments, (detail?.comments?.totalCount ?? 0) - replies, comments.length)
+    remaining += total
+    for (const comment of comments) {
+      const outdated = comment.outdated || (comment.line == null && comment.subjectType !== 'FILE')
+      const line = outdated ? comment.originalLine : comment.line
+      const location = comment.subjectType === 'FILE'
+        ? `${comment.path} (file)`
+        : `${comment.path}:${line ?? '?'}${outdated ? ' (outdated)' : ''}`
+      sections.push({
+        text: `### ${location} (comment ${comment.fullDatabaseId ?? comment.databaseId})\n${cappedBody(comment.body)}\n${comment.url}`,
+        comments: 1,
+      })
+    }
+    if (total === 0 && typeof detail?.body === 'string') {
+      const body = detail.body.replace(/<details\b[^>]*>[\s\S]*?<\/details\s*>/gi, '').trim()
+      if (body) {
+        sections.push({ text: `### レビュー ${review.id}\n${cappedBody(body)}\n${detail.url}`, comments: 0 })
+        remainingBodies++
+      }
+    }
+  }
+  if (sections.length === 0) {
+    return fallback
+  }
+  const rest = (comments, bodies) => bodies > 0
+    ? `\n\n残り ${comments + bodies} 件のコメントとレビュー本文は ${pr.url} で確認してください。`
+    : comments > 0 ? `\n\n残り ${comments} 件のコメントは ${pr.url}/files で確認してください。` : ''
+  for (const section of sections) {
+    const addition = `\n\n${section.text}`
+    const bodies = remainingBodies - (section.comments === 0 ? 1 : 0)
+    // Leave room for the omitted count and approval so the whole prompt stays within the cap
+    if (text.length + addition.length + rest(remaining - section.comments, bodies).length + approval.length > PROMPT_LIMIT) break
+    text += addition
+    remaining -= section.comments
+    remainingBodies = bodies
+  }
+  return text + rest(remaining, remainingBodies) + approval
+}
+
+// A trimmed body with a link notice when its text exceeds the per-body cap
+function cappedBody(body) {
+  const trimmed = body.trim()
+  return trimmed.length > BODY_LIMIT ? trimmed.slice(0, BODY_LIMIT) + '…（以下省略、全文は URL で）' : trimmed
 }
 
 // Takes marks back without waiting; a store that refuses it leaves them, and says so
@@ -1072,7 +1166,7 @@ function read(data, since) {
   }
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
-    .map((r) => ({ id: r.databaseId, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
+    .map((r) => ({ id: r.fullDatabaseId ?? String(r.databaseId), nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
   return { approvedAt, usageLimitAt, reviews }
 }
 
@@ -1130,6 +1224,19 @@ async function graphql($, pr, document, before) {
   const data = JSON.parse(stdout)?.data?.repository?.pullRequest
   if (!data) throw new Error('pull request not found')
   return data
+}
+
+// The comments of exactly the reviews a prompt reports, fetched only when it is delivered
+async function reviewDetails($, reviews) {
+  const { exitCode, stdout, stderr } = await $.process.run([
+    'gh', 'api', 'graphql',
+    '-f', `query=${REVIEW_QUERY}`,
+    ...reviews.flatMap((r) => ['-f', `ids[]=${r.nodeId}`]),
+  ])
+  if (exitCode !== 0) throw new Error(stderr.trim().split('\n')[0] || `gh exited ${exitCode}`)
+  const nodes = JSON.parse(stdout)?.data?.nodes
+  if (!Array.isArray(nodes)) throw new Error('review details not found')
+  return nodes
 }
 
 // The open pull request of the branch checked out here: null when there is none, { error } when gh
@@ -1203,7 +1310,7 @@ function normalize(record) {
     headAt: record?.headAt ?? 0,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
-    reviews: Array.isArray(record?.reviews) ? record.reviews : [],
+    reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],
     ended: record?.ended ?? null,
     at: record?.at ?? 0,
   }

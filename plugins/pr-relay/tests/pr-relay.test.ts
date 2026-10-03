@@ -28,6 +28,31 @@ const START = { surface: 'terminal', isInteractive: true, cwd: '/repo' } as cons
 // The stub registrar a test function receives as its second argument
 type On = Parameters<typeof mock.clock>[0]
 
+type Review = {
+  id: number | null
+  fullDatabaseId?: string | null
+  nodeId?: string
+  at: number
+  comments: number
+  by?: string
+  pending?: true
+  body?: string
+  url?: string
+  detailsTotal?: number
+  details?: {
+    id: number | null
+    fullDatabaseId?: string | null
+    path: string
+    line: number | null
+    originalLine?: number | null
+    body: string
+    url?: string
+    outdated?: boolean
+    replyTo?: { id: string } | null
+    subjectType?: 'FILE' | 'LINE'
+  }[]
+}
+
 type Pull = {
   state?: 'OPEN' | 'MERGED' | 'CLOSED'
   head?: string
@@ -35,15 +60,17 @@ type Pull = {
   branch?: string
   committedAt?: number
   thumbsUpAt?: number
-  reviews?: { id: number; at: number; comments: number; by?: string; pending?: true }[]
+  reviews?: Review[]
   // Reviews on the page before the newest, which gh hands out for the cursor 'older'
-  olderReviews?: { id: number; at: number; comments: number; by?: string }[]
+  olderReviews?: Review[]
   comments?: { at: number; body: string }[]
 }
 
 const reviewNodes = (reviews: NonNullable<Pull['reviews']>) =>
   reviews.map((r) => ({
+    id: r.nodeId ?? `review-${r.fullDatabaseId ?? r.id}`,
     databaseId: r.id,
+    fullDatabaseId: r.fullDatabaseId,
     submittedAt: 'pending' in r && r.pending ? null : iso(r.at),
     author: { login: r.by ?? 'chatgpt-codex-connector' },
     comments: { totalCount: r.comments },
@@ -80,16 +107,60 @@ function graphql(pull: Pull, before?: string) {
   return JSON.stringify({ data: { repository: { pullRequest } } })
 }
 
+function reviewDetails(pulls: Pull[], ids: string[]) {
+  const reviews = pulls.flatMap((p) => [...(p.reviews ?? []), ...(p.olderReviews ?? [])])
+  const nodes = ids.map((id) => {
+    const review = reviews.find((r) => (r.nodeId ?? `review-${r.fullDatabaseId ?? r.id}`) === id)
+    if (!review) return null
+    const comments: NonNullable<Review['details']> = review.details ?? Array.from({ length: Math.min(100, review.comments) }, (_, i) => ({
+      id: (review.id ?? 0) * 1_000 + i + 1,
+      path: `src/file-${i + 1}.ts`,
+      line: i + 1,
+      body: `Comment ${i + 1}`,
+    }))
+    return {
+      databaseId: review.id,
+      fullDatabaseId: review.fullDatabaseId,
+      url: review.url ?? `${URL}#pullrequestreview-${review.fullDatabaseId ?? review.id}`,
+      submittedAt: iso(review.at),
+      commit: { oid: 'a1' },
+      body: review.body ?? 'Review summary',
+      comments: {
+        totalCount: review.detailsTotal ?? review.comments,
+        nodes: comments.map((c) => ({
+          databaseId: c.id,
+          fullDatabaseId: c.fullDatabaseId,
+          path: c.path,
+          line: c.line,
+          originalLine: c.originalLine ?? c.line,
+          body: c.body,
+          url: c.url ?? `${URL}#discussion_r${c.fullDatabaseId ?? c.id}`,
+          outdated: c.outdated ?? false,
+          replyTo: c.replyTo ?? null,
+          subjectType: c.subjectType ?? 'LINE',
+        })),
+      },
+    }
+  })
+  return JSON.stringify({ data: { nodes } })
+}
+
 type World = {
   pull: Pull
   // What gh pr view answers for the branch, null when it has no pull request, or 'error' when gh fails
   branchPr: { url: string; state: string } | null | 'error'
   // What a submitted prompt waits for before its turn starts
   turnStarts: () => Promise<void>
+  dropPrompt?: boolean
   // What gh api graphql waits for before it answers
   answers: () => Promise<void>
   // What gh api graphql fails with, when it does
   queryError?: string
+  // Review details are fetched separately from the polling queries.
+  detailsError?: string
+  detailsResponse?: string
+  detailsAnswer?: () => Promise<void>
+  detailsArgv: (readonly string[])[]
   // What writing a poll note fails with, when it does
   noteError?: string
   // What listing the store fails with, when it does
@@ -104,7 +175,7 @@ type World = {
   ids?: () => Promise<void>
   // The pull requests other than the one in pull, by number
   pulls?: Record<number, Pull>
-  // The argument vectors of the gh api calls
+  // The argument vectors of the polling gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
   // The keys deleted from the store, in order
@@ -128,6 +199,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     queries: 0,
     sessionId: 'session-b',
     queryArgv: [],
+    detailsArgv: [],
     turnStarts: async () => {},
     answers: async () => {},
     ...world,
@@ -145,6 +217,13 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     if (e.argv[1] === 'pr') {
       if (w.branchPr === 'error') return run(1, '', 'error connecting to api.github.com')
       return w.branchPr ? run(0, JSON.stringify(w.branchPr)) : run(1, '', 'no pull requests found for branch "feature"')
+    }
+    if (e.argv.some((arg) => arg.startsWith('query=') && arg.includes('nodes(ids:'))) {
+      w.detailsArgv.push(e.argv)
+      await w.detailsAnswer?.()
+      if (w.detailsError) return run(1, '', w.detailsError)
+      const ids = e.argv.filter((arg) => arg.startsWith('ids[]=')).map((arg) => arg.slice('ids[]='.length))
+      return run(0, w.detailsResponse ?? reviewDetails([w.pull, ...Object.values(w.pulls ?? {})], ids))
     }
     w.queries += 1
     w.queryArgv.push(e.argv)
@@ -178,7 +257,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   on('prompt.submit', async ($, e) => {
     w.prompts.push(e.text)
     await w.turnStarts()
-    return { text: e.text }
+    return w.dropPrompt ? { drop: 'the queue is closed' } : { text: e.text }
   })
   on('ui.toast', ($, e) => {
     w.toasts.push(e.text)
@@ -231,7 +310,9 @@ test('a thumbs-up from before the last push is not an approval', async ($, on) =
   // Codex reacts again after the push: GitHub keeps one reaction, now with the new time
   w.pull.thumbsUpAt = NOW + 30_000
   await clock.advance(MINUTE)
-  expect(w.prompts).toEqual([expect.stringContaining('Codex が PR #7 (' + URL + ') を approved にしました')])
+  expect(w.prompts).toEqual([
+    `Codex が PR #7 (${URL}) を approved にしました（21:00）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+  ])
 
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
@@ -255,6 +336,386 @@ test('a new Codex review wakes the session once, and not another session on the 
   await $.session.start(START)
   await clock.settle()
   expect(w.prompts.length).toBe(1)
+})
+
+test('a review prompt lists inline comments in review order with the original opening', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: {
+      reviews: [
+        { id: 2, nodeId: 'PRR_second', at: NOW - MINUTE, comments: 1, details: [
+          { id: 21, path: 'src/c.ts', line: 8, body: '空の配列を扱ってください。' },
+        ] },
+        { id: 1, nodeId: 'PRR_first', at: NOW - 2 * MINUTE, comments: 2, body: 'boilerplate', details: [
+          { id: 12, path: 'src/b.ts', line: 20, body: '  エラーを返してください。\n' },
+          { id: 11, path: 'src/a.ts', line: 12, body: '\nnull を確認してください。  ' },
+        ] },
+        { id: 3, at: LAST_PUSH - MINUTE, comments: 1 },
+        { id: 4, at: NOW - MINUTE, comments: 1, by: 'someone' },
+      ],
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+
+  expect(w.prompts).toEqual([
+    `Codex が PR #7 (${URL}) にレビューを付けました（レビュー 2 件、inline コメント 3 件）。\n` +
+    '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
+    '返信は gh api repos/HolyGrail/claude-mods/pulls/7/comments/<comment id>/replies -f body=\'...\' で送れます。\n\n' +
+    `### src/b.ts:20 (comment 12)\nエラーを返してください。\n${URL}#discussion_r12\n\n` +
+    `### src/a.ts:12 (comment 11)\nnull を確認してください。\n${URL}#discussion_r11\n\n` +
+    `### src/c.ts:8 (comment 21)\n空の配列を扱ってください。\n${URL}#discussion_r21`,
+  ])
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.detailsArgv[0]?.slice(5)).toEqual(['-f', 'ids[]=PRR_first', '-f', 'ids[]=PRR_second'])
+  expect(w.queryArgv[0]?.join(' ')).not.toContain('comments(first: 100)')
+  expect(w.queryArgv[0]?.join(' ')).not.toContain('originalLine')
+})
+
+test('outdated inline comments use the original line for both GitHub signals', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2, details: [
+      { id: 11, path: 'src/a.ts', line: null, originalLine: 42, body: 'Old line' },
+      { id: 12, path: 'src/b.ts', line: 9, originalLine: 10, outdated: true, body: 'Old diff' },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('### src/a.ts:42 (outdated) (comment 11)')
+  expect(w.prompts[0]).toContain('### src/b.ts:10 (outdated) (comment 12)')
+})
+
+test('a file-level comment has a file heading even when its line is null or it is outdated', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 3, details: [
+      { id: 11, path: 'whole.ts', line: null, subjectType: 'FILE', body: 'Check the whole file' },
+      { id: 12, path: 'old-file.ts', line: null, originalLine: 9, subjectType: 'FILE', outdated: true, body: 'File finding' },
+      { id: 13, path: 'line.ts', line: null, originalLine: 42, subjectType: 'LINE', body: 'Line finding' },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.detailsArgv[0]?.join(' ')).toContain('subjectType')
+  expect(w.prompts[0]).toContain('### whole.ts (file) (comment 11)\nCheck the whole file')
+  expect(w.prompts[0]).toContain('### old-file.ts (file) (comment 12)\nFile finding')
+  expect(w.prompts[0]).toContain('### line.ts:42 (outdated) (comment 13)\nLine finding')
+})
+
+test('review thread replies are neither findings nor newly fetched omitted comments', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1, detailsTotal: 3, details: [
+      { id: 11, path: 'src/a.ts', line: 1, body: 'Codex finding' },
+      { id: 12, path: 'src/a.ts', line: 1, body: 'A rebuttal', replyTo: { id: 'comment-11' } },
+      { id: 13, path: 'src/a.ts', line: 1, body: 'A follow-up', replyTo: { id: 'comment-11' } },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.detailsArgv[0]?.join(' ')).toContain('replyTo { id }')
+  expect(w.prompts[0]).toContain('### src/a.ts:1 (comment 11)\nCodex finding')
+  expect(w.prompts[0]).not.toContain('A rebuttal')
+  expect(w.prompts[0]).not.toContain('A follow-up')
+  expect(w.prompts[0]).not.toContain('残り')
+})
+
+test('a numeric review mark is not resent when GitHub supplies its fullDatabaseId as a string', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: null, fullDatabaseId: '5398198804', at: NOW - MINUTE, comments: 1 }] },
+  })
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(record, { since: LAST_PUSH, head: 'a1', reviews: [5398198804], at: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['5398198804'] })
+})
+
+test('large review ids match their details and retain every digit in headings and records', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [
+      { id: null, fullDatabaseId: '5398198804', at: NOW - 3 * MINUTE, comments: 0, body: 'Body-only finding' },
+      { id: null, fullDatabaseId: '9007199254740993', at: NOW - 2 * MINUTE, comments: 1, details: [
+        { id: 21, path: 'large.ts', line: 7, body: 'Inline finding' },
+      ] },
+      { id: 3, at: NOW - MINUTE, comments: 0, body: 'Legacy review' },
+    ] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.queryArgv[0]?.join(' ')).toContain('id databaseId fullDatabaseId submittedAt')
+  expect(w.detailsArgv[0]?.join(' ')).toContain('databaseId fullDatabaseId url')
+  expect(w.prompts[0]).toContain('### レビュー 5398198804\nBody-only finding')
+  expect(w.prompts[0]).toContain('### large.ts:7 (comment 21)\nInline finding')
+  expect(w.prompts[0]).toContain('### レビュー 3\nLegacy review')
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['5398198804', '9007199254740993', '3'] })
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('inline comment ids use fullDatabaseId without losing large ids or changing review marks', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 3, details: [
+      { id: null, fullDatabaseId: '4170981226', path: 'large.ts', line: 1, body: 'Beyond 32 bits' },
+      { id: 17, fullDatabaseId: '9007199254740993', path: 'precise.ts', line: 2, body: 'Keep every digit' },
+      { id: 19, fullDatabaseId: null, path: 'legacy.ts', line: 3, body: 'Legacy id' },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.detailsArgv[0]?.join(' ')).toContain('databaseId fullDatabaseId path')
+  expect(w.prompts[0]).toContain(`### large.ts:1 (comment 4170981226)\nBeyond 32 bits\n${URL}#discussion_r4170981226`)
+  expect(w.prompts[0]).toContain('### precise.ts:2 (comment 9007199254740993)\nKeep every digit')
+  expect(w.prompts[0]).toContain('### legacy.ts:3 (comment 19)\nLegacy id')
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('inline bodies are trimmed and cut at 4000 characters before the truncation notice', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2, details: [
+      { id: 11, path: 'long.ts', line: 1, body: '  ' + 'x'.repeat(4_000) + 'CUT  ' },
+      { id: 12, path: 'exact.ts', line: 2, body: '\n' + 'y'.repeat(4_000) + '  ' },
+    ] }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('\n' + 'x'.repeat(4_000) + '…（以下省略、全文は URL で）\n')
+  expect(w.prompts[0]).not.toContain('CUT')
+  expect(w.prompts[0]).toContain('\n' + 'y'.repeat(4_000) + '\n')
+})
+
+test('a prompt stays under 30000 characters and counts fetched and unfetched comments left out', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 12, details: Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1, path: `file-${i + 1}.ts`, line: i + 1, body: 'x'.repeat(4_001),
+    })) }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]?.length).toBeLessThanOrEqual(30_000)
+  expect(w.prompts[0]).toContain('### file-7.ts:7 (comment 7)')
+  expect(w.prompts[0]).not.toContain('### file-8.ts')
+  expect(w.prompts[0]?.endsWith(`残り 5 件のコメントは ${URL}/files で確認してください。`)).toBe(true)
+})
+
+test('a review with more than 100 comments links to the comments beyond the details page', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 103 }] } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('### src/file-100.ts:100 (comment 1100)')
+  expect(w.prompts[0]?.endsWith(`残り 3 件のコメントは ${URL}/files で確認してください。`)).toBe(true)
+  expect(w.detailsArgv.length).toBe(1)
+})
+
+for (const withComments of [false, true]) {
+  test(`the prompt cap reports omitted review bodies${withComments ? ' together with unfetched comments' : ''}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const reviews: Review[] = Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1, at: NOW - (11 - i) * MINUTE, comments: 0, body: 'x'.repeat(4_000),
+    }))
+    if (withComments) reviews.unshift({
+      id: 100, at: NOW - 12 * MINUTE, comments: 5,
+      details: [{ id: 1001, path: 'file.ts', line: 1, body: 'x'.repeat(4_000) }],
+    })
+    const w = stubWorld(on, { pull: { reviews } })
+    await $.session.start(START)
+    await clock.settle()
+    const lastBody = withComments ? 6 : 7
+    expect(w.prompts[0]?.length).toBeLessThanOrEqual(30_000)
+    expect(w.prompts[0]).toContain(`### レビュー ${lastBody}\n`)
+    expect(w.prompts[0]).not.toContain(`### レビュー ${lastBody + 1}\n`)
+    expect(w.prompts[0]?.endsWith(`残り ${withComments ? 8 : 3} 件のコメントとレビュー本文は ${URL} で確認してください。`)).toBe(true)
+  })
+}
+
+test('a review without inline comments includes its capped body without details blocks', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 0,
+      body: '<details>\nHidden instructions\n</details>  ' + 'x'.repeat(4_001) + '\n<details open>More boilerplate</details>',
+    }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('### レビュー 1\n' + 'x'.repeat(4_000) + '…（以下省略、全文は URL で）\n')
+  expect(w.prompts[0]).not.toContain('Hidden instructions')
+  expect(w.prompts[0]).not.toContain('More boilerplate')
+})
+
+for (const failure of [
+  { name: 'fails', world: { detailsError: 'error connecting to api.github.com\nMore details' } },
+  { name: 'returns no usable nodes', world: { detailsResponse: '{"data":{"nodes":[null,{}]}}' } },
+  { name: 'returns truncated JSON', world: { detailsResponse: '{"data":' } },
+  { name: 'returns a comment line that throws when formatted', world: { detailsResponse: JSON.stringify({
+    data: { nodes: [{ databaseId: 1, comments: { totalCount: 3, nodes: [
+      { databaseId: 11, path: 'file.ts', line: { toString: null }, body: 'Comment', url: `${URL}#discussion_r11` },
+    ] } }] },
+  }) } },
+]) {
+  test(`a details fetch that ${failure.name} still wakes once and keeps its marks`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 3 }] },
+      ...failure.world,
+    })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts).toEqual([
+      `Codex が PR #7 (${URL}) にレビューを付けました（レビュー 1 件、inline コメント 3 件）。\n` +
+      '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
+      '返信は gh api repos/HolyGrail/claude-mods/pulls/7/comments/<comment id>/replies -f body=\'...\' で送れます。\n' +
+      'コメントは gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.in_reply_to_id == null and ((.pull_request_review_id | tostring) == "1")) | {id, path, line, body}\' で確認してください。',
+    ])
+    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+    await clock.advance(2 * MINUTE)
+    expect(w.prompts.length).toBe(1)
+    expect(w.detailsArgv.length).toBe(1)
+  })
+}
+
+test('the fallback paginates comments and filters to every review reported by the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [
+      { id: 11, fullDatabaseId: '5398198804', at: NOW - 3 * MINUTE, comments: 1 },
+      { id: 12, at: NOW - 2 * MINUTE, comments: 2 },
+      { id: 13, at: LAST_PUSH - MINUTE, comments: 1 },
+      { id: 14, at: NOW - MINUTE, comments: 1, by: 'someone' },
+      { id: 15, at: NOW - MINUTE, comments: 1 },
+    ] },
+    detailsError: 'error connecting to api.github.com',
+  })
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', reviews: [15], at: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('レビュー 2 件、inline コメント 3 件')
+  expect(w.prompts[0]?.split('\n').pop()).toBe(
+    'コメントは gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.in_reply_to_id == null and ((.pull_request_review_id | tostring) == "5398198804" or (.pull_request_review_id | tostring) == "12")) | {id, path, line, body}\' で確認してください。',
+  )
+  await clock.advance(2 * MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('review details wait for the record write and do not hold up later polls', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    sets: (key) => key.startsWith('pr:') ? clock.sleep(5_000) : Promise.resolve(),
+    detailsAnswer: () => clock.sleep(2 * MINUTE),
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.detailsArgv.length).toBe(0)
+  await clock.advance(5_000)
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  w.sets = undefined
+  await clock.advance(MINUTE)
+  expect(w.queries).toBe(2)
+  expect(w.prompts).toEqual([])
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.detailsArgv.length).toBe(1)
+})
+
+test('a push during review details takes back the old head review even if the push finishes before delivery', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { head: 'a1a1a1a0123456789', thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+    detailsAnswer: () => clock.sleep(20_000),
+  })
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  const record = 'pr:' + URL.toLowerCase()
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+
+  await clock.advance(5_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.pull.head = 'b2b2b2b0123456789'
+  await clock.advance(15_000)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: 0 })
+
+  w.detailsAnswer = undefined
+  w.pull.reviews?.push({ id: 2, at: NOW + 30_000, comments: 1 })
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('(comment 2001)')])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['2'], since: NOW + 5_000 })
+})
+
+for (const source of ['resume', 'clear', 'fork'] as const) {
+  test(`a ${source} during review details takes back the old prompt and lets the next watch resend it`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, {
+      pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+      pulls: { 9: {} },
+      detailsAnswer: () => clock.sleep(20_000),
+    })
+    on('classic.SessionStart', () => ({}))
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.detailsArgv.length).toBe(1)
+    const record = 'pr:' + URL.toLowerCase()
+    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+
+    // A resume of the same pull request also changes the conversation that owns this delivery
+    w.branchPr = { url: source === 'resume' ? URL : PR9, state: 'OPEN' }
+    w.sessionId = 'session-c'
+    await $.classic.SessionStart({ source })
+    await clock.advance(20_000)
+    expect(w.prompts).toEqual([])
+    expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: 0 })
+
+    w.detailsAnswer = undefined
+    await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
+    await clock.settle()
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(1)
+  })
+}
+
+test('unrelayed reviews precede a later thumbs-up and carry its approval in one prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('レビュー 1 件、inline コメント 1 件')
+  expect(w.prompts[0]?.endsWith('なお、このレビューの後（20:59）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。')).toBe(true)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  await clock.advance(2 * MINUTE)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('an approval at the newest review time is marked without an approval note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).not.toContain('なお、このレビューの後')
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - MINUTE })
 })
 
 test('the usage limit shows a toast and wakes nobody', async ($, on) => {
@@ -287,7 +748,9 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'PR #7 がマージされました' })).toBeDefined()
   await ui.press({ key: 'cleanup' })
-  expect(w.prompts).toEqual([expect.stringContaining('/dev cleanup')])
+  expect(w.prompts).toEqual([
+    `PR ${URL} がマージされました。この worktree とローカルブランチを片付けてください。消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。`,
+  ])
   expect(await ui.find({ key: 'cleanup' })).toBeUndefined()
 })
 
@@ -407,17 +870,19 @@ test('the watch tool reports what is watched and watches the pull request it is 
   expect(w.queries).toBe(1)
 })
 
-test('a review that comes after an approval is relayed on its own', async ($, on) => {
+test('a review supersedes an earlier approval without another approval prompt', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, {
     pull: { thumbsUpAt: NOW - 10 * MINUTE, reviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 3 }] },
   })
   await $.session.start(START)
   await clock.settle()
-  expect(w.prompts).toEqual([expect.stringContaining('approved にしました')])
+  expect(w.prompts).toEqual([expect.stringContaining('inline コメント 3 件')])
+  expect(w.prompts[0]).not.toContain('なお、このレビューの後')
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - 10 * MINUTE, reviews: ['1'] })
 
   await clock.advance(MINUTE)
-  expect(w.prompts).toEqual([expect.stringContaining('approved にしました'), expect.stringContaining('inline コメント 3 件')])
+  expect(w.prompts.length).toBe(1)
 })
 
 test('a reopened pull request is reported again when it closes', async ($, on) => {
@@ -468,6 +933,48 @@ test('a prompt that does not enter is sent again on the next poll', async ($, on
   expect(w.prompts.length).toBe(2)
 })
 
+for (const failure of ['dropped', 'rejected']) {
+  test(`a ${failure} review prompt takes back its reviews and its approval mark`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    let refuses = true
+    const w = stubWorld(on, {
+      pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+      dropPrompt: failure === 'dropped',
+      turnStarts: async () => {
+        if (refuses && failure === 'rejected') throw new Error('the queue is closed')
+      },
+    })
+    const record = 'pr:' + URL.toLowerCase()
+    w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: NOW - 3 * MINUTE, reviews: [], at: NOW - MINUTE })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts.length).toBe(1)
+    expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: NOW - 3 * MINUTE })
+
+    refuses = false
+    w.dropPrompt = false
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(2)
+    expect(w.prompts[1]).toBe(w.prompts[0])
+    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+    await clock.advance(MINUTE)
+    expect(w.prompts.length).toBe(2)
+  })
+}
+
+test('a dropped review takes back its mark even when an approval was already recorded before delivery', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+    dropPrompt: true,
+  })
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: NOW - MINUTE, reviews: [], at: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: NOW - MINUTE })
+})
+
 test('a pull request found after a push takes that push as its baseline', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { branchPr: null })
@@ -500,11 +1007,11 @@ test('the same pull request spelled in another case is one pull request', async 
   expect([...w.store.keys()].filter((key) => key.startsWith('pr:'))).toEqual(['pr:' + URL.toLowerCase()])
 })
 
-test('taking back a prompt that did not enter leaves what a later approval settled', async ($, on) => {
+test('taking back a review keeps the newer approval and sends the review again', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   let release = () => {}
   const w = stubWorld(on, {
-    pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
     // The review prompt waits for its turn, and then does not enter
     turnStarts: () =>
       w.prompts.length === 1
@@ -523,7 +1030,10 @@ test('taking back a prompt that did not enter leaves what a later approval settl
   expect(w.prompts[1]).toContain('approved にしました')
   release()
   await clock.advance(MINUTE)
-  expect(w.prompts.length).toBe(2)
+  expect(w.prompts.length).toBe(3)
+  expect(w.prompts[2]).toContain('レビュー 1 件')
+  expect(w.prompts[2]).not.toContain('なお、このレビューの後')
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW + 30_000 })
 })
 
 test('a prompt taken back while the next poll waits on GitHub is sent again', async ($, on) => {
@@ -579,7 +1089,7 @@ test('the cleanup button comes back when its prompt does not enter', async ($, o
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   await ui.press({ key: 'cleanup' })
   await clock.settle()
-  expect(w.prompts).toEqual([expect.stringContaining('/dev cleanup')])
+  expect(w.prompts).toEqual([expect.stringContaining('未コミットの変更や push していないコミットが残っていないかを確かめ')])
   expect(await ui.find({ key: 'cleanup' })).toBeDefined()
 })
 
