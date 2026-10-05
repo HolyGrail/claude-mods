@@ -519,7 +519,7 @@ test('a session left idle past the longest window stops showing its own reading'
   let redrawn = () => {}
   on('ui.invalidate', () => {
     redrawn()
-    return {}
+    return { value: undefined }
   })
   stubSession(on, new Map(), [])
   on('session.measure', ($, e) => ({ changed: e.changed }))
@@ -573,3 +573,161 @@ test('compaction keeps the same key', async ($, on) => {
   expect(saved.get(OWN)).toEqual({ at: NOW, limits: LIMITS })
 })
 
+
+const WEEKLY_RESET = NOW + 4 * 24 * HOUR + 18 * HOUR
+
+// The usage endpoint's answer, cut down to its list of limits
+function usageBody(fableResetsAt: number) {
+  return JSON.stringify({
+    limits: [
+      { kind: 'session', group: 'session', percent: 62, resets_at: new Date(NOW + HOUR).toISOString(), scope: null },
+      { kind: 'weekly_all', group: 'weekly', percent: 5, resets_at: new Date(WEEKLY_RESET).toISOString(), scope: null },
+      {
+        kind: 'weekly_scoped',
+        group: 'weekly',
+        percent: 3,
+        // The endpoint writes microseconds and an offset
+        resets_at: new Date(fableResetsAt).toISOString().replace('Z', '712+00:00'),
+        scope: { model: { id: null, display_name: 'Fable' }, surface: null },
+      },
+    ],
+  })
+}
+
+// Stubs the login and the usage endpoint, and counts the requests made to it
+function stubEndpoint(on: On, answer: () => { status: number; text: string }, login: () => { handle: string; kind: 'bearer' } | null = () => ({ handle: 'h', kind: 'bearer' })) {
+  const requests: { url: string; auth?: string }[] = []
+  on('session.authorize', () => ({ value: login() }))
+  on('http.fetch', ($, e) => {
+    requests.push({ url: e.url, auth: e.init?.auth })
+    const { status, text } = answer()
+    return { value: { status, ok: status >= 200 && status < 300, headers: {}, text } }
+  })
+  return requests
+}
+
+test('shows the weekly limit of a model from the usage endpoint and shares it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved)
+  const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
+  await $.session.start(START)
+  // session.start does not wait on the endpoint
+  await clock.settle()
+
+  expect(requests).toEqual([{ url: 'https://api.anthropic.com/api/oauth/usage', auth: 'h' }])
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  // A fourth meter narrows the bars, and no meter gives up width, so the line wraps by meter
+  const meter = await ui.find({ key: 'meter-Fable' })
+  expect(meter).toMatchObject({ props: { flexShrink: 0 } })
+  expect((meter?.children ?? [])[1]).toMatchObject({ type: 'Svg', props: { width: 72 } })
+  // It resets with the weekly limit, whose meter already counts down
+  expect(await ui.find({ type: 'Text', text: '3%' })).toMatchObject({ props: { color: 'success' } })
+  expect(await ui.find({ type: 'Text', text: '5% 4d18h' })).toBeDefined()
+  expect(saved.get('scoped')).toEqual({
+    at: NOW,
+    limits: [{ kind: 'weekly_scoped', label: 'Fable', percentUsed: 3, resetsAt: new Date(WEEKLY_RESET).toISOString() }],
+  })
+})
+
+test('a model limit that resets apart from the weekly limit counts down itself', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubSession(on, new Map())
+  stubEndpoint(on, () => ({ status: 200, text: usageBody(NOW + 2 * 24 * HOUR) }))
+  await $.session.start(START)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '3% 2d0h' })).toBeDefined()
+})
+
+test('sessions share one reading of the endpoint and ask again after five minutes', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Another session read the endpoint just now
+  const saved = new Map<string, unknown>([['scoped', { at: NOW, limits: [{ kind: 'weekly_scoped', label: 'Fable', percentUsed: 9 }] }]])
+  stubSession(on, saved)
+  const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
+  await $.session.start(START)
+  await clock.settle()
+
+  let ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '9%' })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(4 * MINUTE)
+  expect(requests).toHaveLength(0)
+  await clock.advance(MINUTE)
+  expect(requests).toHaveLength(1)
+  ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '3%' })).toBeDefined()
+})
+
+test('with no login or no usable answer, draws no model meter and waits before asking again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved = new Map<string, unknown>()
+  stubSession(on, saved)
+  let login: { handle: string; kind: 'bearer' } | null = null
+  const requests = stubEndpoint(on, () => ({ status: 200, text: '{"five_hour":null}' }), () => login)
+  await $.session.start(START)
+  await clock.settle()
+  // An API key or a gateway: nothing to ask with
+  expect(requests).toHaveLength(0)
+
+  login = { handle: 'h', kind: 'bearer' }
+  await clock.advance(5 * MINUTE)
+  expect(requests).toHaveLength(1)
+  // The answer held no list of limits, so the next ticks leave the endpoint alone
+  await clock.advance(4 * MINUTE)
+  expect(requests).toHaveLength(1)
+  expect(saved.has('scoped')).toBe(false)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'Fable' })).toBeUndefined()
+})
+
+test('the terminal keeps the bars with a model meter from 101 columns', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubSession(on, new Map())
+  stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
+  await $.session.start(START)
+  await clock.settle()
+
+  // Four meters with bars take 99 columns, and the band keeps two free
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 100 } })
+  expect(await ui.find({ type: 'Text', text: /░/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Fable' })).toBeDefined()
+  await ui.unmount()
+
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 101 } })
+  expect(await ui.find({ type: 'Text', text: /░/ })).toBeDefined()
+})
+
+test('a session leaves the endpoint alone for five minutes after another asked it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Another session asked four minutes ago, and left no answer
+  stubSession(on, new Map<string, unknown>([['scoped-tried', NOW - 4 * MINUTE]]))
+  const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
+  await $.session.start(START)
+  await clock.settle()
+  expect(requests).toHaveLength(0)
+
+  // The five minutes run from that request, not from this session's start
+  await clock.advance(MINUTE)
+  expect(requests).toHaveLength(1)
+})
+
+test('a model meter goes at its reset while the endpoint gives no new answer', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const limit = { kind: 'weekly_scoped', label: 'Fable', percentUsed: 40, resetsAt: new Date(NOW + 30 * MINUTE).toISOString() }
+  stubSession(on, new Map<string, unknown>([['scoped', { at: NOW, limits: [limit] }]]))
+  stubEndpoint(on, () => ({ status: 500, text: '' }))
+  await $.session.start(START)
+
+  let ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '40% 30m' })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(30 * MINUTE)
+  ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  // Not 0%: the usage since the reset is unknown
+  expect(await ui.find({ type: 'Text', text: 'Fable' })).toBeUndefined()
+})
