@@ -12,8 +12,10 @@ let ticker = null
 let ownKey = null
 // The per-model weekly limits as last read, by this session or another: { at, limits }
 let scoped = { at: 0, limits: [] }
-// When this session last asked the usage endpoint, whatever came of it
+// When this session last set out to ask the usage endpoint, whatever came of it
 let scopedTriedAt = 0
+// Counts session.start, so an answer to a poll an earlier start began is left unused
+let scopedGeneration = 0
 
 // Rate limits are per account, so sessions share readings through $.store, and each shows the
 // newest one. $.store has no atomic update, so each session writes only its own key, and no
@@ -34,6 +36,10 @@ const TICK_MS = 60_000
 // come from the endpoint /usage reads. Every session shares one key: each write is a whole fresh
 // reading, so one landing over another loses nothing.
 const SCOPED_KEY = 'scoped'
+// When any session last asked the endpoint, so that others starting or ticking meanwhile wait,
+// and a failing endpoint is asked once a poll by the machine, not once by each session. Two
+// sessions that read it in the same moment may still both ask: $.store has no atomic update.
+const SCOPED_TRIED_KEY = 'scoped-tried'
 const SCOPED_URL = 'https://api.anthropic.com/api/oauth/usage'
 // How old the shared reading gets before a session asks the endpoint again, and how long a
 // session waits after an attempt that brought nothing
@@ -82,6 +88,7 @@ export function register(on) {
     measuredAt = 0
     scoped = { at: 0, limits: [] }
     scopedTriedAt = 0
+    scopedGeneration += 1
     ownKey = KEY_PREFIX + (await $.session.id())
     const usage = await $.session.usage()
     context = usage.context
@@ -143,6 +150,9 @@ export function register(on) {
     }
     const weekly = meters.find((m) => m.kind === 'seven_day')
     for (const limit of scoped.limits) {
+      // Only the endpoint refreshes this reading, and it may be failing: past the reset, the
+      // meter goes until an answer comes, where 0% could stand for days over real usage
+      if (limit.resetsAt != null && Date.parse(limit.resetsAt) <= now) continue
       const m = readLimit(limit, now)
       // The weekly meter beside it already counts down to the same reset
       if (weekly?.resetsAt != null && m.resetsAt != null && Math.abs(m.resetsAt - weekly.resetsAt) < SAME_RESET_MS) {
@@ -256,12 +266,16 @@ async function pollScoped($) {
   const now = await $.clock.now()
   if (now - scoped.at < SCOPED_POLL_MS || now - scopedTriedAt < SCOPED_POLL_MS) return
   scopedTriedAt = now
+  const generation = scopedGeneration
   try {
     const auth = await $.session.authorize()
     if (!auth) return
+    const tried = await $.store.get(SCOPED_TRIED_KEY)
+    if (typeof tried === 'number' && tried <= now && now - tried < SCOPED_POLL_MS) return
+    await $.store.set(SCOPED_TRIED_KEY, now)
     const res = await $.http.fetch(SCOPED_URL, { auth: auth.handle })
     const limits = res.ok ? scopedLimits(JSON.parse(res.text)) : null
-    if (!limits) return
+    if (!limits || generation !== scopedGeneration) return
     scoped = { at: await $.clock.now(), limits }
     await $.store.set(SCOPED_KEY, scoped)
   } catch {

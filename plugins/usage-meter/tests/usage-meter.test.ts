@@ -606,19 +606,14 @@ function stubEndpoint(on: On, answer: () => { status: number; text: string }, lo
   return requests
 }
 
-// The tsconfig carries no DOM or Node types
-declare function setTimeout(run: (value?: unknown) => void, ms: number): unknown
-
-// session.start does not wait on the endpoint, so the test lets that read finish
-const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
-
 test('shows the weekly limit of a model from the usage endpoint and shares it', async ($, on) => {
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
   const saved = new Map<string, unknown>()
   stubSession(on, saved)
   const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
   await $.session.start(START)
-  await settle()
+  // session.start does not wait on the endpoint
+  await clock.settle()
 
   expect(requests).toEqual([{ url: 'https://api.anthropic.com/api/oauth/usage', auth: 'h' }])
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
@@ -636,11 +631,11 @@ test('shows the weekly limit of a model from the usage endpoint and shares it', 
 })
 
 test('a model limit that resets apart from the weekly limit counts down itself', async ($, on) => {
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
   stubSession(on, new Map())
   stubEndpoint(on, () => ({ status: 200, text: usageBody(NOW + 2 * 24 * HOUR) }))
   await $.session.start(START)
-  await settle()
+  await clock.settle()
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '3% 2d0h' })).toBeDefined()
@@ -653,7 +648,7 @@ test('sessions share one reading of the endpoint and ask again after five minute
   stubSession(on, saved)
   const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
   await $.session.start(START)
-  await settle()
+  await clock.settle()
 
   let ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '9%' })).toBeDefined()
@@ -674,7 +669,7 @@ test('with no login or no usable answer, draws no model meter and waits before a
   let login: { handle: string; kind: 'bearer' } | null = null
   const requests = stubEndpoint(on, () => ({ status: 200, text: '{"five_hour":null}' }), () => login)
   await $.session.start(START)
-  await settle()
+  await clock.settle()
   // An API key or a gateway: nothing to ask with
   expect(requests).toHaveLength(0)
 
@@ -690,11 +685,11 @@ test('with no login or no usable answer, draws no model meter and waits before a
 })
 
 test('the terminal keeps the bars with a model meter from 101 columns', async ($, on) => {
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
   stubSession(on, new Map())
   stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
   await $.session.start(START)
-  await settle()
+  await clock.settle()
 
   // Four meters with bars take 99 columns, and the band keeps two free
   let ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 100 } })
@@ -704,4 +699,34 @@ test('the terminal keeps the bars with a model meter from 101 columns', async ($
 
   ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 101 } })
   expect(await ui.find({ type: 'Text', text: /░/ })).toBeDefined()
+})
+
+test('a session leaves the endpoint alone for five minutes after another asked it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Another session asked just now, and has no answer yet
+  stubSession(on, new Map<string, unknown>([['scoped-tried', NOW]]))
+  const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
+  await $.session.start(START)
+  await clock.settle()
+  expect(requests).toHaveLength(0)
+
+  await clock.advance(5 * MINUTE)
+  expect(requests).toHaveLength(1)
+})
+
+test('a model meter goes at its reset while the endpoint gives no new answer', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const limit = { kind: 'weekly_scoped', label: 'Fable', percentUsed: 40, resetsAt: new Date(NOW + 30 * MINUTE).toISOString() }
+  stubSession(on, new Map<string, unknown>([['scoped', { at: NOW, limits: [limit] }]]))
+  stubEndpoint(on, () => ({ status: 500, text: '' }))
+  await $.session.start(START)
+
+  let ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '40% 30m' })).toBeDefined()
+  await ui.unmount()
+
+  await clock.advance(30 * MINUTE)
+  ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  // Not 0%: the usage since the reset is unknown
+  expect(await ui.find({ type: 'Text', text: 'Fable' })).toBeUndefined()
 })
