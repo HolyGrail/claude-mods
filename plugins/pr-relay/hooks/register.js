@@ -70,7 +70,7 @@ const MAX_PAGES = 10
 const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int!, $before: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
-const QUERY = queryOf(`state headRefOid headRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
+const QUERY = queryOf(`state headRefOid headRefName baseRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 // Review bodies stay out of the per-minute query so gh's output does not get cut
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
@@ -855,6 +855,9 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, s
       return [
         {
           toast: `PR #${pr.number} が${ENDED[state]}されました`,
+          // Only a merge moves the base branch under the other sessions' work
+          notice: state === 'MERGED' ? `${baseName(data)} advanced (#${pr.number}). Rebase before the next push.` : null,
+          pr,
           undo: (r) => {
             if (r.ended === state) r.ended = null
           },
@@ -1230,8 +1233,11 @@ function relay($, pr, signals, record) {
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
-  if (toast) return $.ui.toast(toast)
+function deliver($, key, { text, toast, notice, pr, reviews, approvedAt, undo }) {
+  if (toast) {
+    if (notice) postNotice($, pr, notice)
+    return $.ui.toast(toast)
+  }
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
@@ -1244,6 +1250,31 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
     .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
+}
+
+// The branch a pull request merged into, as a notice may start with: /notice reads a leading
+// --all as its option, and a branch may be named that
+function baseName(data) {
+  const base = data.baseRefName || 'main'
+  return base.startsWith('-') ? `Branch ${base}` : base
+}
+
+// Tells the other sessions in the repository through notice-board's /notice, without waiting: the
+// command runs only once the session is idle. /notice posts to the session's own repository, so a
+// pull request of another one (watched by URL) posts nothing; nor does a session without
+// notice-board, where the command is unknown and the call rejects.
+function postNotice($, pr, text) {
+  $.session
+    .repo()
+    .then((repo) => (inRepo(repo, pr) ? $.command.run({ command: 'notice', args: text }) : null))
+    .catch(() => {})
+}
+
+// Whether the origin remote is the pull request's repository on GitHub, spelled as a URL or
+// scp-style (ssh.github.com is its SSH over port 443), in whatever case
+function inRepo(repo, pr) {
+  const path = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+\/|[:/])\/*([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(repo?.remote?.trim() ?? '')
+  return path != null && `${path[1]}/${path[2]}`.toLowerCase() === `${pr.owner}/${pr.name}`.toLowerCase()
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll
