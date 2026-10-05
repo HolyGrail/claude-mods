@@ -271,7 +271,11 @@ async function pollScoped($) {
     const auth = await $.session.authorize()
     if (!auth) return
     const tried = await $.store.get(SCOPED_TRIED_KEY)
-    if (typeof tried === 'number' && tried <= now && now - tried < SCOPED_POLL_MS) return
+    if (typeof tried === 'number' && tried <= now && now - tried < SCOPED_POLL_MS) {
+      // Wait out the rest of that session's five minutes, not five of this one's own
+      scopedTriedAt = tried
+      return
+    }
     await $.store.set(SCOPED_TRIED_KEY, now)
     const res = await $.http.fetch(SCOPED_URL, { auth: auth.handle })
     const limits = res.ok ? scopedLimits(JSON.parse(res.text)) : null

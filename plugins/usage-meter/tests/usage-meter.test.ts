@@ -703,14 +703,15 @@ test('the terminal keeps the bars with a model meter from 101 columns', async ($
 
 test('a session leaves the endpoint alone for five minutes after another asked it', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  // Another session asked just now, and has no answer yet
-  stubSession(on, new Map<string, unknown>([['scoped-tried', NOW]]))
+  // Another session asked four minutes ago, and left no answer
+  stubSession(on, new Map<string, unknown>([['scoped-tried', NOW - 4 * MINUTE]]))
   const requests = stubEndpoint(on, () => ({ status: 200, text: usageBody(WEEKLY_RESET) }))
   await $.session.start(START)
   await clock.settle()
   expect(requests).toHaveLength(0)
 
-  await clock.advance(5 * MINUTE)
+  // The five minutes run from that request, not from this session's start
+  await clock.advance(MINUTE)
   expect(requests).toHaveLength(1)
 })
 
