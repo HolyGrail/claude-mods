@@ -2069,6 +2069,17 @@ test('a merge notice is posted from an origin that uses GitHub\'s SSH over port 
   expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
 })
 
+test('a base branch named like an option of /notice is not read as one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull = { state: 'MERGED', base: '--all' }
+  await clock.advance(MINUTE)
+  expect(w.posts).toEqual(['/notice Branch --all advanced (#7). Rebase before the next push.'])
+})
+
 test('a pull request closed without a merge posts no notice', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)

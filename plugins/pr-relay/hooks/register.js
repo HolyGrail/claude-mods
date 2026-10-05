@@ -856,7 +856,7 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, s
         {
           toast: `PR #${pr.number} が${ENDED[state]}されました`,
           // Only a merge moves the base branch under the other sessions' work
-          notice: state === 'MERGED' ? `${data.baseRefName || 'main'} advanced (#${pr.number}). Rebase before the next push.` : null,
+          notice: state === 'MERGED' ? `${baseName(data)} advanced (#${pr.number}). Rebase before the next push.` : null,
           pr,
           undo: (r) => {
             if (r.ended === state) r.ended = null
@@ -1250,6 +1250,13 @@ function deliver($, key, { text, toast, notice, pr, reviews, approvedAt, undo })
     .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
+}
+
+// The branch a pull request merged into, as a notice may start with: /notice reads a leading
+// --all as its option, and a branch may be named that
+function baseName(data) {
+  const base = data.baseRefName || 'main'
+  return base.startsWith('-') ? `Branch ${base}` : base
 }
 
 // Tells the other sessions in the repository through notice-board's /notice, without waiting: the
