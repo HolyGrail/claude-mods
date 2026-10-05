@@ -1,6 +1,6 @@
 {
   "name": "pr-relay",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Watches the session's pull request and wakes the session when it is merged or Codex reviews it",
   "author": { "name": "HolyGrail" }
 }

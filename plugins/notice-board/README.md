@@ -94,7 +94,7 @@ origin がないリポジトリと、origin がローカルのパスや `file://
 await $.command.run({ command: 'notice', args: 'main advanced (#12). Rebase before the next push.' })
 ```
 
-pr-relay（#4）がマージを検知したときに「main が進んだ」と出すのは、この形を想定しています。
+pr-relay は、監視中の PR のマージを検知したときに、この形で「main が進んだ」と出します。
 文面には、次の push の前に rebase するよう書くことを勧めます。
 作業の途中で rebase すると、コンフリクトの解消が実装の変更と混ざるからです。
 `$.command.run` はセッションが待機中になってから実行されるので、投稿は数分遅れることがあります。
