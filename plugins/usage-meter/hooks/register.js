@@ -1,4 +1,5 @@
-// Shows context, 5-hour limit and weekly limit usage in the band above the prompt.
+// Shows context, 5-hour limit, weekly limit and per-model weekly limit usage in the band above
+// the prompt.
 
 // The latest figures this session has, from $.session.usage() or session.measure
 let context = null
@@ -9,6 +10,10 @@ let measuredAt = 0
 let ticker = null
 // This session's own key in the store
 let ownKey = null
+// The per-model weekly limits as last read, by this session or another: { at, limits }
+let scoped = { at: 0, limits: [] }
+// When this session last asked the usage endpoint, whatever came of it
+let scopedTriedAt = 0
 
 // Rate limits are per account, so sessions share readings through $.store, and each shows the
 // newest one. $.store has no atomic update, so each session writes only its own key, and no
@@ -25,11 +30,24 @@ const FINAL_REASONS = ['prompt_input_exit', 'other']
 // How often to pick up other sessions' readings and refresh the countdowns and time markers
 const TICK_MS = 60_000
 
+// The per-model weekly limits (Fable's), which $.session.usage() and session.measure leave out,
+// come from the endpoint /usage reads. Every session shares one key: each write is a whole fresh
+// reading, so one landing over another loses nothing.
+const SCOPED_KEY = 'scoped'
+const SCOPED_URL = 'https://api.anthropic.com/api/oauth/usage'
+// How old the shared reading gets before a session asks the endpoint again, and how long a
+// session waits after an attempt that brought nothing
+const SCOPED_POLL_MS = 5 * 60_000
+// A per-model limit that resets within this long of the weekly limit leaves its countdown out
+const SAME_RESET_MS = 60_000
+
 const HOUR_MS = 3_600_000
 const WINDOWS = {
   // showsClock adds the reset time of day, in JST
   five_hour: { label: '5h', ms: 5 * HOUR_MS, showsClock: true },
   seven_day: { label: '7d', ms: 7 * 24 * HOUR_MS },
+  // Labeled with the model's name
+  weekly_scoped: { ms: 7 * 24 * HOUR_MS },
   spend_limit: { label: '$' },
 }
 
@@ -49,6 +67,9 @@ const BAR_CELLS = 10
 const METER_GAP = 3
 const BAND_RESERVED_COLUMNS = 2
 const SVG_BAR = { width: 96, height: 10 }
+// With more meters than this, the Desktop app's bars narrow so the line still fits its band
+const SVG_WIDE_MAX_METERS = 3
+const SVG_NARROW_WIDTH = 72
 const SVG_COLORS = { success: '#4caf50', warning: '#e0a526', error: '#e5534b', track: 'rgba(128,128,128,0.3)', marker: '#5b9bff' }
 // The terminal draws the time marker in this color
 const MARKER_COLOR = 'cyan'
@@ -59,14 +80,21 @@ export function register(on) {
     ticker?.cancel()
     rateLimits = []
     measuredAt = 0
+    scoped = { at: 0, limits: [] }
+    scopedTriedAt = 0
     ownKey = KEY_PREFIX + (await $.session.id())
     const usage = await $.session.usage()
     context = usage.context
     if (usage.rateLimits.length > 0) await publishSnapshot($, usage.rateLimits)
     // Also clears keys ended sessions left, which short runs that never tick would not
     await refresh($)
+    await adoptScoped($)
+    // Not awaited: the session does not wait on the network to start
+    void pollScoped($).then(() => $.ui.invalidate('ui.render'))
     ticker = $.clock.every(TICK_MS, async () => {
       await refresh($)
+      await adoptScoped($)
+      await pollScoped($)
       $.ui.invalidate('ui.render')
     })
     $.ui.invalidate('ui.render')
@@ -113,13 +141,26 @@ export function register(on) {
     for (const limit of rateLimits) {
       meters.push(readLimit(limit, now))
     }
+    const weekly = meters.find((m) => m.kind === 'seven_day')
+    for (const limit of scoped.limits) {
+      const m = readLimit(limit, now)
+      // The weekly meter beside it already counts down to the same reset
+      if (weekly?.resetsAt != null && m.resetsAt != null && Math.abs(m.resetsAt - weekly.resetsAt) < SAME_RESET_MS) {
+        m.resetsAt = null
+      }
+      meters.push(m)
+    }
     for (const m of meters) m.value = valueText(m, now)
     const gauge = e.surface === 'desktop' ? 'svg' : barsFit(meters, e.props.bodyColumns ?? 0) ? 'text' : 'none'
 
+    const barWidth = meters.length > SVG_WIDE_MAX_METERS ? SVG_NARROW_WIDTH : SVG_BAR.width
     const line = elements.Box({
       flexDirection: 'row',
       columnGap: METER_GAP,
-      children: meters.map((m) => meter(elements, gauge, m)),
+      // In a narrow Desktop window a whole meter moves to the next row, rather than its text
+      // breaking or running off the band
+      ...(gauge === 'svg' && { flexWrap: 'wrap' }),
+      children: meters.map((m) => meter(elements, gauge, m, barWidth)),
     })
     // Keep what the mods after this one draw in the band
     const rest = await next(e)
@@ -200,20 +241,67 @@ async function scan($) {
   return { entries, newest }
 }
 
+// Takes the per-model reading the sessions share, unless this session's own is newer, and drops
+// one too old to say anything current
+async function adoptScoped($) {
+  const shared = await $.store.get(SCOPED_KEY)
+  if (isReading(shared) && shared.at >= scoped.at) scoped = shared
+  if (scoped.at < (await $.clock.now()) - STALE_MS) scoped = { at: 0, limits: [] }
+}
+
+// Asks the usage endpoint once the shared reading is due, and shares what it answers. A session
+// with no first-party login, a refused request or an answer in another shape leaves the reading
+// as it was.
+async function pollScoped($) {
+  const now = await $.clock.now()
+  if (now - scoped.at < SCOPED_POLL_MS || now - scopedTriedAt < SCOPED_POLL_MS) return
+  scopedTriedAt = now
+  try {
+    const auth = await $.session.authorize()
+    if (!auth) return
+    const res = await $.http.fetch(SCOPED_URL, { auth: auth.handle })
+    const limits = res.ok ? scopedLimits(JSON.parse(res.text)) : null
+    if (!limits) return
+    scoped = { at: await $.clock.now(), limits }
+    await $.store.set(SCOPED_KEY, scoped)
+  } catch {
+    // The next attempt is a poll away
+  }
+}
+
+// The weekly limits the answer scopes to a model, as limits readLimit takes: an empty list for an
+// account with none, null when the answer has no list of limits at all
+function scopedLimits(usage) {
+  if (!Array.isArray(usage?.limits)) return null
+  const limits = []
+  for (const limit of usage.limits) {
+    const label = limit?.scope?.model?.display_name
+    if (limit?.kind !== 'weekly_scoped' || typeof label !== 'string' || typeof limit.percent !== 'number') continue
+    const resetsAtMs = typeof limit.resets_at === 'string' ? Date.parse(limit.resets_at) : NaN
+    limits.push({
+      kind: 'weekly_scoped',
+      label,
+      percentUsed: limit.percent,
+      ...(Number.isFinite(resetsAtMs) && { resetsAt: new Date(resetsAtMs).toISOString() }),
+    })
+  }
+  return limits
+}
+
 function isReading(value) {
   return value != null && typeof value.at === 'number' && Array.isArray(value.limits)
 }
 
 function readLimit(limit, now) {
   const window = WINDOWS[limit.kind]
-  const label = window?.label ?? limit.kind
+  const label = limit.label ?? window?.label ?? limit.kind
   const resetsAtMs = limit.resetsAt == null ? null : Date.parse(limit.resetsAt)
   // A window that has reset since the last reading starts again from zero
   if (resetsAtMs != null && resetsAtMs <= now) {
-    return { label, used: 0, elapsed: window?.ms ? 0 : null, resetsAt: null }
+    return { kind: limit.kind, label, used: 0, elapsed: window?.ms ? 0 : null, resetsAt: null }
   }
   const elapsed = window?.ms && resetsAtMs != null ? clamp(100 - ((resetsAtMs - now) / window.ms) * 100) : null
-  return { label, used: limit.percentUsed, elapsed, resetsAt: resetsAtMs, showsClock: window?.showsClock === true }
+  return { kind: limit.kind, label, used: limit.percentUsed, elapsed, resetsAt: resetsAtMs, showsClock: window?.showsClock === true }
 }
 
 // Green, yellow or red by how far usage runs ahead of the time gone in its window
@@ -239,7 +327,7 @@ function barsFit(meters, columns) {
   return width + METER_GAP * (meters.length - 1) <= columns - BAND_RESERVED_COLUMNS
 }
 
-function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, value }) {
+function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, value }, barWidth) {
   const known = typeof used === 'number'
   const status = known ? statusOf(used, elapsed) : null
   const style = known ? { color: status } : { dimColor: true }
@@ -248,9 +336,9 @@ function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, value }) {
   if (gauge === 'svg') {
     children.push(
       Svg({
-        source: svgBar(known ? used : 0, elapsed, status),
+        source: svgBar(known ? used : 0, elapsed, status, barWidth),
         alt: label + ' ' + value + (elapsed == null ? '' : ', ' + Math.round(elapsed) + '% of the window gone'),
-        width: SVG_BAR.width,
+        width: barWidth,
         height: SVG_BAR.height,
       }),
     )
@@ -258,7 +346,14 @@ function meter({ Box, Text, Svg }, gauge, { label, used, elapsed, value }) {
     children.push(...textBar(Text, known ? used : 0, elapsed, status))
   }
   children.push(Text({ ...style, children: [value] }))
-  return Box({ key: 'meter-' + label, flexDirection: 'row', columnGap: 1, alignItems: 'center', children })
+  return Box({
+    key: 'meter-' + label,
+    flexDirection: 'row',
+    columnGap: 1,
+    alignItems: 'center',
+    ...(gauge === 'svg' && { flexShrink: 0 }),
+    children,
+  })
 }
 
 // The bar as runs of cells: used cells in the status color, the rest dim, and the time marker
@@ -284,8 +379,8 @@ function textBar(Text, used, elapsed, status) {
   return [Text({ children: runs.map((run) => Text({ ...run.style, children: [run.text] })) })]
 }
 
-function svgBar(used, elapsed, status) {
-  const { width, height } = SVG_BAR
+function svgBar(used, elapsed, status, width) {
+  const { height } = SVG_BAR
   const r = height / 2
   const fill = Math.round((clamp(used) / 100) * width)
   const parts = [

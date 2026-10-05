@@ -7,7 +7,7 @@ Claude Code の mod 集です。
 
 | mod | 内容 |
 | --- | --- |
-| [usage-meter](plugins/usage-meter/README.md) | プロンプト入力欄の上に、コンテキストと 5 時間制限・週間制限の使用率を常時表示する |
+| [usage-meter](plugins/usage-meter/README.md) | プロンプト入力欄の上に、コンテキストと 5 時間制限・週間制限・モデル別の週間制限（Fable など）の使用率を常時表示する |
 | [notice-board](plugins/notice-board/README.md) | 同じリポジトリのセッション全体にお知らせを出し、各セッションの帯とモデルに届ける |
 | [pr-relay](plugins/pr-relay/README.md) | セッションの PR を監視し、マージされたときと Codex がレビューを付けたときだけセッションを起こす |
 | [zsh-safe](plugins/zsh-safe/README.md) | bash の書き方で書かれた Bash コマンドを、macOS の zsh でもそのまま通す |

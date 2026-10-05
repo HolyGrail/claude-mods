@@ -8,7 +8,7 @@
     {
       "name": "usage-meter",
       "source": "./plugins/usage-meter",
-      "description": "Shows context, 5-hour and weekly limit usage above the prompt"
+      "description": "Shows context, 5-hour, weekly and per-model weekly limit usage above the prompt"
     },
     {
       "name": "notice-board",
