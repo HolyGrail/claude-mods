@@ -2058,6 +2058,17 @@ test('a merge notice names the branch the pull request merged into', async ($, o
   expect(w.posts).toEqual(['/notice release/1.x advanced (#7). Rebase before the next push.'])
 })
 
+test('a merge notice is posted from an origin that uses GitHub\'s SSH over port 443', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { remote: 'ssh://git@ssh.github.com:443/HolyGrail/claude-mods.git' })
+  await $.session.start(START)
+  await clock.settle()
+
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+  expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
+})
+
 test('a pull request closed without a merge posts no notice', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)

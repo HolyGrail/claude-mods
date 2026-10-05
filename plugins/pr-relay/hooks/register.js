@@ -1264,9 +1264,9 @@ function postNotice($, pr, text) {
 }
 
 // Whether the origin remote is the pull request's repository on GitHub, spelled as a URL or
-// scp-style, in whatever case
+// scp-style (ssh.github.com is its SSH over port 443), in whatever case
 function inRepo(repo, pr) {
-  const path = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?github\.com(?::\d+\/|[:/])\/*([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(repo?.remote?.trim() ?? '')
+  const path = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+\/|[:/])\/*([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(repo?.remote?.trim() ?? '')
   return path != null && `${path[1]}/${path[2]}`.toLowerCase() === `${pr.owner}/${pr.name}`.toLowerCase()
 }
 
