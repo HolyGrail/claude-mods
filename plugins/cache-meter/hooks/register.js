@@ -2,10 +2,12 @@
 // it stays warm, its hit ratio and misses, and once it has gone cold, how many tokens the next
 // message writes to the cache again.
 
-// The last main-thread request that came back with usage: { at, model, tokens, prefix, cached, expired }
+// The last main-thread request that came back with usage: { at, ttl, model, tokens, prefix, cached, expired }
 // - at: when it was sent, in $.clock.now() milliseconds. Each request that reads the cache resets
 //   its TTL, so the TTL runs from here; the response may end minutes later.
-// - model: the model it was sent to, null when unknown (a resumed conversation); each model has
+// - ttl: the TTL resolved as it came back, { ttl, estimated }, since Claude Code picks one per
+//   request; null when unknown (a resumed conversation), which takes the TTL as it stands now
+// - model: the model that answered it, null when unknown (a resumed conversation); each model has
 //   a cache of its own
 // - tokens: what the next request re-sends, input + cache read + cache write + output, as the
 //   engine counts it for a model switch
@@ -22,13 +24,16 @@ let stats = emptyStats()
 // The TTL the engine stated at the last model switch: { ttl, overLimit }, kept only while the
 // plan usage stays on the side of the limit it was on then
 let engineTtl = null
-// The TTL as last resolved, { ttl, estimated }, and whether caching is switched off
-let ttl = { ttl: '1h', estimated: true }
+// The TTL as last resolved, { ttl, estimated }, for a request whose own is unknown, and whether
+// caching is switched off
+let ttl = defaultTtl()
 let disabled = false
 // The rate-limit windows, for the TTL estimate: past a window's limit, usage credits pay
 let rateLimits = []
 // After /compact, the next request rebuilds the conversation layer: not a miss
 let compacted = false
+// The forks whose first request has been seen: only that one reads the main conversation's entry
+let forksSeen = new Set()
 // The timer that redraws the gauge when its text next changes
 let timer = null
 // Counts refreshes and resets, so only the latest refresh redraws: one begun before a later one,
@@ -58,6 +63,8 @@ export function register(on) {
   on('session.start', async ($, e, next) => {
     reset()
     engineTtl = null
+    ttl = defaultTtl()
+    disabled = false
     rateLimits = (await $.session.usage()).rateLimits
     void refresh($)
     return next(e)
@@ -79,29 +86,40 @@ export function register(on) {
     return next(e)
   })
 
-  // Subagents, workflows and forks keep caches of their own, with their own TTL: only the main
-  // loop's requests (no agentId) move the gauge
+  // The main loop's requests (no agentId) move the gauge. Subagents and workflows keep caches of
+  // their own, with their own TTL; a fork inherits the main conversation whole, so its first
+  // request reads the main entry and resets its timer.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId) return yield* next(e)
     const sentAt = await $.clock.now()
     const response = yield* next(e)
     const usage = response?.usage
-    if (usage) {
-      const read = usage.cache_read_input_tokens
-      const written = usage.cache_creation_input_tokens
-      count(e.model, sentAt, usage)
-      last = {
-        at: sentAt,
-        model: e.model,
-        tokens: usage.input_tokens + read + written + usage.output_tokens,
-        prefix: read + written,
-        cached: read + written > 0,
-        expired: false,
+    if (!usage) return response
+    // A later mod may have sent the request to another model than the step named
+    const answeredBy = usage.model || e.model
+    if (e.agentId) {
+      if (await readsMainEntry($, e.agentId, answeredBy, usage).catch(() => false)) {
+        last = { ...last, at: sentAt }
+        void refresh($)
       }
-      model = e.model
-      compacted = false
-      void refresh($)
+      return response
     }
+    // Unresolved, the request takes the TTL as it stands when drawn
+    const resolved = await resolveTtl($).catch(() => null)
+    const read = usage.cache_read_input_tokens
+    const written = usage.cache_creation_input_tokens
+    count(answeredBy, sentAt, usage)
+    last = {
+      at: sentAt,
+      ttl: resolved,
+      model: answeredBy,
+      tokens: usage.input_tokens + read + written + usage.output_tokens,
+      prefix: read + written,
+      cached: read + written > 0,
+      expired: false,
+    }
+    model = answeredBy
+    compacted = false
+    void refresh($)
     return response
   })
 
@@ -125,6 +143,7 @@ export function register(on) {
       if (typeof e.seconds_since_last_response === 'number' && typeof e.context_tokens === 'number') {
         last = {
           at: (await $.clock.now()) - e.seconds_since_last_response * 1000,
+          ttl: null,
           model: null,
           tokens: e.context_tokens,
           prefix: e.context_tokens,
@@ -151,6 +170,10 @@ export function register(on) {
   })
 }
 
+function defaultTtl() {
+  return { ttl: '1h', estimated: true }
+}
+
 function emptyStats() {
   return { input: 0, read: 0, misses: 0, lastMissCause: null }
 }
@@ -163,6 +186,20 @@ function reset() {
   model = null
   stats = emptyStats()
   compacted = false
+  forksSeen = new Set()
+}
+
+// Whether a subagent's request was a fork's first, which read the main conversation's cached
+// prefix: the same model, and at least as much read as a request that hit it would. Its own later
+// requests read the fork's longer entry instead.
+async function readsMainEntry($, agentId, answeredBy, usage) {
+  if (!last?.cached || forksSeen.has(agentId)) return false
+  if (last.model && last.model !== answeredBy) return false
+  if (usage.cache_read_input_tokens < last.prefix * MISS_BELOW_SHARE) return false
+  const agent = (await $.agent.list()).find((a) => a.id === agentId)
+  if (agent?.type !== 'fork') return false
+  forksSeen.add(agentId)
+  return true
 }
 
 // Adds a main request to the conversation's figures. A request that reads well under what the
@@ -175,7 +212,7 @@ function count(stepModel, sentAt, usage) {
   if (!last || !last.cached || compacted || read >= last.prefix * MISS_BELOW_SHARE) return
   stats.misses += 1
   if (last.model && last.model !== stepModel) stats.lastMissCause = 'model switch'
-  else if (last.expired || sentAt - last.at > TTL_MS[ttl.ttl]) stats.lastMissCause = 'expired'
+  else if (last.expired || sentAt - last.at > TTL_MS[(last.ttl ?? ttl).ttl]) stats.lastMissCause = 'expired'
   else stats.lastMissCause = null
 }
 
@@ -221,14 +258,15 @@ function viewAt(now) {
   if (!last) return null
   if (!last.cached) return { kind: 'off', reason: 'no cache tokens reported' }
   if (last.model && model && last.model !== model) return { kind: 'cold', reason: 'model switch', tokens: last.tokens }
-  const ttlMs = TTL_MS[ttl.ttl]
+  const own = last.ttl ?? ttl
+  const ttlMs = TTL_MS[own.ttl]
   const remaining = last.at + ttlMs - now
   if (last.expired || remaining <= 0) return { kind: 'cold', reason: null, tokens: last.tokens }
   return {
     kind: 'warm',
     remaining,
     share: remaining / ttlMs,
-    ttl: (ttl.estimated ? '~' : '') + ttl.ttl,
+    ttl: (own.estimated ? '~' : '') + own.ttl,
     hit: stats.input > 0 ? Math.round((stats.read / stats.input) * 100) : null,
     misses: stats.misses,
     lastMissCause: stats.lastMissCause,

@@ -1,4 +1,4 @@
-import type { SessionRateLimit, TurnStepResult } from 'claude-code'
+import type { AgentInfo, SessionRateLimit, TurnStepResult } from 'claude-code'
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
 const MINUTE = 60_000
@@ -138,6 +138,58 @@ test('leaves the main cache to the main loop: a subagent request does not refres
   expect(await line($)).toBe('cache ● ~1h██░░░░░░░░10m left · hit 90% · misses 0')
 })
 
+test('takes a fork’s first request, which reads the main conversation’s entry, as a refresh', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  const agents = [
+    { id: 'f1', type: 'fork', description: 'fork' },
+    { id: 'a1', type: 'Explore', description: 'look' },
+  ] as AgentInfo[]
+  on('agent.list', () => ({ value: agents }))
+  await $.session.start(START)
+  await step($, h)
+  await clock.advance(50 * MINUTE)
+  // A subagent that reads as much from a cache of its own is not a fork
+  await step($, h, { agentId: 'a1', usage: { cache_read_input_tokens: 44_000 } })
+  await clock.settle()
+  expect(await line($)).toMatch(/10m left/)
+
+  await step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 44_000 } })
+  await clock.settle()
+  expect(await line($)).toMatch(/60m left · hit 90% · misses 0$/)
+
+  // The fork's later requests read its own longer entry
+  await clock.advance(30 * MINUTE)
+  await step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 48_000 } })
+  await clock.settle()
+  expect(await line($)).toMatch(/30m left/)
+})
+
+test('takes the model that answered, when a later mod sent the request elsewhere', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  await $.session.start(START)
+  // The step names Opus, but Sonnet answers both requests
+  await step($, h, { usage: { model: SONNET } })
+  await step($, h, { usage: { model: SONNET } })
+  await clock.settle()
+  expect(await line($)).toMatch(/misses 0$/)
+
+  await $.classic.PostModelSwitch({
+    from_model: SONNET,
+    to_model: SONNET,
+    requested_model: 'sonnet',
+    source: 'command',
+    context_tokens: 52_000,
+    prompt_cache_warm: true,
+    cache_ttl: '1h',
+    estimated_cache_write_usd: 0,
+    pricing: 'catalog',
+  })
+  await clock.settle()
+  expect(await line($)).toMatch(/^cache ● ~1h/)
+})
+
 test('draws an SVG bar on the desktop, and none once the cache is cold', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const h = stubHost(on)
@@ -161,12 +213,31 @@ test('takes five minutes off a subscription: an API key, or plan usage past its 
   h.login = 'bearer'
   const over: SessionRateLimit[] = [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(NOW + 60 * MINUTE).toISOString() }]
   await $.session.measure({ context: { window: 200_000 }, rateLimits: over, changed: ['rateLimits'] })
+  await step($, h)
   await clock.settle()
   expect(await line($)).toMatch(/^cache ● ~5m/)
 
   await $.session.measure({ context: { window: 200_000 }, rateLimits: [], changed: ['rateLimits'] })
+  await step($, h)
   await clock.settle()
   expect(await line($)).toMatch(/^cache ● ~1h.*60m left/)
+})
+
+test('keeps the TTL each request was cached with when the plan usage changes after it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const over: SessionRateLimit[] = [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(NOW + 60 * MINUTE).toISOString() }]
+  const h = stubHost(on, { rateLimits: over })
+  await $.session.start(START)
+  await step($, h)
+  await clock.settle()
+  expect(await line($)).toMatch(/^cache ● ~5m.*5m left/)
+
+  // The window resets, but the cache written on usage credits still lapses in five minutes
+  await $.session.measure({ context: { window: 200_000 }, rateLimits: [], changed: ['rateLimits'] })
+  await clock.settle()
+  expect(await line($)).toMatch(/^cache ● ~5m.*5m left/)
+  await clock.advance(5 * MINUTE)
+  expect(await line($)).toBe('cache ○ cold · next message re-caches 46k tokens')
 })
 
 test('follows a TTL chosen in the environment or settings, in Claude Code’s order', async ($, on) => {
@@ -263,4 +334,10 @@ test('says so when caching is off or the responses report none', async ($, on) =
   await $.session.measure({ context: { window: 200_000 }, rateLimits: [], changed: ['rateLimits'] })
   await clock.settle()
   expect(await line($)).toBe('cache ○ off · DISABLE_PROMPT_CACHING')
+
+  // A re-fired session.start does not carry the switch over before it reads the environment again
+  delete h.env.DISABLE_PROMPT_CACHING
+  await $.session.start(START)
+  await clock.settle()
+  expect(await gauge($)).toBeUndefined()
 })
