@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Claude Code plugins live under `plugins/<name>/`: `usage-meter`, `notice-board`, `pr-relay`, and `zsh-safe`. Each plugin contains:
+Claude Code plugins live under `plugins/<name>/`: `usage-meter`, `cache-meter`, `notice-board`, `pr-relay`, and `zsh-safe`. Each plugin contains:
 
 - `.claude-plugin/plugin.json` for metadata.
 - `hooks/hooks.json` for module registration and `hooks/register.js` exporting `register(on)`.
