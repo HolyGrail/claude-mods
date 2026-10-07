@@ -2,7 +2,9 @@
 // it stays warm, its hit ratio and misses, and once it has gone cold, how many tokens the next
 // message writes to the cache again.
 
-// The last main-thread request that came back with usage: { at, ttl, model, tokens, prefix, cached, expired }
+// The last main-thread request that came back with usage: { seq, at, ttl, model, tokens, prefix, cached, expired }
+// - seq: which main request it was, counted across the module's life, so a fork can tell whether
+//   the entry it read is still the newest
 // - at: when it was sent, in $.clock.now() milliseconds. Each request that reads the cache resets
 //   its TTL, so the TTL runs from here; the response may end minutes later.
 // - ttl: the TTL resolved as it came back, { ttl, estimated }, since Claude Code picks one per
@@ -32,8 +34,11 @@ let disabled = false
 let rateLimits = []
 // After /compact, the next request rebuilds the conversation layer: not a miss
 let compacted = false
-// The forks whose first request has been seen: only that one reads the main conversation's entry
-let forksSeen = new Set()
+// The subagents whose first request has been seen: only a fork's first reads the main
+// conversation's entry, hit or miss
+let agentsSeen = new Set()
+// Numbers the main requests (`last.seq`)
+let mainRequests = 0
 // The timer that redraws the gauge when its text next changes
 let timer = null
 // Counts refreshes and resets, so only the latest refresh redraws: one begun before a later one,
@@ -91,13 +96,18 @@ export function register(on) {
   // request reads the main entry and resets its timer.
   on('turn.step', async function* ($, e, next) {
     const sentAt = await $.clock.now()
+    // The main entry as this request went out, which a fork's request read if it read any
+    const parent = last
     const response = yield* next(e)
     const usage = response?.usage
     if (!usage) return response
     // A later mod may have sent the request to another model than the step named
     const answeredBy = usage.model || e.model
     if (e.agentId) {
-      if (await readsMainEntry($, e.agentId, answeredBy, usage).catch(() => false)) {
+      // Forks that overlap may answer out of order: the newest read stands, and a main request
+      // recorded since holds an entry the fork did not read
+      const read = await readsMainEntry($, e.agentId, parent, answeredBy, usage).catch(() => false)
+      if (read && last?.seq === parent.seq && sentAt > last.at) {
         last = { ...last, at: sentAt }
         void refresh($)
       }
@@ -109,6 +119,7 @@ export function register(on) {
     const written = usage.cache_creation_input_tokens
     count(answeredBy, sentAt, usage)
     last = {
+      seq: ++mainRequests,
       at: sentAt,
       ttl: resolved,
       model: answeredBy,
@@ -142,6 +153,7 @@ export function register(on) {
       reset()
       if (typeof e.seconds_since_last_response === 'number' && typeof e.context_tokens === 'number') {
         last = {
+          seq: ++mainRequests,
           at: (await $.clock.now()) - e.seconds_since_last_response * 1000,
           ttl: null,
           model: null,
@@ -186,20 +198,20 @@ function reset() {
   model = null
   stats = emptyStats()
   compacted = false
-  forksSeen = new Set()
+  agentsSeen = new Set()
 }
 
-// Whether a subagent's request was a fork's first, which read the main conversation's cached
-// prefix: the same model, and at least as much read as a request that hit it would. Its own later
-// requests read the fork's longer entry instead.
-async function readsMainEntry($, agentId, answeredBy, usage) {
-  if (!last?.cached || forksSeen.has(agentId)) return false
-  if (last.model && last.model !== answeredBy) return false
-  if (usage.cache_read_input_tokens < last.prefix * MISS_BELOW_SHARE) return false
+// Whether a subagent's request was a fork's first and read `parent`, the main conversation's
+// cached prefix as it went out: the same model, and at least as much read as a request that hit it
+// would. Only an agent's first request counts, hit or miss: its later ones read its own entry.
+async function readsMainEntry($, agentId, parent, answeredBy, usage) {
+  if (agentsSeen.has(agentId)) return false
+  agentsSeen.add(agentId)
+  if (!parent?.cached) return false
+  if (parent.model && parent.model !== answeredBy) return false
+  if (usage.cache_read_input_tokens < parent.prefix * MISS_BELOW_SHARE) return false
   const agent = (await $.agent.list()).find((a) => a.id === agentId)
-  if (agent?.type !== 'fork') return false
-  forksSeen.add(agentId)
-  return true
+  return agent?.type === 'fork'
 }
 
 // Adds a main request to the conversation's figures. A request that reads well under what the

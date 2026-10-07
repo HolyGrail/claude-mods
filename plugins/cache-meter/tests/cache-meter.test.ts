@@ -35,6 +35,8 @@ type Host = {
   rateLimits: SessionRateLimit[]
   // The usage the next model request reports
   usage: Usage | null
+  // Holds a subagent's request until it resolves, so requests can answer out of order
+  hold?: { agentId: string; until: Promise<void> }
 }
 
 function stubHost(on: On, host: Partial<Host> = {}): Host {
@@ -46,7 +48,9 @@ function stubHost(on: On, host: Partial<Host> = {}): Host {
   on('env.get', ($, e) => ({ value: h.env[e.name] }))
   on('settings.read', () => ({ value: h.settings }))
   on('turn.step', async function* ($, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: h.usage } as TurnStepResult
+    const usage = h.usage
+    if (h.hold && e.agentId === h.hold.agentId) await h.hold.until
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as TurnStepResult
   })
   on('classic.PostModelSwitch', () => ({}))
   on('classic.SessionStart', () => ({}))
@@ -163,6 +167,45 @@ test('takes a fork’s first request, which reads the main conversation’s entr
   await step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 48_000 } })
   await clock.settle()
   expect(await line($)).toMatch(/30m left/)
+})
+
+test('leaves the main cache cold when a fork’s first request missed it, whatever its later ones read', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  const agents = [{ id: 'f1', type: 'fork', description: 'fork' }] as AgentInfo[]
+  on('agent.list', () => ({ value: agents }))
+  await $.session.start(START)
+  await step($, h)
+  await clock.advance(61 * MINUTE)
+  await step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 46_000 } })
+  await step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 46_000 } })
+  await clock.settle()
+  expect(await line($)).toBe('cache ○ cold · next message re-caches 46k tokens')
+})
+
+test('keeps the newest read when overlapping forks answer out of order', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  const agents = [
+    { id: 'f1', type: 'fork', description: 'older' },
+    { id: 'f2', type: 'fork', description: 'newer' },
+  ] as AgentInfo[]
+  on('agent.list', () => ({ value: agents }))
+  await $.session.start(START)
+  await step($, h)
+  await clock.advance(20 * MINUTE)
+  // The older fork's request goes out first and answers last
+  let release = () => {}
+  h.hold = { agentId: 'f1', until: new Promise<void>((resolve) => (release = resolve)) }
+  const older = step($, h, { agentId: 'f1', usage: { cache_read_input_tokens: 44_000 } })
+  await clock.advance(10 * MINUTE)
+  await step($, h, { agentId: 'f2', usage: { cache_read_input_tokens: 44_000 } })
+  await clock.settle()
+  expect(await line($)).toMatch(/60m left/)
+  release()
+  await older
+  await clock.settle()
+  expect(await line($)).toMatch(/60m left/)
 })
 
 test('takes the model that answered, when a later mod sent the request elsewhere', async ($, on) => {
