@@ -1,0 +1,6 @@
+{
+  "name": "cache-meter",
+  "version": "0.1.0",
+  "description": "Gauges how long the conversation's prompt cache stays warm, its hit ratio and misses, and what the next message re-caches once it has gone cold",
+  "author": { "name": "HolyGrail" }
+}

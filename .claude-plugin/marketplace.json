@@ -11,6 +11,11 @@
       "description": "Shows context, 5-hour, weekly and per-model weekly limit usage above the prompt"
     },
     {
+      "name": "cache-meter",
+      "source": "./plugins/cache-meter",
+      "description": "Gauges how long the conversation's prompt cache stays warm, its hit ratio and misses, and what the next message re-caches once it has gone cold"
+    },
+    {
       "name": "notice-board",
       "source": "./plugins/notice-board",
       "description": "Shares notices with every session in the same repository, or on the machine"
