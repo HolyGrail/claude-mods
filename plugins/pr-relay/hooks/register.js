@@ -38,8 +38,10 @@ const GIT_OPTION = String.raw`(?:-C\s+(${SHELL_WORD})|--work-tree(?:=|\s+)(${SHE
 // Accepts git push with any combination of -C dir, -c key=value, --git-dir=dir,
 // --work-tree=dir and --no-pager before push, including space-separated directory values
 const GIT_PUSH = new RegExp(String.raw`\bgit\s+((?:${GIT_OPTION}\s+)*)push(?=$|[\s;&|)])`, 'g')
-// What gh pr view says when the branch has no pull request, as opposed to failing to ask
-const NO_PR = /no pull requests found/i
+// What gh pr view says when there is no pull request to find, as opposed to failing to ask: the
+// branch has none, the directory is not a git repository, the repository has no remote, or HEAD is
+// detached. A remote on an unknown host is left out: gh says the same of one not logged in to.
+const NO_PR = /no pull requests found|not a git repository|no git remotes found|not on any branch/i
 // The session.end reasons after which this module stops
 const FINAL_REASONS = ['prompt_input_exit', 'other']
 
@@ -1517,8 +1519,8 @@ async function pushDirectory($, options) {
   return cwd
 }
 
-// The open pull request of the branch checked out at cwd: null when there is none, { error } when gh
-// could not tell
+// The open pull request of the branch checked out at cwd: null when there is none (or no branch,
+// repository or remote to find one for), { error } when gh could not tell
 async function findForBranch($, cwd) {
   try {
     const ran = await $.process.run(['gh', 'pr', 'view', '--json', 'url,state'], cwd === undefined ? undefined : { cwd })

@@ -167,7 +167,8 @@ type World = {
   branchLookups: number
   processRuns: { argv: readonly string[]; init?: ProcessRunInit }[]
   // What gh pr view answers for the branch, null when it has no pull request, or 'error' when gh fails
-  branchPr: { url: string; state: string } | null | 'error'
+  // { stderr } is what gh pr view fails with on stderr; 'error' is a connection failure
+  branchPr: { url: string; state: string } | null | 'error' | { stderr: string }
   // What a submitted prompt waits for before its turn starts
   turnStarts: () => Promise<void>
   dropPrompt?: boolean
@@ -281,6 +282,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     if (e.argv[1] === 'pr') {
       w.branchLookups += 1
       if (w.branchPr === 'error') return run(1, '', 'error connecting to api.github.com')
+      if (w.branchPr && 'stderr' in w.branchPr) return run(1, '', w.branchPr.stderr)
       return w.branchPr ? run(0, JSON.stringify(w.branchPr)) : run(1, '', 'no pull requests found for branch "feature"')
     }
     if (e.argv.some((arg) => arg.startsWith('query=') && arg.includes('nodes(ids:'))) {
@@ -2753,6 +2755,27 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
   expect(w.store.get(NOTE)).toMatchObject({ idle: true })
 })
+
+for (const [where, stderr] of [
+  ['outside a git repository', 'failed to run git: fatal: not a git repository (or any of the parent directories): .git'],
+  ['in a repository without a remote', 'no git remotes found'],
+  ['on a detached HEAD', 'could not determine current branch: failed to run git: not on any branch'],
+] as const) {
+  test(`a lookup ${where} finds no pull request rather than failing`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { branchPr: { stderr } })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.queries).toBe(0)
+    expect(w.status).toBeUndefined()
+
+    // Nothing to retry: the lookup is not asked again a tick later
+    expect(w.branchLookups).toBe(1)
+    await clock.advance(MINUTE)
+    expect(w.branchLookups).toBe(1)
+    expect(w.status).toBeUndefined()
+  })
+}
 
 test('a lookup that succeeds after failing clears the failure from the status line', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
