@@ -1,6 +1,7 @@
 // Shares notices across the sessions on this machine: /notice posts one to every session in the
 // same repository (or, with --all, to every session), each shows it above the prompt and passes
-// it on to its model once, and /notice clear takes it down everywhere.
+// it on to its model once, at the start of its next turn, and /notice clear takes it down
+// everywhere.
 
 // The notices this session shows, newest first
 let notices = []
@@ -28,9 +29,11 @@ let posts = 0
 // another session's notice, and clearing deletes keys instead of rewriting a shared list
 const KEY_PREFIX = 'notice:'
 // What the model was told is read back from the conversation itself, so a reload, /clear,
-// compaction, /resume, /rewind and /branch each leave it right. Each notice or withdrawal is a row
-// of its own, whose whole text is one of these, so a notice's body may hold anything, new lines
-// that look like another row included. The ref that ends a row is a hash of its body under a
+// compaction, /resume, /rewind and /branch each leave it right. It is read in its Messages API
+// form: the rows form leaves out the rows a plugin adds, while the API form carries each as a
+// text block of its own, folded into the user message beside it. Each notice or withdrawal is a
+// block of its own, whose whole text is one of these, so a notice's body may hold anything, new
+// lines that look like another row included. The ref that ends a row is a hash of its body under a
 // secret kept in $.store, so a prompt that only reads like a row is not taken for one. Each
 // secret has a key of its own, so one that signed a row is never overwritten by another.
 const TOLD = /^Notice to every Claude Code session (on this machine|in this repository), posted \d+[mhd] ago with \/notice: ([\s\S]*)\n\(notice-board ref ([0-9a-f]{8})\)$/
@@ -41,8 +44,13 @@ const TOLD_V1 = /^Notice to every Claude Code session (on this machine|in this r
 const WITHDRAWN_V1 = /^This notice no longer applies: ([\s\S]*)$/
 const LINE_START_V1 = /\n(?=Notice to every Claude Code session |This notice no longer applies: )/
 const KNOWN_V1 = { plugin: 'notice-board', key: 'known' }
-// $.session.messages() returns at most this many, the newest
+// $.session.messages() returns at most this many messages, the newest
 const WINDOW = 4096
+// The text blocks left out of a message's fingerprint: a row this module added, whichever version
+// added it, since a row folded into a message must not read as a change to it; and a reminder the
+// engine folds into the newest user message when its request goes out, after the turn.start that
+// read it without
+const UNSTABLE_BLOCK = /^(?:Notice to every Claude Code session |This notice no longer applies: |<system-reminder>)/
 // What each conversation was told, under the session id, for the rows a full window no longer
 // returns: { at, told: [{ key, text }] }
 const RECORD_PREFIX = 'told:'
@@ -74,8 +82,26 @@ export function register(on) {
       description: 'Post a notice to every session in this repository (--all: on this machine), or clear them',
       argumentHint: '[--all] <text> | clear',
     })
+    // Fills the band; the model is told at its next turn. This start may be a respawn in the
+    // middle of a turn, which nothing says, so nothing is added to the conversation here.
     await refresh($)
     ticker = $.clock.every(TICK_MS, () => refresh($))
+    return next(e)
+  })
+
+  // The conversation is brought up to date here, after the prompt joined it and before the turn's
+  // first request goes out, and nowhere else. The model reads the conversation only when a request
+  // is sent, so telling it sooner gains nothing; and a row added while a turn runs lands wherever
+  // the response stands, even between a server tool's use and its result inside one assistant
+  // message, which the API then refuses on every later request, so the conversation is lost. The
+  // ticker, /notice and session.start only fill the band. The engine waits on this hook before
+  // its first request, so the rows are in when the model reads. Subagents raise no turn.start; a
+  // queued prompt's turn raises one of its own, so a prompt typed over a running turn is covered.
+  // A load that fails must not hold the turn back; the next turn tries again. Past the hook's
+  // budget the engine goes on without it, and a row added then would land in the turn: the load
+  // takes the hook's signal and adds nothing once it aborted.
+  on('turn.start', async ($, e, next) => {
+    await refresh($, true, next.signal).catch(() => {})
     return next(e)
   })
 
@@ -110,14 +136,6 @@ export function register(on) {
       }).catch(() => {})
     }
     return result
-  })
-
-  // Before the model reads a prompt, the conversation it reads is brought up to date: /rewind
-  // raises no event of its own, and the lines it took back are retold here
-  on('prompt.submit', async ($, e, next) => {
-    // A load that fails must not hold the prompt back; the next tick tries again
-    await refresh($).catch(() => {})
-    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
@@ -181,9 +199,11 @@ async function clear($) {
   return 'Cleared ' + cleared.length + (cleared.length === 1 ? ' notice.' : ' notices.')
 }
 
-// Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws
-function refresh($) {
-  return serially(() => load($)).then(() => $.ui.invalidate('ui.render'))
+// Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws.
+// With tell, the model is told too; only turn.start asks for that, and the permission is the
+// load's own, so a tick's load queued behind it never inherits it.
+function refresh($, tell = false, signal = null) {
+  return serially(() => load($, tell, signal)).then(() => $.ui.invalidate('ui.render'))
 }
 
 // Runs task once every earlier one has settled
@@ -193,9 +213,10 @@ function serially(task) {
   return run
 }
 
-// Reads the notices meant for this session, and tells the model about the ones its conversation
-// does not hold and the ones it holds that have since been cleared
-async function load($) {
+// Reads the notices meant for this session and, with tell, tells the model about the ones its
+// conversation does not hold and the ones it holds that have since been cleared; nothing is added
+// once signal aborted
+async function load($, tell, signal) {
   // Before any wait, so a restart or a switch that lands during one is seen
   const started = generation
   const id = sessionId
@@ -213,8 +234,11 @@ async function load($) {
   // At an equal time the later id comes first, so every session lists them alike
   shown.sort((a, b) => b.postedAt - a.postedAt || (a.id < b.id ? 1 : -1))
   notices = shown
+  // Between turns the conversation is not read either: its form while a turn runs is not settled
+  // (a row added then is folded into a message only once the turn ends)
+  if (!tell) return
 
-  const messages = await $.session.messages()
+  const messages = await $.session.messages({ as: 'api' })
   if (refused.size > 0) {
     const now = messages.map(fingerprint)
     if (!continues(seen, now)) refused.clear()
@@ -261,8 +285,8 @@ async function load($) {
       const line = row.line + '\n(notice-board ref ' + (await ref(secrets[0], row.text)) + ')'
       // A restart or a switch since this load read the conversation: its rows may not fit the one
       // installed now, which the next load reads afresh. Checked after the last wait before the
-      // append.
-      if (generation !== started) return
+      // append. A turn the engine began without waiting for this load any longer is left alone.
+      if (generation !== started || signal?.aborted) return
       const result = await $.session
         .append({ message: { type: 'user', content: [{ type: 'text', text: line }] } })
         .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
@@ -298,7 +322,8 @@ function forgetRefusals() {
 }
 
 // The notices the conversation tells the model of, by key, with their text: each row this module
-// added in order, a withdrawal taking back every notice of its text; and the texts withdrawn
+// added in order, a withdrawal taking back every notice of its text; and the texts withdrawn. A
+// row is a text block of a user message, read whole.
 async function toldIn(messages, secrets, legacy) {
   const signs = async (text, r) => {
     for (const secret of secrets) if (r === (await ref(secret, text))) return true
@@ -308,36 +333,44 @@ async function toldIn(messages, secrets, legacy) {
   const withdrawals = new Set()
   for (const message of messages) {
     if (message.role !== 'user') continue
-    const added = TOLD.exec(message.text)
-    if (added && (await signs(added[2], added[3]))) {
-      told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
-      withdrawals.delete(added[2])
-      continue
-    }
-    const withdrawn = WITHDRAWN.exec(message.text)
-    if (withdrawn && (await signs(withdrawn[1], withdrawn[2]))) {
-      for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
-      withdrawals.add(withdrawn[1])
-      continue
-    }
-    // A row of version 0.1 counts where that version's record says it told the text
-    if (legacy.size === 0) continue
-    const parts = partsV1(message.text, legacy)
-    if (parts === null) continue
-    for (const part of parts) {
-      const added = TOLD_V1.exec(part)
-      if (added && legacy.has(added[2])) {
+    for (const text of textsOf(message)) {
+      const added = TOLD.exec(text)
+      if (added && (await signs(added[2], added[3]))) {
         told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
         withdrawals.delete(added[2])
+        continue
       }
-      const withdrawnV1 = WITHDRAWN_V1.exec(part)
-      if (withdrawnV1 && legacy.has(withdrawnV1[1])) {
-        for (const [key, value] of told) if (value === withdrawnV1[1]) told.delete(key)
-        withdrawals.add(withdrawnV1[1])
+      const withdrawn = WITHDRAWN.exec(text)
+      if (withdrawn && (await signs(withdrawn[1], withdrawn[2]))) {
+        for (const [key, value] of told) if (value === withdrawn[1]) told.delete(key)
+        withdrawals.add(withdrawn[1])
+        continue
+      }
+      // A row of version 0.1 counts where that version's record says it told the text
+      if (legacy.size === 0) continue
+      const parts = partsV1(text, legacy)
+      if (parts === null) continue
+      for (const part of parts) {
+        const added = TOLD_V1.exec(part)
+        if (added && legacy.has(added[2])) {
+          told.set((added[1] === 'on this machine' ? 'all' : 'repo') + '\n' + added[2], added[2])
+          withdrawals.delete(added[2])
+        }
+        const withdrawnV1 = WITHDRAWN_V1.exec(part)
+        if (withdrawnV1 && legacy.has(withdrawnV1[1])) {
+          for (const [key, value] of told) if (value === withdrawnV1[1]) told.delete(key)
+          withdrawals.add(withdrawnV1[1])
+        }
       }
     }
   }
   return { told, withdrawals }
+}
+
+// The texts of a message's text blocks, in order
+function textsOf(message) {
+  const blocks = Array.isArray(message.content) ? message.content : []
+  return blocks.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text)
 }
 
 // Splits a row of version 0.1 into its lines. A body may itself hold a new line that starts like
@@ -421,9 +454,13 @@ function toldKey(notice) {
   return (notice.repo === null ? 'all' : 'repo') + '\n' + notice.text
 }
 
+// A message's identity for continues: its role, its tool calls and results, and its text less the
+// rows this module added, which are folded into the message beside them as they are added
 function fingerprint(message) {
-  const ids = [...message.toolUses, ...(message.toolResults ?? [])].map((t) => t.tool_use_id)
-  return message.role + '\n' + ids.join(' ') + '\n' + message.text
+  const blocks = Array.isArray(message.content) ? message.content : []
+  const ids = blocks.map((b) => (b?.type === 'tool_use' ? b.id : b?.type === 'tool_result' ? b.tool_use_id : null)).filter((id) => id)
+  const texts = textsOf(message).filter((text) => !UNSTABLE_BLOCK.test(text))
+  return message.role + '\n' + ids.join(' ') + '\n' + texts.join('\n')
 }
 
 // Whether now is before carried on: before's messages, less the oldest ones the capped window
