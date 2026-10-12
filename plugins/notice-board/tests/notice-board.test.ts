@@ -1,4 +1,4 @@
-import type { SessionMessage, SessionRepo } from 'claude-code'
+import type { SessionRepo } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
@@ -33,24 +33,32 @@ const APP_KEY = 'github.com/owner/app'
 // The stub registrar a test function receives as its second argument
 type On = Parameters<typeof mock.clock>[0]
 
+// A message of the conversation in its Messages API form, which is what the module reads
+type Block = { type: string; [field: string]: unknown }
+type Message = { role: 'user' | 'assistant'; content: Block[] }
+
 type Host = {
   // The store every session shares, by key
   store: Map<string, unknown>
-  // Each line this session's model was told
+  // Each line this session's model was told, or that the host refused
   passedOn: string[]
   // The conversation, which a test may replace as /clear, /resume or /rewind does
-  transcript: SessionMessage[]
+  transcript: Message[]
 }
 
-// Backs $.store with a Map and the conversation with an array. A plugin's $.session.append never
-// reaches a test's hooks and fails, so what the model is told is read from the debug line the
-// failure logs, and that line stands in for the row the append would have added.
+// Backs $.store with a Map and the conversation with an array of API messages. A row the module
+// appends is taken as the engine takes it: folded into the user message beside it as a text block
+// of its own, or a user message of its own where none is beside it. The rows form of the
+// conversation leaves such rows out, as the engine's does, so a module that read it would tell
+// every notice again.
 function stubHost(
   on: On,
   {
     store = new Map<string, unknown>(),
     repo = (): SessionRepo | null => HTTPS,
-    keepsRows = true,
+    // Whether the host keeps a row the module appends; false refuses it, as a run no plugin may
+    // shape does. A function decides per row.
+    keepsRows = true as boolean | ((row: string) => boolean),
     // Holds a read of the conversation back, as a slow host would
     beforeRead = async (): Promise<void> => {},
     // Holds a read of the repository back
@@ -68,13 +76,24 @@ function stubHost(
   } = {},
 ): Host {
   const host: Host = { store, passedOn: [], transcript: [] }
+  mock.session(on)
+  on('session.append', { door: 'note' }, ($, e, next) => {
+    const row = e.message.content.map((block) => (typeof block.text === 'string' ? block.text : '')).join('')
+    // The ref that signs the row is checked where it matters; the rest compare what the model reads
+    host.passedOn.push(row.replace(REF, ''))
+    if (!(typeof keepsRows === 'function' ? keepsRows(row) : keepsRows)) return { deny: 'the host keeps no row' }
+    const last = host.transcript.at(-1)
+    if (last?.role === 'user') host.transcript = [...host.transcript.slice(0, -1), { role: 'user', content: [...last.content, text(row)] }]
+    else host.transcript = [...host.transcript, said('user', row)]
+    return next(e)
+  })
   on('session.id', async () => {
     await beforeId()
     return { value: id() }
   })
-  on('session.messages', async () => {
+  on('session.messages', async ($, e) => {
     await beforeRead()
-    return { value: host.transcript }
+    return { value: (e.as === 'api' ? host.transcript : []) as never }
   })
   on('session.repo', async () => {
     await beforeRepo()
@@ -85,6 +104,7 @@ function stubHost(
     return { value: { value: known(), version: 0 } }
   })
   on('session.start', () => ({ cwd: '/work' }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('store.keys', () => ({ value: [...store.keys()] }))
   on('store.get', async ($, e) => {
@@ -99,22 +119,25 @@ function stubHost(
     store.delete(e.key)
     return { value: undefined }
   })
-  on('ui.log', ($, e) => {
-    if (e.text.startsWith('notice-board could not tell the model: ')) {
-      const row = e.text.slice(e.text.indexOf('\n') + 1)
-      // The ref that signs the row is checked where it matters; the rest compare what the model reads
-      host.passedOn.push(row.replace(REF, ''))
-      if (keepsRows) host.transcript = [...host.transcript, said('user', row)]
-    }
-    return { value: undefined }
-  })
+  on('ui.log', () => ({ value: undefined }))
   // What the mods after this one draw in the band
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn by another mod'] }))
   return host
 }
 
-function said(role: 'user' | 'assistant', text: string): SessionMessage {
-  return { role, text, toolUses: [] }
+function text(text: string): Block {
+  return { type: 'text', text }
+}
+
+function said(role: 'user' | 'assistant', text: string): Message {
+  return { role, content: [{ type: 'text', text }] }
+}
+
+// Begins a model turn, as the engine does once a prompt has joined the conversation
+let turns = 0
+function turn($: Engine) {
+  turns += 1
+  return $.turn.start({ text: 'go on', turnId: 'turn-' + turns })
 }
 
 // The test environment has timers, which the es2023 lib the tsconfig names leaves untyped
@@ -148,7 +171,7 @@ function run($: Engine, args: string) {
   return $.command.run({ command: 'notice', args, origin: { kind: 'composer' }, presentation: PRESENTATION })
 }
 
-test('a posted notice is stored for the repository, shown here and told to this model once', async ($, on) => {
+test('a posted notice is stored for the repository, shown here and told to this model at its next turn, once', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const host = stubHost(on)
   await $.session.start(START)
@@ -161,10 +184,14 @@ test('a posted notice is stored for the repository, shown here and told to this 
   expect(await ui.find({ type: 'Text', text: 'CI is paused, check the Codex review only' })).toBeDefined()
   // What the other mods draw stays below
   expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
-  // A command's output is not part of what the model reads, so the poster's model is told too
+  // A command's output is not part of what the model reads, so the poster's model is told too,
+  // when its next turn begins
+  expect(host.passedOn).toEqual([])
+  await turn($)
   const told = ['Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused, check the Codex review only']
   expect(host.passedOn).toEqual(told)
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual(told)
 })
 
@@ -172,17 +199,69 @@ test("another worktree's notice reaches this session within a tick and the model
   const clock = mock.clock(on, { now: NOW })
   const host = stubHost(on, { repo: () => SSH })
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual([])
 
   host.store.set('notice:1-other', notice('CI is paused', APP_KEY, NOW))
   await clock.advance(MINUTE)
-  const told = ['Notice to every Claude Code session in this repository, posted 1m ago with /notice: CI is paused']
-  expect(host.passedOn).toEqual(told)
   const ui = await $.ui.mount(BAND)
   expect(await ui.find({ type: 'Text', text: 'notice 1m:' })).toBeDefined()
+  expect(host.passedOn).toEqual([])
+  await turn($)
+  const told = ['Notice to every Claude Code session in this repository, posted 1m ago with /notice: CI is paused']
+  expect(host.passedOn).toEqual(told)
 
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual(told)
+})
+
+test('a notice that arrives while a turn runs is told at the next turn, not by the ticks meanwhile', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const host = stubHost(on)
+  await $.session.start(START)
+  // A turn begins with nothing to tell, and runs on through several ticks
+  await turn($)
+  host.transcript = [said('user', 'review this'), { role: 'assistant', content: [{ type: 'server_tool_use', id: 'srvtoolu_1', name: 'advisor' }] }]
+  host.store.set('notice:1-other', notice('CI is paused', APP_KEY, NOW))
+  await clock.advance(3 * MINUTE)
+  // The band shows it at once; the conversation is left alone
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeDefined()
+  expect(host.passedOn).toEqual([])
+  expect(host.transcript).toHaveLength(2)
+
+  // The next turn begins once the prompt has joined the conversation: the row joins it there, once
+  host.transcript = [...host.transcript, said('user', 'and then?')]
+  await turn($)
+  expect(host.passedOn).toEqual(['Notice to every Claude Code session in this repository, posted 3m ago with /notice: CI is paused'])
+  expect(host.transcript).toHaveLength(3)
+  await clock.advance(MINUTE)
+  await turn($)
+  expect(host.passedOn).toHaveLength(1)
+})
+
+test('a row folded into the message beside it is read there, and the notice is not told again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store })
+  await $.session.start(START)
+  await turn($)
+  expect(host.passedOn).toHaveLength(1)
+
+  // The engine folds the row into the user message beside it, after a tool result, and the rows
+  // form of the conversation never shows it
+  const row = host.transcript[0]!.content[0]!
+  host.transcript = [
+    said('user', 'run the tests'),
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }, row, text('<system-reminder>…</system-reminder>')] },
+  ]
+  for (let i = 0; i < 3; i++) {
+    await clock.advance(MINUTE)
+    await turn($)
+  }
+  expect(host.passedOn).toHaveLength(1)
 })
 
 test("another repository's notices stay out, and --all ones reach every repository", async ($, on) => {
@@ -198,6 +277,7 @@ test("another repository's notices stay out, and --all ones reach every reposito
   expect(await ui.find({ type: 'Text', text: 'lib only' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: 'every session' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'notice (all) 3h:' })).toBeDefined()
+  await turn($)
   expect(host.passedOn).toEqual(['Notice to every Claude Code session on this machine, posted 3h ago with /notice: every session'])
 })
 
@@ -210,12 +290,14 @@ test('/notice clear takes down what this session shows, and the others tell thei
   ])
   const host = stubHost(on, { store })
   await $.session.start(START)
+  await turn($)
 
   expect((await run($, 'clear')).text).toBe('Cleared 2 notices.')
   expect([...store.keys()].filter((key) => key.startsWith('notice:'))).toEqual(['notice:3-lib'])
   const ui = await $.ui.mount(BAND)
   expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'Notice to every Claude Code session on this machine, posted 0m ago with /notice: every session',
@@ -230,16 +312,18 @@ test('a notice another session cleared is withdrawn from the model and the band'
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   await $.session.start(START)
+  await turn($)
 
   store.delete('notice:1-a')
   await clock.advance(MINUTE)
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'This notice no longer applies: CI is paused',
   ])
-  const ui = await $.ui.mount(BAND)
-  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
 })
 
 test('the band shows the newest three and counts the rest', async ($, on) => {
@@ -256,20 +340,23 @@ test('the band shows the newest three and counts the rest', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '+2 more' })).toBeDefined()
 })
 
-test('a reload keeps what the model was told, and /clear tells it again at the next tick', async ($, on) => {
+test('a reload keeps what the model was told, and /clear tells it again at the next turn', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
   await $.session.start(START)
+  await turn($)
   // An enable or a worker respawn fires session.start again
   await $.session.start(START)
+  await turn($)
   const told = 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused'
   expect(host.passedOn).toEqual([told])
 
   host.transcript = []
   await $.classic.SessionStart({ source: 'clear' })
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual([told, told.replace('0m ago', '1m ago')])
 })
 
@@ -279,6 +366,7 @@ test('a reload between /clear and the retelling still tells the new conversation
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   host.transcript = []
@@ -286,6 +374,7 @@ test('a reload between /clear and the retelling still tells the new conversation
   await clock.advance(MINUTE / 2)
   // A hot reload starts the module over
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
@@ -345,10 +434,12 @@ test('a cleared notice is not withdrawn while another notice shown carries its t
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', null, NOW)]])
   const host = stubHost(on, { store })
   await $.session.start(START)
+  await turn($)
 
   store.delete('notice:1-a')
   store.set('notice:2-b', notice('CI is paused', APP_KEY, NOW + MINUTE))
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session on this machine, posted 0m ago with /notice: CI is paused',
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
@@ -360,15 +451,15 @@ test('/branch keeps what the fork copied, without telling it twice', async ($, o
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   // The fork copies the conversation, the notice with it; a reload right after changes nothing
   await $.classic.SessionStart({ source: 'fork' })
   await $.session.start(START)
   await clock.advance(MINUTE)
-  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 })
 
@@ -377,8 +468,8 @@ test('a resumed conversation is told a notice it holds was cleared meanwhile, an
   const store = new Map<string, unknown>([['notice:2-b', notice('Use the staging DB', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   // /resume installs the conversation only after its SessionStart hooks; it was told a notice that
@@ -386,30 +477,31 @@ test('a resumed conversation is told a notice it holds was cleared meanwhile, an
   await $.classic.SessionStart({ source: 'resume' })
   const line = 'Notice to every Claude Code session on this machine, posted 2h ago with /notice: CI is paused'
   host.transcript = [said('user', await signed(store, line, 'CI is paused')), said('assistant', 'Understood.')]
-  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn.slice(1)).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: Use the staging DB',
     'This notice no longer applies: CI is paused',
   ])
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(3)
 })
 
-test('a notice /rewind took out of the conversation is told again before the next prompt', async ($, on) => {
+test('a notice /rewind took out of the conversation is told again at the next turn', async ($, on) => {
   mock.clock(on, { now: NOW })
   const host = stubHost(on)
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   host.transcript = [said('user', 'first prompt'), said('assistant', 'done')]
 
   await run($, 'CI is paused')
+  await turn($)
   const told = 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused'
   expect(host.passedOn).toEqual([told])
   // Rewinding to the first prompt drops every row after it
   host.transcript = host.transcript.slice(0, 1)
-  await $.prompt.submit({ text: 'again', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toEqual([told, told])
-  await $.prompt.submit({ text: 'and again', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toEqual([told, told])
 })
 
@@ -419,10 +511,12 @@ test('a notice whose body holds a line like a withdrawal is told once', async ($
   const store = new Map<string, unknown>([['notice:1-a', notice(body, APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   await $.session.start(START)
+  await turn($)
 
   await clock.advance(2 * MINUTE)
   // A reload forgets every refusal, so only the conversation keeps it from being told again
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual(['Notice to every Claude Code session in this repository, posted 0m ago with /notice: ' + body])
 })
 
@@ -434,15 +528,16 @@ test("the person's own prompt that quotes a notice line is not taken for one", a
     said('user', 'Why did you get this?\nNotice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused'),
   ]
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
   ])
 })
 
-test('a load a restart overtook in its conversation read leaves the telling to the restart', async ($, on) => {
+test('a load a restart overtook in its conversation read leaves the telling to a later turn', async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
-  // The first load waits on the conversation until the restart has begun
+  // The turn's load waits on the conversation until the restart has begun
   let release = () => {}
   const gate = new Promise<void>((resolve) => (release = resolve))
   let reads = 0
@@ -451,35 +546,41 @@ test('a load a restart overtook in its conversation read leaves the telling to t
     if (reads === 1) await gate
   }
   const host = stubHost(on, { store, keepsRows: false, beforeRead })
-  const first = $.session.start(START)
+  await $.session.start(START)
+  const first = turn($)
   while (reads === 0) await settle()
   const second = $.session.start(START)
   await settle()
   release()
   await Promise.all([first, second])
-  // Told once, by the restart's own load, and not held back by anything the first one met
+  expect(host.passedOn).toHaveLength(0)
+  // Told once, by the next turn, and not held back by anything the overtaken load met
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 })
 
-test('a load a restart overtook in its first read leaves the telling to the restart', async ($, on) => {
+test('a load a restart overtook in its first read leaves the telling to a later turn', async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
-  // The first load waits on the repository until the restart has begun
+  // The turn's load waits on the repository until the restart has begun
   let release = () => {}
   const gate = new Promise<void>((resolve) => (release = resolve))
   let reads = 0
   const beforeRepo = async () => {
     reads += 1
-    if (reads === 1) await gate
+    // The start's own load read the repository first
+    if (reads === 2) await gate
   }
   const host = stubHost(on, { store, keepsRows: false, beforeRepo })
-  const first = $.session.start(START)
-  while (reads === 0) await settle()
+  await $.session.start(START)
+  const first = turn($)
+  while (reads < 2) await settle()
   const second = $.session.start(START)
   await settle()
   release()
   await Promise.all([first, second])
-  // Told once, by the restart's own load, and not held back by anything the first one met
+  expect(host.passedOn).toHaveLength(0)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 })
 
@@ -501,13 +602,14 @@ test('a session that ran version 0.1 reads its unsigned rows, withdrawing what w
     said('user', 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: Deploy freely'),
   ]
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
 })
 
 test('a load a switch overtook adds nothing to the conversation now installed', async ($, on) => {
   mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
-  // The first load waits on the conversation until /resume has begun
+  // The turn's load waits on the conversation until /resume has begun
   let release = () => {}
   const gate = new Promise<void>((resolve) => (release = resolve))
   let reads = 0
@@ -517,31 +619,32 @@ test('a load a switch overtook adds nothing to the conversation now installed', 
   }
   const host = stubHost(on, { store, keepsRows: false, beforeRead })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
-  const started = $.session.start(START)
+  await $.session.start(START)
+  const started = turn($)
   while (reads === 0) await settle()
   await $.classic.SessionStart({ source: 'resume' })
   release()
   await started
   expect(host.passedOn).toEqual([])
-  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 })
 
-test("a tick during /resume keeps the outgoing conversation's record to it", async ($, on) => {
+test("a turn that begins during /resume keeps the outgoing conversation's record to it", async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const resumed = { at: NOW, told: [{ key: 'repo\nUse the staging DB', text: 'Use the staging DB' }] }
   store.set('told:new', resumed)
   let id = 'old'
   const host = stubHost(on, { store, id: () => id })
-  // A tick lands while the outgoing conversation is still installed
+  // A turn's load lands while the outgoing conversation is still installed
   on('classic.SessionStart', async () => {
-    await clock.advance(MINUTE)
+    await turn($)
     return {}
   })
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   expect(store.get('told:old')).toEqual({ at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] })
 
   // The host moves to the resumed session's id before its SessionStart hooks
@@ -550,7 +653,7 @@ test("a tick during /resume keeps the outgoing conversation's record to it", asy
   expect(store.get('told:new')).toEqual(resumed)
 })
 
-test('a tick while the new session id is read keeps each record to its own conversation', async ($, on) => {
+test('a turn that begins while the new session id is read keeps each record to its own conversation', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   let id = 'old'
@@ -561,8 +664,8 @@ test('a tick while the new session id is read keeps each record to its own conve
     beforeId: async () => {
       if (!slowId) return
       slowId = false
-      // A tick lands while the id is read
-      await clock.advance(MINUTE)
+      // A turn's load lands while the id is read
+      await turn($)
     },
   })
   on('classic.SessionStart', () => {
@@ -572,6 +675,7 @@ test('a tick while the new session id is read keeps each record to its own conve
   })
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   const outgoing = { at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] }
   expect(store.get('told:old')).toEqual(outgoing)
 
@@ -588,9 +692,9 @@ test("/branch carries the record of what the copied conversation was told", asyn
   let id = 'old'
   const host = stubHost(on, { store, id: () => id })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   id = 'new'
   await $.classic.SessionStart({ source: 'fork' })
   await settle()
@@ -600,11 +704,11 @@ test("/branch carries the record of what the copied conversation was told", asyn
   const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
   host.transcript = Array.from({ length: 4096 }, (_, i) => message(i))
   store.delete('notice:1-a')
-  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn.at(-1)).toBe('This notice no longer applies: CI is paused')
 })
 
-test('a tick while /branch copies the record leaves nothing of it behind', async ($, on) => {
+test('a turn that begins while /branch copies the record leaves nothing of it behind', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([
     ['notice:1-a', notice('CI is paused', APP_KEY, NOW)],
@@ -618,29 +722,29 @@ test('a tick while /branch copies the record leaves nothing of it behind', async
     beforeGet: async (key) => {
       if (!slowCopy || key !== 'told:old') return
       slowCopy = false
-      // A tick lands while the copied record is read, and is given the time to write its own
-      void clock.advance(MINUTE)
+      // A turn's load lands while the copied record is read, and is given the time to write its own
+      void turn($)
       for (let i = 0; i < 40 && !store.has('told:new'); i++) await settle()
     },
   })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(2)
   expect((store.get('told:old') as { told: unknown[] }).told).toHaveLength(2)
 
   // The copied conversation's window is full, and holds the row of only one notice; the other has
   // been cleared since the outgoing conversation last loaded
-  const kept = host.transcript.find((m) => m.text.includes('Use the staging DB'))!
+  const kept = host.transcript.flatMap((m) => m.content).find((b) => typeof b.text === 'string' && b.text.includes('Use the staging DB'))!
   const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
-  host.transcript = [...Array.from({ length: 4095 }, (_, i) => message(i)), kept]
+  host.transcript = [...Array.from({ length: 4095 }, (_, i) => message(i)), { role: 'user', content: [kept] }]
   store.delete('notice:1-a')
   id = 'new'
   slowCopy = true
   await $.classic.SessionStart({ source: 'fork' })
   await settle()
-  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn.slice(2)).toEqual(['This notice no longer applies: CI is paused'])
 })
 
@@ -649,6 +753,7 @@ test('rows signed before another session made its secret at the same time stay r
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   // A session that found no secret either writes its own, as this module does, after this one
@@ -658,6 +763,7 @@ test('rows signed before another session made its secret at the same time stay r
   else store.set('secret:' + other, other)
   store.delete('notice:1-a')
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
 })
 
@@ -669,17 +775,16 @@ test("/resume reads the resumed session's version 0.1 record", async ($, on) => 
     known = [{ id: '1-a', text: 'CI is paused' }]
     return {}
   })
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
 
   await $.classic.SessionStart({ source: 'resume' })
   host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 1h ago with /notice: CI is paused')]
-  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toEqual(['This notice no longer applies: CI is paused'])
 })
 
-test("a tick while /resume reads version 0.1's record reads the resumed rows with it", async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
+test("a turn that begins while /resume reads version 0.1's record reads the resumed rows with it", async ($, on) => {
+  mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   let known: { id: string; text: string }[] = []
   let slowState = false
@@ -689,8 +794,8 @@ test("a tick while /resume reads version 0.1's record reads the resumed rows wit
     beforeState: async () => {
       if (!slowState) return
       slowState = false
-      // A tick lands while the record is read, and is given the time to finish
-      void clock.advance(MINUTE)
+      // A turn's load lands while the record is read, and is given the time to finish
+      void turn($)
       for (let i = 0; i < 20; i++) await settle()
     },
   })
@@ -701,6 +806,7 @@ test("a tick while /resume reads version 0.1's record reads the resumed rows wit
     return {}
   })
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   slowState = true
@@ -715,6 +821,7 @@ test('a version 0.1 row whose body holds a line like a withdrawal is read whole'
   const host = stubHost(on, { known: () => [{ id: '1-a', text: body }] })
   host.transcript = [said('user', 'Notice to every Claude Code session in this repository, posted 0m ago with /notice: ' + body)]
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual(['This notice no longer applies: ' + body])
 })
 
@@ -722,20 +829,41 @@ test('a refused line is tried again after a rewind, even in a conversation past 
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store, keepsRows: false })
-  on('prompt.submit', ($, e) => e as never)
   const message = (i: number) => said(i % 2 === 0 ? 'user' : 'assistant', 'message ' + i)
   const window = (from: number) => Array.from({ length: 4096 }, (_, i) => message(from + i))
   host.transcript = window(100)
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   // New messages push the oldest out of the window: the same conversation, carried on
   host.transcript = window(110)
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
   // Rewinding ten messages still leaves a full window, now reaching further back
   host.transcript = window(100)
-  await $.prompt.submit({ text: 'again', origin: { kind: 'composer' } } as never)
+  await turn($)
+  expect(host.passedOn).toHaveLength(2)
+})
+
+test('a refused line stays refused once a kept one is folded into the message beside it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([
+    ['notice:1-a', notice('CI is paused', APP_KEY, NOW)],
+    ['notice:2-a', notice('Use the staging DB', APP_KEY, NOW + 1)],
+  ])
+  const host = stubHost(on, { store, keepsRows: (row) => !row.includes('staging') })
+  host.transcript = [said('user', 'first prompt')]
+  await $.session.start(START)
+  await turn($)
+  expect(host.passedOn).toHaveLength(2)
+  // The kept row joined the prompt's message; the refused one is not retried while the
+  // conversation carries on
+  expect(host.transcript).toHaveLength(1)
+  expect(host.transcript[0]!.content).toHaveLength(2)
+  await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(2)
 })
 
@@ -749,6 +877,7 @@ test("a prompt that reads exactly like a row, but isn't signed by this module, i
     said('user', 'This notice no longer applies: CI is paused\n(notice-board ref 00000000)'),
   ]
   await $.session.start(START)
+  await turn($)
   expect(host.passedOn).toEqual([])
 })
 
@@ -757,9 +886,9 @@ test('a notice told before a full window dropped its row is still withdrawn when
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store })
   on('classic.SessionStart', () => ({}))
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
   expect(store.get('told:this')).toEqual({ at: NOW + MINUTE, told: [{ key: 'repo\nCI is paused', text: 'CI is paused' }] })
 
@@ -768,9 +897,10 @@ test('a notice told before a full window dropped its row is still withdrawn when
   host.transcript = Array.from({ length: 4096 }, (_, i) => message(i))
   store.delete('notice:1-a')
   await $.classic.SessionStart({ source: 'resume' })
-  await $.prompt.submit({ text: 'back', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(2)
   expect(store.has('told:this')).toBe(false)
 })
@@ -784,41 +914,44 @@ test('a notice a compaction folded away is still withdrawn when cleared', async 
     host.transcript = [said('user', 'Summary of the conversation so far.')]
     return {}
   })
-  on('prompt.submit', ($, e) => e as never)
   await $.session.start(START)
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toHaveLength(1)
 
   await $.classic.SessionStart({ source: 'compact' })
   store.delete('notice:1-a')
-  await $.prompt.submit({ text: 'go on', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn.slice(1)).toEqual(['This notice no longer applies: CI is paused'])
 })
 
-test('a refusal met by a tick during a conversation switch is not held against the new one', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
+test('a refusal met by a turn during a conversation switch is not held against the new one', async ($, on) => {
+  mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
   const host = stubHost(on, { store, keepsRows: false })
-  on('prompt.submit', ($, e) => e as never)
-  // A tick fires while the switch is under way, against the outgoing conversation
+  // A turn's load lands while the switch is under way, against the outgoing conversation
   on('classic.SessionStart', async () => {
-    await clock.advance(MINUTE)
+    await turn($)
     return {}
   })
   await $.session.start(START)
+  await turn($)
   await $.classic.SessionStart({ source: 'clear' })
   expect(host.passedOn).toHaveLength(2)
-  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  await turn($)
   expect(host.passedOn).toHaveLength(3)
 })
 
-test('a refused line is not retried every tick', async ($, on) => {
+test('a refused line is not retried every turn', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
-  // A host that keeps no row: the debug line is all there is
+  // A host that keeps no row
   const host = stubHost(on, { store, keepsRows: false })
   await $.session.start(START)
-  await clock.advance(3 * MINUTE)
+  for (let i = 0; i < 3; i++) {
+    await turn($)
+    await clock.advance(MINUTE)
+  }
   expect(host.passedOn).toHaveLength(1)
   expect(host.transcript).toEqual([])
 })
@@ -829,9 +962,11 @@ test("a session that moves to another repository is told its notices no longer a
   let repo = HTTPS
   const host = stubHost(on, { store, repo: () => repo })
   await $.session.start(START)
+  await turn($)
 
   repo = { root: '/src/lib', remote: 'https://github.com/owner/lib.git', internal: false, name: null }
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual([
     'Notice to every Claude Code session in this repository, posted 0m ago with /notice: CI is paused',
     'This notice no longer applies: CI is paused',
@@ -851,14 +986,15 @@ test('two posts in the same millisecond keep both notices', async ($, on) => {
 test('a session that ends stops picking up notices', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = new Map<string, unknown>()
-  const host = stubHost(on, { store })
+  stubHost(on, { store })
   on('session.end', () => ({ sessionId: 'this' }))
   await $.session.start(START)
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'this', resume: { id: '' } })
   store.set('notice:1-other', notice('CI is paused', APP_KEY, NOW))
   await clock.advance(MINUTE)
-  expect(host.passedOn).toEqual([])
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: 'CI is paused' })).toBeUndefined()
 })
 
 // Stands in for pr-relay, which posts through /notice when it sees a merge: its $.store is its own,
@@ -883,7 +1019,8 @@ test('another plugin posts through $.command.run, as pr-relay does on a merge', 
   await clock.advance(MINUTE)
   expect(noticesIn(host.store)).toEqual([notice('main advanced (#12). Rebase before the next push.', APP_KEY, NOW + MINUTE)])
   await clock.advance(MINUTE)
+  await turn($)
   expect(host.passedOn).toEqual([
-    'Notice to every Claude Code session in this repository, posted 0m ago with /notice: main advanced (#12). Rebase before the next push.',
+    'Notice to every Claude Code session in this repository, posted 1m ago with /notice: main advanced (#12). Rebase before the next push.',
   ])
 })
