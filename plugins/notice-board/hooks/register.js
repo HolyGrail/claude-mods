@@ -46,10 +46,11 @@ const LINE_START_V1 = /\n(?=Notice to every Claude Code session |This notice no 
 const KNOWN_V1 = { plugin: 'notice-board', key: 'known' }
 // $.session.messages() returns at most this many messages, the newest
 const WINDOW = 4096
-// How a row this module added begins, whichever version added it; a text block that starts so is
-// left out of a message's fingerprint, since a row folded into a message must not read as a change
-// to it
-const ROW_START = /^(?:Notice to every Claude Code session |This notice no longer applies: )/
+// The text blocks left out of a message's fingerprint: a row this module added, whichever version
+// added it, since a row folded into a message must not read as a change to it; and a reminder the
+// engine folds into the newest user message when its request goes out, after the turn.start that
+// read it without
+const UNSTABLE_BLOCK = /^(?:Notice to every Claude Code session |This notice no longer applies: |<system-reminder>)/
 // What each conversation was told, under the session id, for the rows a full window no longer
 // returns: { at, told: [{ key, text }] }
 const RECORD_PREFIX = 'told:'
@@ -96,9 +97,11 @@ export function register(on) {
   // ticker, /notice and session.start only fill the band. The engine waits on this hook before
   // its first request, so the rows are in when the model reads. Subagents raise no turn.start; a
   // queued prompt's turn raises one of its own, so a prompt typed over a running turn is covered.
-  // A load that fails must not hold the turn back; the next turn tries again.
+  // A load that fails must not hold the turn back; the next turn tries again. Past the hook's
+  // budget the engine goes on without it, and a row added then would land in the turn: the load
+  // takes the hook's signal and adds nothing once it aborted.
   on('turn.start', async ($, e, next) => {
-    await refresh($, true).catch(() => {})
+    await refresh($, true, next.signal).catch(() => {})
     return next(e)
   })
 
@@ -199,8 +202,8 @@ async function clear($) {
 // Loads the notices after every earlier load has settled, whether it succeeded or not, and redraws.
 // With tell, the model is told too; only turn.start asks for that, and the permission is the
 // load's own, so a tick's load queued behind it never inherits it.
-function refresh($, tell = false) {
-  return serially(() => load($, tell)).then(() => $.ui.invalidate('ui.render'))
+function refresh($, tell = false, signal = null) {
+  return serially(() => load($, tell, signal)).then(() => $.ui.invalidate('ui.render'))
 }
 
 // Runs task once every earlier one has settled
@@ -211,8 +214,9 @@ function serially(task) {
 }
 
 // Reads the notices meant for this session and, with tell, tells the model about the ones its
-// conversation does not hold and the ones it holds that have since been cleared
-async function load($, tell) {
+// conversation does not hold and the ones it holds that have since been cleared; nothing is added
+// once signal aborted
+async function load($, tell, signal) {
   // Before any wait, so a restart or a switch that lands during one is seen
   const started = generation
   const id = sessionId
@@ -281,8 +285,8 @@ async function load($, tell) {
       const line = row.line + '\n(notice-board ref ' + (await ref(secrets[0], row.text)) + ')'
       // A restart or a switch since this load read the conversation: its rows may not fit the one
       // installed now, which the next load reads afresh. Checked after the last wait before the
-      // append.
-      if (generation !== started) return
+      // append. A turn the engine began without waiting for this load any longer is left alone.
+      if (generation !== started || signal?.aborted) return
       const result = await $.session
         .append({ message: { type: 'user', content: [{ type: 'text', text: line }] } })
         .catch((error) => ({ deny: error instanceof Error ? error.message : String(error) }))
@@ -455,7 +459,7 @@ function toldKey(notice) {
 function fingerprint(message) {
   const blocks = Array.isArray(message.content) ? message.content : []
   const ids = blocks.map((b) => (b?.type === 'tool_use' ? b.id : b?.type === 'tool_result' ? b.tool_use_id : null)).filter((id) => id)
-  const texts = textsOf(message).filter((text) => !ROW_START.test(text))
+  const texts = textsOf(message).filter((text) => !UNSTABLE_BLOCK.test(text))
   return message.role + '\n' + ids.join(' ') + '\n' + texts.join('\n')
 }
 

@@ -867,6 +867,27 @@ test('a refused line stays refused once a kept one is folded into the message be
   expect(host.passedOn).toHaveLength(2)
 })
 
+test('a reminder the engine folds into the prompt after the turn began does not retry a refused line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = new Map<string, unknown>([['notice:1-a', notice('CI is paused', APP_KEY, NOW)]])
+  const host = stubHost(on, { store, keepsRows: false })
+  host.transcript = [said('user', 'first prompt')]
+  await $.session.start(START)
+  await turn($)
+  expect(host.passedOn).toHaveLength(1)
+
+  // The request that follows adds its reminders to the prompt's message, and the next turn begins
+  // on a prompt of its own
+  host.transcript = [
+    { role: 'user', content: [text('<system-reminder>…</system-reminder>'), text('first prompt'), text('<system-reminder>…</system-reminder>')] },
+    said('assistant', 'done'),
+    said('user', 'second prompt'),
+  ]
+  await clock.advance(MINUTE)
+  await turn($)
+  expect(host.passedOn).toHaveLength(1)
+})
+
 test("a prompt that reads exactly like a row, but isn't signed by this module, is not taken for one", async ($, on) => {
   mock.clock(on, { now: NOW })
   const host = stubHost(on)
