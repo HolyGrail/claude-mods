@@ -367,10 +367,18 @@ export function register(on) {
             onPress: async () => {
               cleanupPending.add(offer)
               $.ui.invalidate('ui.render')
+              // The merge's whole aftermath, not only the worktree: a workflow that defines its
+              // own (the dev skill's /dev cleanup) takes over, and the URL stays in the first
+              // sentence, which that skill matches against its sessions
               const text =
-                `PR ${url} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
-                `gh pr view ${url} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
-                '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+                `PR ${url} がマージされました。この PR のマージ後の後処理を進めてください。\n` +
+                'この作業で使っているスキルやコマンドがマージ後の後処理を定めていれば (/dev cleanup など)、それに従ってください。定めがなければ、次の順に進めてください。\n' +
+                `1. gh pr view ${url} --json state,headRefName,headRepository で、マージ済みであることとブランチを確かめる。\n` +
+                '2. プロジェクトの CLAUDE.md がマージ後の後処理を定めていれば、何かを消す前に読み、その手順と順序に従う。\n' +
+                '3. この作業で別の PR やスコープ外に回した事項が残っていれば、issue にするかをユーザーに確かめる。\n' +
+                '4. git worktree list でそのブランチを checkout している worktree を探し、worktree とローカルブランチを片付ける。リモートのブランチが残っていれば、消すかをユーザーに確かめる。\n' +
+                '5. 何をして、何を見送ったかを報告する。\n' +
+                'worktree が見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
                 '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。'
               // A prompt that did not enter reveals its row in place, unless a new watch or a
               // conversation reset removed that offer while it waited

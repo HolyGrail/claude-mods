@@ -359,7 +359,18 @@ function monitorNotice(number = 7) {
 }
 
 // An approval that follows fresh monitored reviews points to the monitor's findings
-const MONITORED_APPROVAL_NOTE = 'なお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
+const cleanupPrompt = (url: string) =>
+  `PR ${url} がマージされました。この PR のマージ後の後処理を進めてください。\n` +
+  'この作業で使っているスキルやコマンドがマージ後の後処理を定めていれば (/dev cleanup など)、それに従ってください。定めがなければ、次の順に進めてください。\n' +
+  `1. gh pr view ${url} --json state,headRefName,headRepository で、マージ済みであることとブランチを確かめる。\n` +
+  '2. プロジェクトの CLAUDE.md がマージ後の後処理を定めていれば、何かを消す前に読み、その手順と順序に従う。\n' +
+  '3. この作業で別の PR やスコープ外に回した事項が残っていれば、issue にするかをユーザーに確かめる。\n' +
+  '4. git worktree list でそのブランチを checkout している worktree を探し、worktree とローカルブランチを片付ける。リモートのブランチが残っていれば、消すかをユーザーに確かめる。\n' +
+  '5. 何をして、何を見送ったかを報告する。\n' +
+  'worktree が見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+  '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。'
+
+const MONITORED_APPROVAL_NOTE ='なお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
 
 test('an auto-fix primary marks reviews without fetching details or prompting and shows the monitor', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -997,12 +1008,7 @@ test('other bound merges have independent cleanup rows while the watched pull re
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'drawn by another mod' })).toBeDefined()
   await ui.press({ key: `cleanup-${PR9.toLowerCase()}` })
-  expect(w.prompts).toEqual([
-    `PR ${PR9} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
-    `gh pr view ${PR9} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
-    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
-    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
-  ])
+  expect(w.prompts).toEqual([cleanupPrompt(PR9)])
   expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeUndefined()
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase().replace('/7', '/10')}` })).toBeDefined()
   await clock.advance(MINUTE)
@@ -1025,12 +1031,7 @@ test('cleanup identifies a bound pull request by its URL and checks its reposito
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: `cleanup-${foreign.toLowerCase()}` })
 
-  expect(w.prompts).toHaveLength(1)
-  expect(w.prompts[0]).toContain(`PR ${foreign} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。`)
-  expect(w.prompts[0]).toContain(`gh pr view ${foreign} --json headRefName,headRepository`)
-  expect(w.prompts[0]).toContain('git worktree list でそのブランチを checkout している worktree を探してください。')
-  expect(w.prompts[0]).toContain('見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。')
-  expect(w.prompts[0]).toContain('未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。')
+  expect(w.prompts).toEqual([cleanupPrompt(foreign)])
   expect(w.status).toBe('PR #7 監視中 · 21:01 確認')
 })
 
@@ -1831,12 +1832,7 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'PR #7 がマージされました' })).toBeDefined()
   await ui.press({ key: `cleanup-${URL.toLowerCase()}` })
-  expect(w.prompts).toEqual([
-    `PR ${URL} がマージされました。この PR のブランチの worktree とローカルブランチを片付けてください。\n` +
-    `gh pr view ${URL} --json headRefName,headRepository でブランチを確かめ、git worktree list でそのブランチを checkout している worktree を探してください。\n` +
-    '見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
-    '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
-  ])
+  expect(w.prompts).toEqual([cleanupPrompt(URL)])
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeUndefined()
 })
 
