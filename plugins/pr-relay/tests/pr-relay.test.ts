@@ -209,7 +209,9 @@ type World = {
   // What git merge-base --is-ancestor of the base tip answers: contained, behind, or a tip the
   // repository has not fetched
   ancestry?: 'contained' | 'behind' | 'missing'
-  // The argument vectors and directories of the git calls
+  // The origin remote of the pushing repository; null when it has none
+  origin?: string | null
+  // The argument vectors and directories of the git merge-base calls
   gitRuns: { argv: readonly string[]; init?: ProcessRunInit }[]
   status: string | undefined
   queries: number
@@ -280,6 +282,9 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (e.argv[0] === 'git' && e.argv[1] === 'remote') {
+      return w.origin === null ? run(2, '', 'error: No such remote \'origin\'') : run(0, `${w.origin ?? 'git@github.com:HolyGrail/claude-mods.git'}\n`)
+    }
     if (e.argv[0] === 'git') {
       w.gitRuns.push({ argv: e.argv, init: e.init })
       if (w.ancestry === 'behind') return run(1, '')
@@ -1965,6 +1970,31 @@ for (const ancestry of ['behind', 'missing'] as const) {
     expect(w.gitRuns).toEqual([{ argv: ['git', 'merge-base', '--is-ancestor', 'c0c0c0c0123456789', 'HEAD'], init: undefined }])
   })
 }
+
+for (const origin of ['git@github.com:HolyGrail/other.git', 'https://notgithub.com/HolyGrail/claude-mods', null]) {
+  test(`a push from a repository other than the watched pull request's is not checked: ${origin}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { ancestry: 'missing', origin })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(ran.context).toBeUndefined()
+    expect(w.gitRuns).toEqual([])
+  })
+}
+
+test('a push from an origin spelled another way is still checked', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ancestry: 'behind', origin: 'ssh://git@ssh.github.com:443/holygrail/Claude-Mods.git' })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.context).toEqual([expect.stringMatching(BEHIND)])
+})
 
 test('a push that holds the base tip adds nothing', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })

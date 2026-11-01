@@ -1138,7 +1138,7 @@ function pushedCommits(ran) {
 // or null. Only the pull request's own branch is checked: HEAD when the output names no branch.
 // A tip the repository has not fetched is left out too, which git reports as no valid commit.
 async function baseAdvanced($, push, moved, matches) {
-  const base = push.pr && push.pr === watched?.id && !watched.ended && lastBase ? { ...lastBase, number: watched.number } : null
+  const base = push.pr && push.pr === watched?.id && !watched.ended && lastBase ? { ...lastBase, number: watched.number, owner: watched.owner, repo: watched.name } : null
   if (!base) return null
   const named = moved?.refs && Object.keys(moved.refs).length > 0
   const pushed = named ? moved.refs[base.branch] : 'HEAD'
@@ -1146,10 +1146,20 @@ async function baseAdvanced($, push, moved, matches) {
   // Pushes from several directories in one Bash call may be of other repositories
   const directories = await Promise.all(matches.map((match) => pushDirectory($, match[1])))
   if (directories.includes(null) || new Set(directories).size > 1) return null
-  const cwd = directories[0]
-  const ran = await $.process.run(['git', 'merge-base', '--is-ancestor', base.oid, pushed], cwd === undefined ? undefined : { cwd })
+  const init = directories[0] === undefined ? undefined : { cwd: directories[0] }
+  // A watch by URL may be of another repository, whose base tip this one never has
+  const origin = await $.process.run(['git', 'remote', 'get-url', 'origin'], init)
+  if (origin.exitCode !== 0 || !inRepo(origin.stdout, base)) return null
+  const ran = await $.process.run(['git', 'merge-base', '--is-ancestor', base.oid, pushed], init)
   const missing = ran.exitCode === 128 && ran.stderr.includes(base.oid)
   return ran.exitCode === 1 || missing ? base : null
+}
+
+// Whether a remote URL is the pull request's repository on GitHub, spelled as a URL or scp-style
+// (ssh.github.com is its SSH over port 443), in whatever case
+function inRepo(remote, pr) {
+  const path = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+\/|[:/])\/*([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(remote?.trim() ?? '')
+  return path != null && `${path[1]}/${path[2]}`.toLowerCase() === `${pr.owner}/${pr.repo}`.toLowerCase()
 }
 
 // The head the watched pull request had as lately as this session knows: its own last poll or the
