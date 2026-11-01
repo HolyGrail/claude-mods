@@ -72,7 +72,7 @@ const MAX_PAGES = 10
 const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int!, $before: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
-const QUERY = queryOf(`state headRefOid headRefName baseRefName commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
+const QUERY = queryOf(`state headRefOid headRefName baseRefName baseRef { target { oid } } commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
 // Review bodies stay out of the per-minute query so gh's output does not get cut
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
@@ -104,6 +104,9 @@ let knownSince = 0
 // The head of the watched pull request as this session's last poll found it, and when
 let lastHead = null
 let lastHeadAt = 0
+// The watched pull request's base branch and its tip, and the pull request's own branch, as this
+// session's last poll found them
+let lastBase = null
 // This session's latest poll note, { key, pr, at, since, pending, running, serial }, as last written,
 // so an older poll does not mark it finished, a push can update it and a stop can leave it idle
 let lastNote = null
@@ -324,6 +327,15 @@ export function register(on) {
     const moved = push && !failed ? pushedCommits(ran) : null
     if (push) await finish({ dropped: failed || moved?.shas.length === 0, shas: moved?.shas, refs: moved?.refs })
     if (failed) return ran
+    // The base branch is checked as a push lands, when a rebase matters, rather than told to every
+    // session as it merges, most of which have it already
+    const base = push && moved?.shas.length !== 0 ? await baseAdvanced($, push, moved, pushMatches).catch(() => null) : null
+    if (base) {
+      const fix =
+        `${$.plugin.name}: PR #${base.number} のマージ先 ${base.name} が進んでいて、いま push したコミットはその先端 (${base.oid.slice(0, 7)}) を含んでいません。` +
+        `次の push の前に origin/${base.name} へ rebase してください。`
+      ran = { ...ran, context: [...(ran.context ?? []), fix] }
+    }
     if (creates) {
       const url = ran.text?.match(PR_URL)?.[0]
       if (url) watch($, { url, since: startedAt })
@@ -414,6 +426,7 @@ function reset($) {
   boundStates = new Map()
   monitored.clear()
   pushes = []
+  lastBase = null
   $.ui.invalidate('ui.render')
   showStatus($)
 }
@@ -471,6 +484,7 @@ function watch($, { url, since }) {
   lookupFailure = null
   lastHead = null
   lastHeadAt = 0
+  lastBase = null
   // Watching a pull request again removes only its own cleanup offer
   removeCleanup($, pr.id)
   // Ask at once: a review or a merge may have come while no session watched
@@ -713,6 +727,8 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     lastHead = data.headRefOid
     lastHeadAt = seenAt
   }
+  const baseOid = data.baseRef?.target?.oid
+  lastBase = baseOid ? { name: data.baseRefName || 'main', oid: baseOid, branch: data.headRefName } : null
   lastCheck = { at: now }
   // One that leaves the waking to another session leaves the end to it too, and sees it next round
   // from the record, as the session that relays: only then does it stop and offer the cleanup
@@ -865,8 +881,6 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, s
       return [
         {
           toast: `PR #${pr.number} が${ENDED[state]}されました`,
-          // Only a merge moves the base branch under the other sessions' work
-          notice: state === 'MERGED' ? `${baseName(data)} advanced (#${pr.number}). Rebase before the next push.` : null,
           pr,
           undo: (r) => {
             if (r.ended === state) r.ended = null
@@ -1120,6 +1134,24 @@ function pushedCommits(ran) {
   return { shas: [...new Set(moves.map(([sha]) => sha))], refs }
 }
 
+// The watched pull request's base branch when the push left out its tip as the last poll saw it,
+// or null. Only the pull request's own branch is checked: HEAD when the output names no branch.
+// A tip the repository has not fetched is left out too, which git reports as no valid commit.
+async function baseAdvanced($, push, moved, matches) {
+  const base = push.pr && push.pr === watched?.id && !watched.ended && lastBase ? { ...lastBase, number: watched.number } : null
+  if (!base) return null
+  const named = moved?.refs && Object.keys(moved.refs).length > 0
+  const pushed = named ? moved.refs[base.branch] : 'HEAD'
+  if (!pushed) return null
+  // Pushes from several directories in one Bash call may be of other repositories
+  const directories = await Promise.all(matches.map((match) => pushDirectory($, match[1])))
+  if (directories.includes(null) || new Set(directories).size > 1) return null
+  const cwd = directories[0]
+  const ran = await $.process.run(['git', 'merge-base', '--is-ancestor', base.oid, pushed], cwd === undefined ? undefined : { cwd })
+  const missing = ran.exitCode === 128 && ran.stderr.includes(base.oid)
+  return ran.exitCode === 1 || missing ? base : null
+}
+
 // The head the watched pull request had as lately as this session knows: its own last poll or the
 // record another session wrote since
 async function headBefore($, prId) {
@@ -1243,11 +1275,8 @@ function relay($, pr, signals, record) {
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, toast, notice, pr, reviews, approvedAt, undo }) {
-  if (toast) {
-    if (notice) postNotice($, pr, notice)
-    return $.ui.toast(toast)
-  }
+function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
+  if (toast) return $.ui.toast(toast)
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
@@ -1260,31 +1289,6 @@ function deliver($, key, { text, toast, notice, pr, reviews, approvedAt, undo })
     .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
     .then((entered) => entered || takeBack($, key, undo))
     .catch(() => {})
-}
-
-// The branch a pull request merged into, as a notice may start with: /notice reads a leading
-// --all as its option, and a branch may be named that
-function baseName(data) {
-  const base = data.baseRefName || 'main'
-  return base.startsWith('-') ? `Branch ${base}` : base
-}
-
-// Tells the other sessions in the repository through notice-board's /notice, without waiting: the
-// command runs only once the session is idle. /notice posts to the session's own repository, so a
-// pull request of another one (watched by URL) posts nothing; nor does a session without
-// notice-board, where the command is unknown and the call rejects.
-function postNotice($, pr, text) {
-  $.session
-    .repo()
-    .then((repo) => (inRepo(repo, pr) ? $.command.run({ command: 'notice', args: text }) : null))
-    .catch(() => {})
-}
-
-// Whether the origin remote is the pull request's repository on GitHub, spelled as a URL or
-// scp-style (ssh.github.com is its SSH over port 443), in whatever case
-function inRepo(repo, pr) {
-  const path = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+\/|[:/])\/*([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(repo?.remote?.trim() ?? '')
-  return path != null && `${path[1]}/${path[2]}`.toLowerCase() === `${pr.owner}/${pr.name}`.toLowerCase()
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll
