@@ -61,6 +61,8 @@ type Pull = {
   branch?: string
   // The branch it merges into
   base?: string
+  // That branch's tip
+  baseTip?: string
   committedAt?: number
   thumbsUpAt?: number
   reviews?: Review[]
@@ -91,6 +93,7 @@ function graphql(pull: Pull, before?: string) {
     headRefOid: pull.head ?? 'a1',
     headRefName: pull.branch ?? 'feature',
     baseRefName: pull.base ?? 'main',
+    baseRef: { target: { oid: pull.baseTip ?? 'c0c0c0c0123456789' } },
     commits: { nodes: [{ commit: { committedDate: iso(pull.committedAt ?? LAST_PUSH) } }] },
     reactionGroups: [
       {
@@ -203,12 +206,13 @@ type World = {
   deleted: string[]
   prompts: string[]
   toasts: string[]
-  // The origin remote of the session's repository; null outside one
-  remote: string | null
-  // The arguments of the /notice runs pr-relay asked for
-  posts: string[]
-  // Stands for a session without notice-board, where /notice is unknown
-  postError?: string
+  // What git merge-base --is-ancestor of the base tip answers: contained, behind, or a tip the
+  // repository has not fetched
+  ancestry?: 'contained' | 'behind' | 'missing'
+  // The origin remote of the pushing repository; null when it has none
+  origin?: string | null
+  // The argument vectors and directories of the git merge-base calls
+  gitRuns: { argv: readonly string[]; init?: ProcessRunInit }[]
   status: string | undefined
   queries: number
   sessionId: string
@@ -222,8 +226,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     deleted: [],
     prompts: [],
     toasts: [],
-    remote: 'git@github.com:HolyGrail/claude-mods.git',
-    posts: [],
+    gitRuns: [],
     status: undefined,
     queries: 0,
     toolLists: 0,
@@ -279,6 +282,15 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     const run = (exitCode: number, stdout: string, stderr = '') => ({
       value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (e.argv[0] === 'git' && e.argv[1] === 'remote') {
+      return w.origin === null ? run(2, '', 'error: No such remote \'origin\'') : run(0, `${w.origin ?? 'git@github.com:HolyGrail/claude-mods.git'}\n`)
+    }
+    if (e.argv[0] === 'git') {
+      w.gitRuns.push({ argv: e.argv, init: e.init })
+      if (w.ancestry === 'behind') return run(1, '')
+      if (w.ancestry === 'missing') return run(128, '', `fatal: Not a valid commit name ${e.argv[3]}`)
+      return run(0, '')
+    }
     if (e.argv[1] === 'pr') {
       w.branchLookups += 1
       if (w.branchPr === 'error') return run(1, '', 'error connecting to api.github.com')
@@ -335,14 +347,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     w.toasts.push(e.text)
     return { value: undefined }
   })
-  on('session.repo', () => ({
-    value: w.remote === null ? null : { root: '/repo', remote: w.remote, internal: false, name: null },
-  }))
-  on('command.run', ($, e) => {
-    if (w.postError) throw new Error(w.postError)
-    w.posts.push(`/${e.command} ${e.args}`)
-    return { text: 'Posted.' }
-  })
+
   on('ui.status', ($, e) => {
     w.status = e.text
     return { value: undefined }
@@ -1139,8 +1144,6 @@ test('dismissing one merged pull request leaves the other cleanup rows', async (
   await clock.advance(MINUTE)
   expect(w.desktopCalls).toBe(4)
   expect(w.queries).toBe(3)
-  // Only the watched pull request's merge is posted to the other sessions
-  expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
 })
 
 test('a rejected cleanup prompt restores its row beside the other offers', async ($, on) => {
@@ -1824,7 +1827,6 @@ test('a merge stops the polling and offers the cleanup in the band', async ($, o
   expect(w.toasts).toEqual(['PR #7 がマージされました'])
   expect(w.status).toBe('PR #7 マージ済み')
   expect(w.prompts).toEqual([])
-  expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
 
   await clock.advance(5 * MINUTE)
   expect(w.queries).toBe(2)
@@ -1953,6 +1955,104 @@ test('a push moves the baseline, so a thumbs-up from before it is not an approva
   expect(w.prompts).toEqual([])
 })
 
+const BEHIND = /pr-relay: PR #7 のマージ先 main が進んでいて、いま push したコミットはその先端 \(c0c0c0c\) を含んでいません。次の push の前に origin\/main へ rebase してください。/
+
+for (const ancestry of ['behind', 'missing'] as const) {
+  test(`a push that leaves out the base tip (${ancestry}) tells the model to rebase`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { ancestry })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(ran.context).toEqual([expect.stringMatching(BEHIND)])
+    expect(w.gitRuns).toEqual([{ argv: ['git', 'merge-base', '--is-ancestor', 'c0c0c0c0123456789', 'HEAD'], init: undefined }])
+  })
+}
+
+for (const origin of ['git@github.com:HolyGrail/other.git', 'https://notgithub.com/HolyGrail/claude-mods', null]) {
+  test(`a push from a repository other than the watched pull request's is not checked: ${origin}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { ancestry: 'missing', origin })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(ran.context).toBeUndefined()
+    expect(w.gitRuns).toEqual([])
+  })
+}
+
+test('a push from an origin spelled another way is still checked', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ancestry: 'behind', origin: 'ssh://git@ssh.github.com:443/holygrail/Claude-Mods.git' })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.context).toEqual([expect.stringMatching(BEHIND)])
+})
+
+test('a push that holds the base tip adds nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ancestry: 'contained' })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.context).toBeUndefined()
+  expect(w.gitRuns.length).toBe(1)
+})
+
+test('the base check looks at the commit the pull request branch moved to, in the push directory', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ancestry: 'behind' })
+  const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git -C /repo/.wt/x push origin feature' })
+  expect(ran.context).toEqual([expect.stringMatching(BEHIND)])
+  expect(w.gitRuns).toEqual([{ argv: ['git', 'merge-base', '--is-ancestor', 'c0c0c0c0123456789', 'b2b2b2b'], init: { cwd: '/repo/.wt/x' } }])
+})
+
+for (const [name, stderr, command] of [
+  ['moved nothing', 'Everything up-to-date', 'git push'],
+  ['moved another branch', '   a1a1a1a..b2b2b2b  other -> other\n', 'git push origin other'],
+  ['ran in two directories', '', 'git -C /a push && git -C /b push'],
+] as const) {
+  test(`a push that ${name} is not checked against the base`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { ancestry: 'behind' })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr, interrupted: false }, text: stderr }) as never)
+    await $.session.start(START)
+    await clock.settle()
+
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(ran.context).toBeUndefined()
+    expect(w.gitRuns).toEqual([])
+  })
+}
+
+test('a push that failed, or with no pull request polled, is not checked against the base', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ancestry: 'behind', branchPr: null })
+  let failed = true
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '', isError: failed }) as never)
+  await $.session.start(START)
+  await clock.settle()
+
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push' })).context).toBeUndefined()
+  failed = false
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push' })).context).toBeUndefined()
+  expect(w.gitRuns).toEqual([])
+})
+
 test('a push that leaves the head where it was keeps the baseline', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
@@ -2043,89 +2143,6 @@ test('a review supersedes an earlier approval without another approval prompt', 
 
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
-})
-
-test('a merge notice names the branch the pull request merged into', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { remote: 'https://github.com/holygrail/Claude-Mods' })
-  await $.session.start(START)
-  await clock.settle()
-
-  w.pull = { state: 'MERGED', base: 'release/1.x' }
-  await clock.advance(MINUTE)
-  expect(w.posts).toEqual(['/notice release/1.x advanced (#7). Rebase before the next push.'])
-})
-
-test('a merge notice is posted from an origin that uses GitHub\'s SSH over port 443', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { remote: 'ssh://git@ssh.github.com:443/HolyGrail/claude-mods.git' })
-  await $.session.start(START)
-  await clock.settle()
-
-  w.pull.state = 'MERGED'
-  await clock.advance(MINUTE)
-  expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
-})
-
-test('a base branch named like an option of /notice is not read as one', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on)
-  await $.session.start(START)
-  await clock.settle()
-
-  w.pull = { state: 'MERGED', base: '--all' }
-  await clock.advance(MINUTE)
-  expect(w.posts).toEqual(['/notice Branch --all advanced (#7). Rebase before the next push.'])
-})
-
-test('a pull request closed without a merge posts no notice', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on)
-  await $.session.start(START)
-  await clock.settle()
-
-  w.pull.state = 'CLOSED'
-  await clock.advance(MINUTE)
-  expect(w.toasts).toEqual(['PR #7 がクローズされました'])
-  expect(w.posts).toEqual([])
-})
-
-for (const remote of ['git@github.com:HolyGrail/other.git', 'https://notgithub.com/HolyGrail/claude-mods', null]) {
-  test(`a merge posts no notice from a session whose repository is not the pull request's: ${remote}`, async ($, on) => {
-    const clock = mock.clock(on, { now: NOW })
-    const w = stubWorld(on, { remote })
-    await $.session.start(START)
-    await clock.settle()
-
-    w.pull.state = 'MERGED'
-    await clock.advance(MINUTE)
-    expect(w.toasts).toEqual(['PR #7 がマージされました'])
-    expect(w.posts).toEqual([])
-  })
-}
-
-test('a merge is still told where /notice is unknown', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { postError: 'unknown command: notice' })
-  await $.session.start(START)
-  await clock.settle()
-
-  w.pull.state = 'MERGED'
-  await clock.advance(MINUTE)
-  expect(w.toasts).toEqual(['PR #7 がマージされました'])
-  expect(w.status).toBe('PR #7 マージ済み')
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ ended: 'MERGED' })
-})
-
-test('a session that finds the merge already in the record posts no second notice', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on, { pull: { state: 'MERGED' } })
-  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'MERGED', at: NOW - MINUTE })
-  await $.session.start(START)
-  await clock.settle()
-
-  expect(w.toasts).toEqual([])
-  expect(w.posts).toEqual([])
 })
 
 test('a reopened pull request is reported again when it closes', async ($, on) => {
@@ -2970,7 +2987,6 @@ test('a merge seen by a session that leaves the waking to another is left to tha
   w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: null, approvedAt: 0, usageLimitAt: 0, reviews: [], ended: 'MERGED', at: NOW })
   await clock.advance(MINUTE)
   expect(w.toasts).toEqual([])
-  expect(w.posts).toEqual([])
   expect(w.status).toBe('PR #7 マージ済み')
   expect(await ui.find({ key: `cleanup-${URL.toLowerCase()}` })).toBeDefined()
   await clock.advance(5 * MINUTE)
@@ -4458,13 +4474,11 @@ test('a merge whose toast a push took back is told on a later poll', async ($, o
   await $.session.start(START)
   await clock.settle()
   expect(w.toasts).toEqual([])
-  expect(w.posts).toEqual([])
 
   // Its push moved nothing
   w.store.delete('poll:session-a')
   await clock.advance(MINUTE)
   expect(w.toasts).toEqual(['PR #7 がマージされました'])
-  expect(w.posts).toEqual(['/notice main advanced (#7). Rebase before the next push.'])
 })
 
 test('a push another session starts during the last check of the notes holds back the relay', async ($, on) => {
