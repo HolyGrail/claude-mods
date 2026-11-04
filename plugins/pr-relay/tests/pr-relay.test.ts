@@ -361,6 +361,24 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
   return w
 }
 
+// A pull request's record as the next session that writes it reads it: the marks taken back since
+// (undo:<id> keys the record has not applied yet) come off as the module applies them
+function marked(w: World, key = 'pr:' + URL.toLowerCase()) {
+  const record = { ...(w.store.get(key) as Record<string, any>) }
+  const undone: string[] = record.undone ?? []
+  const undos = [...w.store.entries()]
+    .filter(([k, v]) => k.startsWith('undo:') && (v as { pr?: string }).pr === key.slice('pr:'.length) && !undone.includes(k))
+    .map(([, v]) => v as Record<string, any>)
+    .sort((a, b) => a.at - b.at)
+  for (const u of undos) {
+    if (Array.isArray(u.reviews)) record.reviews = (record.reviews ?? []).filter((id: string) => !u.reviews.includes(String(id)))
+    if (u.approvedAt && record.approvedAt === u.approvedAt) record.approvedAt = u.previous ?? 0
+    if (u.usageLimitAt && record.usageLimitAt === u.usageLimitAt) record.usageLimitAt = u.usagePrevious ?? 0
+    if (typeof u.ended === 'string' && record.ended === u.ended) record.ended = null
+  }
+  return record
+}
+
 // The monitor identifies its pull request before quoting any GitHub comments
 function monitorNotice(number = 7) {
   return `<ci-monitor-event>\n"Auto-fix pull requests" is watching HolyGrail/claude-mods PR #${number} and detected the following.\n\n` +
@@ -391,8 +409,43 @@ test('an auto-fix primary marks reviews without fetching details or prompting an
   await clock.settle()
   expect(w.prompts).toEqual([])
   expect(w.detailsArgv).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認 · CI モニター併用')
+})
+
+test('a review is left to the CI monitor of another session polling the same pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] } })
+  // A desktop session whose CI monitor fixes this pull request polled it in an earlier round
+  w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { pr: URL.toLowerCase(), at: NOW - 40_000, since: 0, monitored: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
+for (const [what, note] of [
+  ['an idle note', { at: NOW - 40_000, idle: true }],
+  ['a note not written for three minutes', { at: NOW - 3 * MINUTE - 1_000 }],
+] as const) {
+  test(`a CI monitor known from ${what} does not hold back a review`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] } })
+    w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { pr: URL.toLowerCase(), since: 0, monitored: true, ...note })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  })
+}
+
+test('a poll note says whether this session\'s CI monitor relays the pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.store.get('poll:session-b:p1:' + URL.toLowerCase())).toMatchObject({ monitored: true })
 })
 
 test('turning off auto-fix relays the next review without resending silently marked reviews', async ($, on) => {
@@ -413,7 +466,7 @@ test('turning off auto-fix relays the next review without resending silently mar
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件、inline コメント 1 件')])
   expect(w.detailsArgv.length).toBe(1)
   expect(w.detailsArgv[0]?.slice(5)).toEqual(['-f', 'ids[]=review-2'])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1', '2'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1', '2'] })
 })
 
 // Only the SDK's leading notice may identify the watched pull request
@@ -441,7 +494,7 @@ for (const notice of [
     expect(w.prompts.length).toBe(notice.monitored ? 0 : 1)
     expect(w.detailsArgv.length).toBe(notice.monitored ? 0 : 1)
     expect(w.status?.endsWith(' · CI モニター併用')).toBe(notice.monitored)
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+    expect(marked(w)).toMatchObject({ reviews: ['1'] })
   })
 }
 
@@ -613,7 +666,7 @@ test('a monitored review followed by a thumbs-up sends only an approval with the
     `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。\n` + MONITORED_APPROVAL_NOTE,
   ])
   expect(w.detailsArgv).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
 })
@@ -630,7 +683,7 @@ for (const autoFix of [false, true]) {
     expect(w.prompts).toEqual(autoFix ? [] : [
       `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
     ])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - MINUTE })
+    expect(marked(w)).toMatchObject({ approvedAt: NOW - MINUTE })
     w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
     await clock.advance(2 * MINUTE)
     expect(w.prompts.length).toBe(autoFix ? 0 : 1)
@@ -649,7 +702,7 @@ for (const commentAt of [NOW - 2 * MINUTE, NOW]) {
     expect(w.prompts).toEqual([
       `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
     ])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: Math.max(NOW - MINUTE, commentAt) })
+    expect(marked(w)).toMatchObject({ approvedAt: Math.max(NOW - MINUTE, commentAt) })
     w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
     await clock.advance(2 * MINUTE)
     expect(w.prompts.length).toBe(1)
@@ -670,7 +723,7 @@ test('a monitored review supersedes an earlier thumbs-up even when an approval c
   await clock.settle()
   expect(w.prompts).toEqual([])
   expect(w.detailsArgv).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
 })
@@ -688,12 +741,12 @@ test('a dropped monitored thumbs-up retries when the same poll marks a later app
   await $.session.start({ ...START, surface: 'desktop' })
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('approved にしました（20:58）')])
-  expect(w.store.get(record)).toMatchObject({ approvedAt: previous })
+  expect(marked(w, record)).toMatchObject({ approvedAt: previous })
   w.dropPrompt = false
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(2)
   expect(w.prompts[1]).toBe(w.prompts[0])
-  expect(w.store.get(record)).toMatchObject({ approvedAt: NOW - MINUTE })
+  expect(marked(w, record)).toMatchObject({ approvedAt: NOW - MINUTE })
   w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(2)
@@ -729,7 +782,7 @@ for (const offset of [0, MINUTE]) {
     await clock.advance(MINUTE)
     expect(w.prompts).toEqual([])
     expect(w.detailsArgv).toEqual([])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1', '2'], approvedAt })
+    expect(marked(w)).toMatchObject({ reviews: ['1', '2'], approvedAt })
   })
 }
 
@@ -741,7 +794,7 @@ test('a monitored usage limit is marked without a toast even after auto-fix is d
   })
   await $.session.start({ ...START, surface: 'desktop' })
   await clock.settle()
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ usageLimitAt: NOW - MINUTE })
+  expect(marked(w)).toMatchObject({ usageLimitAt: NOW - MINUTE })
   expect(w.toasts).toEqual([])
   w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
   await clock.advance(2 * MINUTE)
@@ -770,7 +823,7 @@ for (const failure of ['dropped', 'rejected']) {
     await clock.settle()
     expect(w.prompts.length).toBe(1)
     expect(w.prompts[0]?.endsWith(MONITORED_APPROVAL_NOTE)).toBe(true)
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: 0, usageLimitAt: NOW - MINUTE })
+    expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: 0, usageLimitAt: NOW - MINUTE })
     refuses = false
     w.dropPrompt = false
     await clock.advance(MINUTE)
@@ -779,7 +832,7 @@ for (const failure of ['dropped', 'rejected']) {
     expect(w.prompts[1]).not.toContain(MONITORED_APPROVAL_NOTE)
     expect(w.detailsArgv).toEqual([])
     expect(w.toasts).toEqual([])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE, usageLimitAt: NOW - MINUTE })
+    expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE, usageLimitAt: NOW - MINUTE })
     await clock.advance(MINUTE)
     expect(w.prompts.length).toBe(2)
   })
@@ -1522,7 +1575,7 @@ test('a numeric review mark is not resent when GitHub supplies its fullDatabaseI
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
   expect(w.detailsArgv).toEqual([])
-  expect(w.store.get(record)).toMatchObject({ reviews: ['5398198804'] })
+  expect(marked(w, record)).toMatchObject({ reviews: ['5398198804'] })
 })
 
 test('large review ids match their details and retain every digit in headings and records', async ($, on) => {
@@ -1543,7 +1596,7 @@ test('large review ids match their details and retain every digit in headings an
   expect(w.prompts[0]).toContain('### レビュー 5398198804\nBody-only finding')
   expect(w.prompts[0]).toContain('### large.ts:7 (comment 21)\nInline finding')
   expect(w.prompts[0]).toContain('### レビュー 3\nLegacy review')
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['5398198804', '9007199254740993', '3'] })
+  expect(marked(w)).toMatchObject({ reviews: ['5398198804', '9007199254740993', '3'] })
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
 })
@@ -1563,7 +1616,7 @@ test('inline comment ids use fullDatabaseId without losing large ids or changing
   expect(w.prompts[0]).toContain(`### large.ts:1 (comment 4170981226)\nBeyond 32 bits\n${URL}#discussion_r4170981226`)
   expect(w.prompts[0]).toContain('### precise.ts:2 (comment 9007199254740993)\nKeep every digit')
   expect(w.prompts[0]).toContain('### legacy.ts:3 (comment 19)\nLegacy id')
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
 })
@@ -1667,7 +1720,7 @@ for (const failure of [
       '返信は gh api repos/HolyGrail/claude-mods/pulls/7/comments/<comment id>/replies -f body=\'...\' で送れます。\n' +
       'コメントは gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.in_reply_to_id == null and ((.pull_request_review_id | tostring) == "1")) | {id, path, line, body}\' で確認してください。',
     ])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+    expect(marked(w)).toMatchObject({ reviews: ['1'] })
     await clock.advance(2 * MINUTE)
     expect(w.prompts.length).toBe(1)
     expect(w.detailsArgv.length).toBe(1)
@@ -1709,7 +1762,7 @@ test('review details wait for the record write and do not hold up later polls', 
   expect(w.detailsArgv.length).toBe(0)
   await clock.advance(5_000)
   expect(w.detailsArgv.length).toBe(1)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
   w.sets = undefined
   await clock.advance(MINUTE)
   expect(w.queries).toBe(2)
@@ -1731,20 +1784,20 @@ test('a push during review details takes back the old head review even if the pu
   await clock.settle()
   const record = 'pr:' + URL.toLowerCase()
   expect(w.detailsArgv.length).toBe(1)
-  expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  expect(marked(w, record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
 
   await clock.advance(5_000)
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   w.pull.head = 'b2b2b2b0123456789'
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: 0 })
+  expect(marked(w, record)).toMatchObject({ reviews: [], approvedAt: 0 })
 
   w.detailsAnswer = undefined
   w.pull.reviews?.push({ id: 2, at: NOW + 30_000, comments: 1 })
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([expect.stringContaining('(comment 2001)')])
-  expect(w.store.get(record)).toMatchObject({ reviews: ['2'], since: NOW + 5_000 })
+  expect(marked(w, record)).toMatchObject({ reviews: ['2'], since: NOW + 5_000 })
 })
 
 for (const source of ['resume', 'clear', 'fork'] as const) {
@@ -1760,7 +1813,7 @@ for (const source of ['resume', 'clear', 'fork'] as const) {
     await clock.settle()
     expect(w.detailsArgv.length).toBe(1)
     const record = 'pr:' + URL.toLowerCase()
-    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+    expect(marked(w, record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
 
     // A resume of the same pull request also changes the conversation that owns this delivery
     w.branchPr = { url: source === 'resume' ? URL : PR9, state: 'OPEN' }
@@ -1768,13 +1821,13 @@ for (const source of ['resume', 'clear', 'fork'] as const) {
     await $.classic.SessionStart({ source })
     await clock.advance(20_000)
     expect(w.prompts).toEqual([])
-    expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: 0 })
+    expect(marked(w, record)).toMatchObject({ reviews: [], approvedAt: 0 })
 
     w.detailsAnswer = undefined
     await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
     await clock.settle()
     expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
-    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+    expect(marked(w, record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
     await clock.advance(MINUTE)
     expect(w.prompts.length).toBe(1)
   })
@@ -1789,7 +1842,7 @@ test('unrelayed reviews precede a later thumbs-up and carry its approval in one 
   await clock.settle()
   expect(w.prompts[0]).toContain('レビュー 1 件、inline コメント 1 件')
   expect(w.prompts[0]?.endsWith('なお、このレビューの後（20:59）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。')).toBe(true)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+  expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
   await clock.advance(2 * MINUTE)
   expect(w.prompts.length).toBe(1)
 })
@@ -1804,7 +1857,7 @@ test('an approval at the newest review time is marked without an approval note',
   expect(w.prompts[0]).not.toContain('なお、このレビューの後')
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - MINUTE })
+  expect(marked(w)).toMatchObject({ approvedAt: NOW - MINUTE })
 })
 
 test('the usage limit shows a toast and wakes nobody', async ($, on) => {
@@ -2083,7 +2136,7 @@ test('a newer head commit moves the baseline after an unseen push', async ($, on
   w.pull.committedAt = NOW + 20_000
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW + 20_000 })
+  expect(marked(w)).toMatchObject({ since: NOW + 20_000 })
 })
 
 test('a pull request gh could not look up at startup is looked up again', async ($, on) => {
@@ -2142,7 +2195,7 @@ test('a review supersedes an earlier approval without another approval prompt', 
   await clock.settle()
   expect(w.prompts).toEqual([expect.stringContaining('inline コメント 3 件')])
   expect(w.prompts[0]).not.toContain('なお、このレビューの後')
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ approvedAt: NOW - 10 * MINUTE, reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ approvedAt: NOW - 10 * MINUTE, reviews: ['1'] })
 
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
@@ -2212,18 +2265,107 @@ for (const failure of ['dropped', 'rejected']) {
     await $.session.start(START)
     await clock.settle()
     expect(w.prompts.length).toBe(1)
-    expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: NOW - 3 * MINUTE })
+    expect(marked(w, record)).toMatchObject({ reviews: [], approvedAt: NOW - 3 * MINUTE })
 
     refuses = false
     w.dropPrompt = false
     await clock.advance(MINUTE)
     expect(w.prompts.length).toBe(2)
     expect(w.prompts[1]).toBe(w.prompts[0])
-    expect(w.store.get(record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
+    expect(marked(w, record)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
     await clock.advance(MINUTE)
     expect(w.prompts.length).toBe(2)
   })
 }
+
+test('a take-back leaves a mark another session wrote meanwhile alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { turnStarts: () => clock.sleep(5_000) })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  w.dropPrompt = true
+  await clock.advance(MINUTE)
+  // While this session's prompt waits for its turn, another session relays review 2 and marks it
+  const record = 'pr:' + URL.toLowerCase()
+  w.pull.reviews.push({ id: 2, at: NOW + 40_000, comments: 1 })
+  w.store.set(record, { ...(w.store.get(record) as object), reviews: ['1', '2'] })
+  // The queue drops this session's prompt, which takes back review 1 only
+  await clock.advance(10_000)
+  expect((w.store.get(record) as { reviews: string[] }).reviews).toEqual(['1', '2'])
+  expect(marked(w)).toMatchObject({ reviews: ['2'] })
+
+  w.dropPrompt = false
+  w.prompts = []
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['2', '1'] })
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+})
+
+test('a take-back outlasts a copy of the record another session read before it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { turnStarts: () => clock.sleep(5_000) })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  w.dropPrompt = true
+  const record = 'pr:' + URL.toLowerCase()
+  await clock.advance(MINUTE)
+  const copy = w.store.get(record) as object
+  await clock.advance(10_000)
+  // Another session writes back the copy it read before the take-back, review 1 still marked
+  w.store.set(record, { ...copy })
+
+  w.dropPrompt = false
+  w.prompts = []
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a take-back the record has applied is not applied again when its delete failed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  const record = 'pr:' + URL.toLowerCase()
+  w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: ['1'], ended: null, at: NOW - MINUTE, undone: ['undo:old'] })
+  w.store.set('undo:old', { pr: URL.toLowerCase(), at: NOW - 2 * MINUTE, reviews: ['1'] })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['1'] })
+  expect(w.store.has('undo:old')).toBe(false)
+})
+
+test('a take-back whose delete keeps failing stays applied however many come after it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  const record = 'pr:' + URL.toLowerCase()
+  const old = { pr: URL.toLowerCase(), at: NOW - 3 * MINUTE, reviews: ['1'] }
+  w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: ['1'], ended: null, at: NOW - MINUTE, undone: ['undo:old'] })
+  w.store.set('undo:old', old)
+  // Sixty newer take-backs, of reviews this pull request never had
+  for (let i = 0; i < 60; i++) w.store.set(`undo:new-${String(i).padStart(2, '0')}`, { pr: URL.toLowerCase(), at: NOW - 2 * MINUTE, reviews: [`x${i}`] })
+  await $.session.start(START)
+  await clock.settle()
+  expect((w.store.get(record) as { undone: string[] }).undone).toContain('undo:old')
+
+  // Its delete failed again, and the next round must not take back review 1 once more
+  w.store.set('undo:old', old)
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['1'] })
+})
+
+test('a take-back no session applied for two weeks is pruned', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { branchPr: null })
+  w.store.set('undo:stale', { pr: 'https://github.com/holygrail/claude-mods/pull/3', at: NOW - 15 * 24 * 60 * MINUTE, reviews: ['1'] })
+  w.store.set('undo:fresh', { pr: 'https://github.com/holygrail/claude-mods/pull/3', at: NOW - MINUTE, reviews: ['2'] })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.store.has('undo:stale')).toBe(false)
+  expect(w.store.has('undo:fresh')).toBe(true)
+})
 
 test('a dropped review takes back its mark even when an approval was already recorded before delivery', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -2235,7 +2377,7 @@ test('a dropped review takes back its mark even when an approval was already rec
   w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: NOW - MINUTE, reviews: [], at: NOW - MINUTE })
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.get(record)).toMatchObject({ reviews: [], approvedAt: NOW - MINUTE })
+  expect(marked(w, record)).toMatchObject({ reviews: [], approvedAt: NOW - MINUTE })
 })
 
 test('a pull request found after a push takes that push as its baseline', async ($, on) => {
@@ -2355,7 +2497,7 @@ for (const command of [
     await clock.settle()
     expect(w.queries).toBe(1)
     expect(w.prompts).toEqual([])
-    expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW + 30_000 })
+    expect(marked(w)).toMatchObject({ since: NOW + 30_000 })
   })
 }
 
@@ -2415,7 +2557,7 @@ test('taking back a review keeps the newer approval and sends the review again',
   expect(w.prompts.length).toBe(3)
   expect(w.prompts[2]).toContain('レビュー 1 件')
   expect(w.prompts[2]).not.toContain('なお、このレビューの後')
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'], approvedAt: NOW + 30_000 })
+  expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW + 30_000 })
 })
 
 test('a prompt taken back while the next poll waits on GitHub is sent again', async ($, on) => {
@@ -2857,6 +2999,56 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
   expect(w.store.get(NOTE)).toMatchObject({ idle: true })
 })
 
+test('a final session end writes its note idle again when the store refused it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let slow = false
+  const w = stubWorld(on, { answers: async () => { if (slow) await clock.sleep(5 * MINUTE) } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  // The session ends mid-poll, and the store refuses the first two idle writes
+  slow = true
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  let refusals = 2
+  w.sets = async (key) => {
+    if (key === NOTE && refusals-- > 0) throw new Error('store busy')
+  }
+  const ended = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await clock.advance(2_000)
+  await ended
+  w.sets = undefined
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+  expect(w.store.get(NOTE)).not.toHaveProperty('running')
+  // Let the slow query finish inside the test
+  await clock.advance(5 * MINUTE)
+})
+
+test('a final session end gives up on a store that keeps refusing the idle note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let slow = false
+  const w = stubWorld(on, { answers: async () => { if (slow) await clock.sleep(5 * MINUTE) } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  slow = true
+  await clock.advance(MINUTE)
+  let refusals = 0
+  w.sets = async (key) => {
+    if (key !== NOTE) return
+    refusals++
+    throw new Error('store busy')
+  }
+  const ended = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await clock.advance(5_000)
+  await ended
+  w.sets = undefined
+  // The first write and three more, then the note is left as it was
+  expect(refusals).toBe(4)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  await clock.advance(5 * MINUTE)
+})
+
 test('a prompt still queued when the session ends gives its mark back for another session to send', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   // The session is busy, so the prompt waits for a turn that never starts here
@@ -2867,10 +3059,10 @@ test('a prompt still queued when the session ends gives its mark back for anothe
   w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
   await clock.advance(MINUTE)
   expect(w.prompts.length).toBe(1)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [] })
+  expect(marked(w)).toMatchObject({ reviews: [] })
 
   // Another session on the same pull request sends it
   w.sessionId = 'session-c'
@@ -2892,7 +3084,7 @@ test('a prompt whose turn has started keeps its mark when the session ends', asy
   expect(w.prompts.length).toBe(1)
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
 })
 
 test('a queued prompt taken back at the session end and dropped later leaves a newer mark alone', async ($, on) => {
@@ -2907,12 +3099,17 @@ test('a queued prompt taken back at the session end and dropped later leaves a n
   expect(w.prompts.length).toBe(1)
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  // Another session sends the review and marks it, then the queue drops this session's prompt
-  w.store.set('pr:' + URL.toLowerCase(), { ...(w.store.get('pr:' + URL.toLowerCase()) as object), reviews: ['1'] })
+  // Another session applies the take-back, sends the review and marks it again, then the queue
+  // drops this session's prompt
+  const undos = [...w.store.keys()].filter((key) => key.startsWith('undo:'))
+  expect(undos.length).toBe(1)
+  w.store.set('pr:' + URL.toLowerCase(), { ...(w.store.get('pr:' + URL.toLowerCase()) as object), reviews: ['1'], undone: undos })
+  for (const key of undos) w.store.delete(key)
   w.dropPrompt = true
   startTurn()
   await clock.settle()
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+  expect(marked(w)).toMatchObject({ reviews: ['1'] })
 })
 
 for (const [where, stderr] of [
@@ -3369,7 +3566,7 @@ test('a push counts once GitHub shows the commit it pushed', async ($, on) => {
   w.pull.head = 'b2b2b2b0123456789'
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW + 20_000 })
+  expect(marked(w)).toMatchObject({ since: NOW + 20_000 })
 })
 
 test('a session that leaves the waking to another pages through the same pages again next time', async ($, on) => {
@@ -3390,6 +3587,38 @@ test('a session that leaves the waking to another pages through the same pages a
   await clock.advance(MINUTE)
   expect(w.queries).toBe(4)
   expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
+})
+
+test('a push\'s last note, with the time its Bash call ran, goes out again when the store refuses it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(10_000)
+  // The first three notes are slow, and the store refuses the fourth, the one the Bash call runs on
+  let writes = 0
+  w.sets = async (key) => {
+    if (key !== NOTE) return
+    writes++
+    if (writes <= 3) await clock.sleep(2_000)
+    else if (writes === 4) throw new Error('store busy')
+  }
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(6_500)
+  expect(writes).toBe(4)
+  // The store holds the time from before the third note went out, 4 s older than the push's own
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 14_000, running: true }] })
+  // A second later the note goes out again with it
+  await clock.advance(1_000)
+  expect(writes).toBe(5)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 16_000, running: true }] })
+  w.sets = undefined
+  await clock.advance(30_000)
+  await push
 })
 
 test('a push whose note cannot be written still runs, and says so in the status line', async ($, on) => {
@@ -4020,10 +4249,10 @@ test('a push that started and finished while the record was written still holds 
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
 })
 
@@ -4034,9 +4263,15 @@ test('a record write that lands past the lease sends nothing', async ($, on) => 
   w.answers = () => clock.sleep(9 * MINUTE)
   await $.session.start(START)
   await clock.advance(1_000)
-  // GitHub answers in time, and the record is slow to land
+  // GitHub answers in time, and the record is slow to land; the store refuses the note's beats
+  // meanwhile, so another session may have taken the round over
+  let writing = false
   w.sets = async (key) => {
-    if (key.startsWith('pr:')) await clock.sleep(MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(MINUTE)
+    writing = false
   }
   await clock.advance(10 * MINUTE)
   expect(w.prompts).toEqual([])
@@ -4047,6 +4282,42 @@ test('a record write that lands past the lease sends nothing', async ($, on) => 
   await clock.advance(10 * MINUTE)
 })
 
+test('a record write the store is slow to take keeps its round while the note\'s beats land', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  let slow = true
+  w.sets = async (key) => {
+    if (slow && key.startsWith('pr:')) {
+      slow = false
+      await clock.sleep(12 * MINUTE)
+    }
+  }
+  await clock.advance(MINUTE)
+  // Halfway through, the note says the poll is alive, so the other sessions still hold back
+  await clock.advance(6 * MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true, beat: NOW + 7 * MINUTE })
+  expect(w.prompts).toEqual([])
+  // The record lands twelve minutes on, past the lease of the poll's start, and the review goes out
+  await clock.advance(6 * MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+  w.sets = undefined
+})
+
+test('another session\'s running poll holds this one back from its newest beat', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Started eleven minutes ago, and still writing its record a minute ago
+  w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { ...pollNote(NOW - 11 * MINUTE), running: true, beat: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
+})
+
 test('a merge whose record write lands past the lease is told on a later poll', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { state: 'MERGED' } })
@@ -4054,8 +4325,13 @@ test('a merge whose record write lands past the lease is told on a later poll', 
   await $.session.start(START)
   await clock.advance(1_000)
   let slow = true
+  let writing = false
   w.sets = async (key) => {
-    if (slow && key.startsWith('pr:')) await clock.sleep(MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!slow || !key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(MINUTE)
+    writing = false
   }
   await clock.advance(10 * MINUTE)
   expect(w.toasts).toEqual([])
@@ -4145,11 +4421,116 @@ test('a push another session started while the record was written holds back the
   })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
+})
+
+// A poll whose record has been written, with review 1 marked, and the other session's idle note
+async function scanAfterRecord($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const state = { written: false }
+  w.sets = async (key) => {
+    if (key === 'pr:' + URL.toLowerCase()) state.written = true
+  }
+  return { clock, w, other, state }
+}
+
+test('a push another session starts while the review details are fetched holds back the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  const w = stubWorld(on, {
+    detailsAnswer: async () => {
+      w.store.set(other, { ...pollNote(NOW + MINUTE), idle: true, pending: [{ id: 'a', at: NOW + MINUTE + 1, head: 'a1', running: true }] })
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.prompts).toEqual([])
+  // Its mark is taken back, so a round after the push sends it
+  expect(marked(w)).toMatchObject({ reviews: [] })
+})
+
+test('a newer push another session learns of while the review details are fetched holds back the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  const w = stubWorld(on, {
+    detailsAnswer: async () => {
+      w.store.set(other, { ...pollNote(NOW + MINUTE), idle: true, since: NOW + 50_000 })
+    },
+  })
+  w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.prompts).toEqual([])
+  expect(marked(w)).toMatchObject({ reviews: [] })
+})
+
+test('a push note written under a new key while the last notes are read holds back the relay', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  // Lands as the other note is read the second time since the record went out: during the last
+  // scan of a session that reads each note once a scan
+  let reads = 0
+  let done = false
+  w.gets = async (key) => {
+    if (key !== other || !state.written || ++reads !== 2) return
+    done = true
+    w.store.set('poll:session-z:p1:' + URL.toLowerCase(), { ...pollNote(NOW + MINUTE), idle: true, pending: [{ id: 'z', at: NOW + MINUTE, head: 'a1', running: true }] })
+  }
+  await clock.advance(MINUTE)
+  expect(done).toBe(true)
+  expect(w.prompts).toEqual([])
+  w.gets = undefined
+  w.sets = undefined
+})
+
+test('a note rewritten with a running push while the last notes are read holds back the relay', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  // Lands as the other note is read the second time since the record went out: during the last
+  // scan of a session that reads each note once a scan
+  let reads = 0
+  let done = false
+  w.gets = async (key) => {
+    if (key !== other || !state.written || ++reads !== 2) return
+    done = true
+    w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true, pending: [{ id: 'a', at: NOW + MINUTE, head: 'a1', running: true }] })
+  }
+  await clock.advance(MINUTE)
+  expect(done).toBe(true)
+  expect(w.prompts).toEqual([])
+  w.gets = undefined
+  w.sets = undefined
+})
+
+test('notes that change at every read hold back the relay until they settle', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  let writes = 0
+  w.gets = async (key) => {
+    if (key !== other || !state.written) return
+    w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true, writes: ++writes })
+  }
+  await clock.advance(MINUTE)
+  expect(writes).toBeGreaterThan(0)
+  expect(w.prompts).toEqual([])
+
+  w.gets = undefined
+  w.sets = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
 })
 
 test('a baseline another session\'s note shows once the record is written holds back the relay', async ($, on) => {
@@ -4168,10 +4549,10 @@ test('a baseline another session\'s note shows once the record is written holds 
   w.store.set('poll:session-a:' + URL.toLowerCase(), { ...pollNote(NOW + MINUTE + 1_000), idle: true, since: NOW + 40_000 })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
 })
 
@@ -4186,7 +4567,7 @@ test('the head is timed when GitHub showed it, not once the older pages came', a
   })
   await $.session.start(START)
   await clock.advance(30_000)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ headAt: NOW })
+  expect(marked(w)).toMatchObject({ headAt: NOW })
 })
 
 test('a module started afresh for the same session keeps what its note in the store held', async ($, on) => {
@@ -4197,7 +4578,7 @@ test('a module started afresh for the same session keeps what its note in the st
   await $.session.start(START)
   await clock.settle()
   expect(w.prompts).toEqual([])
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW - 10_000 })
+  expect(marked(w)).toMatchObject({ since: NOW - 10_000 })
 })
 
 test('a module started afresh while its push still runs holds back the relay', async ($, on) => {
@@ -4750,17 +5131,23 @@ test('a merge seen by a poll whose record lands past the lease raises no toast',
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { state: 'MERGED' } })
   on('session.end', () => ({ sessionId: 'session-b' }))
+  // The store refuses the note's beats while the record is on its way
+  let writing = false
   w.sets = async (key) => {
-    if (key.startsWith('pr:')) await clock.sleep(10 * MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(10 * MINUTE)
+    writing = false
   }
   await $.session.start(START)
   await clock.advance(10 * MINUTE + 1_000)
   expect(w.toasts).toEqual([])
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10 * MINUTE)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ ended: null })
+  expect(marked(w)).toMatchObject({ ended: null })
   expect(w.toasts).toEqual([])
 })
 
@@ -4780,10 +5167,10 @@ test('a usage limit seen before a push that started while the record was written
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(15_000)
   expect(w.toasts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ usageLimitAt: 0 })
+  expect(marked(w)).toMatchObject({ usageLimitAt: 0 })
   expect(w.toasts).toEqual([])
 })
 
@@ -4832,13 +5219,14 @@ test('a mark the store will not take back is shown in the status line', async ($
     if (key === record && ++writes === 1) await clock.sleep(10_000)
   }
   await clock.advance(MINUTE + 1_000)
-  // A push makes the poll take its mark back, and the store then refuses the record
+  // A push makes the poll take its mark back, and the store then refuses the take-back
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
-  w.getFails = (key) => key === record
+  w.sets = async (key) => {
+    if (key.startsWith('undo:')) throw new Error('store busy')
+  }
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
   expect(w.status).toContain('mark:')
-  w.getFails = undefined
   w.sets = undefined
 })
 
