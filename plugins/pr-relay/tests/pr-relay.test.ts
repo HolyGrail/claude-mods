@@ -4228,9 +4228,15 @@ test('a record write that lands past the lease sends nothing', async ($, on) => 
   w.answers = () => clock.sleep(9 * MINUTE)
   await $.session.start(START)
   await clock.advance(1_000)
-  // GitHub answers in time, and the record is slow to land
+  // GitHub answers in time, and the record is slow to land; the store refuses the note's beats
+  // meanwhile, so another session may have taken the round over
+  let writing = false
   w.sets = async (key) => {
-    if (key.startsWith('pr:')) await clock.sleep(MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(MINUTE)
+    writing = false
   }
   await clock.advance(10 * MINUTE)
   expect(w.prompts).toEqual([])
@@ -4241,6 +4247,42 @@ test('a record write that lands past the lease sends nothing', async ($, on) => 
   await clock.advance(10 * MINUTE)
 })
 
+test('a record write the store is slow to take keeps its round while the note\'s beats land', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  let slow = true
+  w.sets = async (key) => {
+    if (slow && key.startsWith('pr:')) {
+      slow = false
+      await clock.sleep(12 * MINUTE)
+    }
+  }
+  await clock.advance(MINUTE)
+  // Halfway through, the note says the poll is alive, so the other sessions still hold back
+  await clock.advance(6 * MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true, beat: NOW + 7 * MINUTE })
+  expect(w.prompts).toEqual([])
+  // The record lands twelve minutes on, past the lease of the poll's start, and the review goes out
+  await clock.advance(6 * MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+  w.sets = undefined
+})
+
+test('another session\'s running poll holds this one back from its newest beat', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Started eleven minutes ago, and still writing its record a minute ago
+  w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { ...pollNote(NOW - 11 * MINUTE), running: true, beat: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
+})
+
 test('a merge whose record write lands past the lease is told on a later poll', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { state: 'MERGED' } })
@@ -4248,8 +4290,13 @@ test('a merge whose record write lands past the lease is told on a later poll', 
   await $.session.start(START)
   await clock.advance(1_000)
   let slow = true
+  let writing = false
   w.sets = async (key) => {
-    if (slow && key.startsWith('pr:')) await clock.sleep(MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!slow || !key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(MINUTE)
+    writing = false
   }
   await clock.advance(10 * MINUTE)
   expect(w.toasts).toEqual([])
@@ -5049,8 +5096,14 @@ test('a merge seen by a poll whose record lands past the lease raises no toast',
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { state: 'MERGED' } })
   on('session.end', () => ({ sessionId: 'session-b' }))
+  // The store refuses the note's beats while the record is on its way
+  let writing = false
   w.sets = async (key) => {
-    if (key.startsWith('pr:')) await clock.sleep(10 * MINUTE)
+    if (key.startsWith('poll:') && writing) throw new Error('store busy')
+    if (!key.startsWith('pr:')) return
+    writing = true
+    await clock.sleep(10 * MINUTE)
+    writing = false
   }
   await $.session.start(START)
   await clock.advance(10 * MINUTE + 1_000)

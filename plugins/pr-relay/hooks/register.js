@@ -37,6 +37,10 @@ const SCAN_TRIES = 3
 // A poll still running holds back the later ones of other sessions past its round, since it has not
 // written what it relayed yet; one this old is taken to belong to a session that died mid-poll
 const RUNNING_MS = 10 * 60_000
+// While a poll waits on its record write, it writes the time into its note this often (beat), and
+// the other sessions hold back from the newest beat: a store slow to take the record must not let
+// another session take a round over that this one is still writing
+const BEAT_MS = 60_000
 const LATE = 'poll outlasted its turn'
 // The pauses before a final session.end writes again the notes the store would not take as idle: a
 // note left running holds the other sessions back for RUNNING_MS, and no later poll of this session
@@ -710,6 +714,8 @@ async function pollOnce($, gen) {
 }
 
 async function pollNoted($, gen, { pr, key, now, floor, note }) {
+  // How long the others hold back from this poll, from its start and from the beats it writes
+  const lease = leaseOf(now, note.landedAt ?? now)
   // Read before GitHub is asked: a push that starts, and even finishes, while the query or the
   // record is on its way may have replaced the head the query saw
   const started = pushStarts.get(pr.id) ?? 0
@@ -809,7 +815,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       // A watch that began while this waited its turn owns the pushes and the marks now
       if (gen !== generation && !ended) return null
       // Checked once more just before the record is written, since the store may have kept it waiting
-      if (lapsed(now, writeAt)) return LATE
+      if (lease.lapsed(writeAt)) return LATE
       // An ended poll goes on past a new watch, whose baseline is not this pull request's: it goes by
       // what its note said
       const owns = watched?.id === pr.id
@@ -821,15 +827,21 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       if (defers) return sends
       record.at = now
       if (data.headRefOid) record.headAt = seenAt
-      await $.store.set(key, record)
+      const stopBeat = beatWhile($, note, lease)
+      try {
+        await $.store.set(key, record)
+      } finally {
+        stopBeat()
+      }
       // The record now says what they took back, so they can go; one whose delete fails is skipped
       // by its id in undone and deleted next time
       for (const done of [...undos.open.map(({ key }) => key), ...undos.applied]) $.store.delete(done).catch(() => {})
       // A write that landed past the lease may have gone over a session that took the round over and
       // relayed the same, so this one sends nothing; $.store has no conditional write to stop it.
       // Its marks are taken back, since a session that has not taken the round over yet would read
-      // them as sent, and nothing would send them
-      if (lapsed(now, await $.clock.now())) return { late: sends }
+      // them as sent, and nothing would send them. The beats keep the lease while the store takes
+      // them, so this happens only once they too went unwritten that long
+      if (lease.lapsed(await $.clock.now())) return { late: sends }
       // Pages are skipped next time only once what they held is in the record: a session that leaves
       // the waking to another goes through them again in case that one never writes it
       if (gen === generation) watched = { ...watched, pagedAt: now }
@@ -866,7 +878,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       // A read the store kept waiting past the lease may have let another session take the round
       // over; it read the marks, which this one wrote in time, so it sent nothing: they are taken back
       // for the next round to send
-      if (lapsed(now, await $.clock.now())) {
+      if (lease.lapsed(await $.clock.now())) {
         takeBackAll($, key, sends, pr)
         return late($, now, pr, note)
       }
@@ -900,6 +912,41 @@ function reopen($, pr, gen) {
 // Whether a poll started at now has run so long that another session may have taken its round over
 function lapsed(now, at) {
   return at >= now + RUNNING_MS - ROUND_MS
+}
+
+// A poll's lease: the times the others hold back from (its start, then each beat the store took) and
+// when each landed. It has lapsed at a moment when, or once at any moment before when, the newest
+// time the store held was 30 s short of RUNNING_MS old, since another session reading the notes then
+// may have taken the round over
+function leaseOf(now, landedAt) {
+  const beats = [{ value: now, landed: landedAt }]
+  return {
+    beats,
+    lapsed(at) {
+      for (let i = 1; i < beats.length; i++) if (lapsed(beats[i - 1].value, beats[i].landed)) return true
+      return lapsed(beats[beats.length - 1].value, at)
+    },
+  }
+}
+
+// Writes the time into the poll's note now and every BEAT_MS until stopped, and adds each beat the
+// store took to the lease
+function beatWhile($, note, lease) {
+  let beating = true
+  const beat = async () => {
+    if (!beating || lastNote?.serial !== note.serial) return
+    const value = await $.clock.now()
+    lastNote.beat = value
+    const landed = await writeNote($, lastNote, { strict: true }).then(() => $.clock.now(), () => null)
+    if (beating && landed !== null) lease.beats.push({ value, landed })
+  }
+  // At once as well, since what came before the write may have used up most of the lease
+  beat()
+  const timer = $.clock.every(BEAT_MS, beat)
+  return () => {
+    beating = false
+    timer?.cancel()
+  }
 }
 
 // A poll that lapsed relays nothing, and says so. An ended one that a new watch went past leaves
@@ -1134,7 +1181,7 @@ function writeNote($, note, { strict = false } = {}) {
   return strict ? write : tail
 }
 
-function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
+function noteValue({ pr, at, since, pending = [], running, idle, deferred, beat }) {
   const pushes = pending.filter((push) => !push.dropped).map(pushNote)
   return {
     pr,
@@ -1142,6 +1189,7 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred }) {
     since,
     ...(pushes.length ? { pending: pushes } : {}),
     ...(running ? { running } : {}),
+    ...(running && typeof beat === 'number' ? { beat } : {}),
     ...(idle ? { idle } : {}),
     ...(deferred ? { deferred } : {}),
   }
@@ -1318,7 +1366,10 @@ async function readNotes($, pr, note) {
       continue
     }
     if (other.at > note.at) continue
-    if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
+    // A running poll holds the others back from its newest beat, so one still writing its record
+    // keeps its round however slow the store is
+    const heldFrom = other.running && typeof other.beat === 'number' ? Math.max(other.at, other.beat) : other.at
+    if (heldFrom < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
   return { defers, since, pending, pushing, stable }
