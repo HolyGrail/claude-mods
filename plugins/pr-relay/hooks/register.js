@@ -37,6 +37,10 @@ const ROUND_MS = 30_000
 // written what it relayed yet; one this old is taken to belong to a session that died mid-poll
 const RUNNING_MS = 10 * 60_000
 const LATE = 'poll outlasted its turn'
+// The pauses before a final session.end writes again the notes the store would not take as idle: a
+// note left running holds the other sessions back for RUNNING_MS, and no later poll of this session
+// will write it again
+const FINAL_RETRIES_MS = [200, 1_000, 3_000]
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // Option values are one unquoted, single-quoted or double-quoted shell word
 const SHELL_WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';&|<>]+)`
@@ -205,7 +209,7 @@ export function register(on) {
       stop({ desktop: true })
       // Before the note goes idle, so a session that polls next finds the marks gone and sends them
       await takeBackUndelivered($)
-      await retire($)
+      await retireFinally($)
     }
     return next(e)
   })
@@ -1045,6 +1049,24 @@ async function retire($) {
   const idle = { ...note, pending: [...note.pending], running: false, idle: true, dirty: true }
   retired.set(note.key, idle)
   await writeNote($, idle)
+}
+
+// Leaves this session's notes idle as it ends, writing again those the store refused a few times
+// over, since no later poll of this session will. A store that refuses them all leaves them as they
+// were, and the other sessions wait out a running one.
+async function retireFinally($) {
+  await retire($)
+  for (const wait of FINAL_RETRIES_MS) {
+    const left = [...retired.values()].filter((note) => note.dirty || !note.writtenIdle)
+    if (!left.length) return
+    await new Promise((resolve) => $.clock.after(wait, resolve))
+    await Promise.all(
+      left.map((note) => {
+        catchUp(note)
+        return writeNote($, note, { strict: true }).catch(() => {})
+      }),
+    )
+  }
 }
 
 // Brings a note of the watched pull request up to what this session knows of its pushes

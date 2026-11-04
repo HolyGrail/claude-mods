@@ -2944,6 +2944,56 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
   expect(w.store.get(NOTE)).toMatchObject({ idle: true })
 })
 
+test('a final session end writes its note idle again when the store refused it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let slow = false
+  const w = stubWorld(on, { answers: async () => { if (slow) await clock.sleep(5 * MINUTE) } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  // The session ends mid-poll, and the store refuses the first two idle writes
+  slow = true
+  await clock.advance(MINUTE)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  let refusals = 2
+  w.sets = async (key) => {
+    if (key === NOTE && refusals-- > 0) throw new Error('store busy')
+  }
+  const ended = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await clock.advance(2_000)
+  await ended
+  w.sets = undefined
+  expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+  expect(w.store.get(NOTE)).not.toHaveProperty('running')
+  // Let the slow query finish inside the test
+  await clock.advance(5 * MINUTE)
+})
+
+test('a final session end gives up on a store that keeps refusing the idle note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let slow = false
+  const w = stubWorld(on, { answers: async () => { if (slow) await clock.sleep(5 * MINUTE) } })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  slow = true
+  await clock.advance(MINUTE)
+  let refusals = 0
+  w.sets = async (key) => {
+    if (key !== NOTE) return
+    refusals++
+    throw new Error('store busy')
+  }
+  const ended = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await clock.advance(5_000)
+  await ended
+  w.sets = undefined
+  // The first write and three more, then the note is left as it was
+  expect(refusals).toBe(4)
+  expect(w.store.get(NOTE)).toMatchObject({ running: true })
+  await clock.advance(5 * MINUTE)
+})
+
 test('a prompt still queued when the session ends gives its mark back for another session to send', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   // The session is busy, so the prompt waits for a turn that never starts here
