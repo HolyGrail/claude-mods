@@ -160,6 +160,9 @@ let desktopTimer = null
 let aliveTimer = null
 // Parked take-backs of delivered prompts whose delete the store refused, tried again every minute
 const parkedLeft = new Set()
+// This process's alive times the store took, { value, landed }, oldest first: a poll's lease lapses
+// when another session may have read this process as gone
+const aliveBeats = []
 // This generation is reading the desktop cache, so slow calls do not pile up within a watch
 let desktopPolling = null
 // Successful desktop reads keep the last primary URL here
@@ -753,7 +756,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
   if (gen !== generation) return
   // A query that outlasted the time the others wait on a running note may have seen another
   // session take the round over, which this one's election cannot tell: it relays nothing
-  if (!answer.error && lapsed(now, answeredAt)) answer.error = new Error(LATE)
+  if (!answer.error && lease.lapsed(answeredAt)) answer.error = new Error(LATE)
   if (answer.error) {
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
@@ -780,7 +783,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     return
   }
   // So may one whose store answered too late
-  if (lapsed(now, readAt)) return late($, now, pr, note)
+  if (lease.lapsed(readAt)) return late($, now, pr, note)
   const { defers, since: othersSince, pending, pushing, monitoredElsewhere } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) {
@@ -949,9 +952,28 @@ function leaseOf(now, landedAt) {
     beats,
     lapsed(at) {
       for (let i = 1; i < beats.length; i++) if (lapsed(beats[i - 1].value, beats[i].landed)) return true
-      return lapsed(beats[beats.length - 1].value, at)
+      return lapsed(beats[beats.length - 1].value, at) || aliveLapsed(now, at)
     },
   }
+}
+
+// Whether this process's alive time may have read as stale to another session at some moment from
+// from to at, which then takes its polls as a gone process's and may take the round over: the
+// newest alive time the store held was ever 30 s short of ALIVE_STALE_MS old. None the store took
+// counts as stale from the start
+function aliveLapsed(from, at) {
+  const limit = ALIVE_STALE_MS - ROUND_MS
+  let last = null
+  for (const beat of aliveBeats) {
+    if (beat.landed > at) break
+    if (beat.landed <= from) {
+      last = beat
+      continue
+    }
+    if (!last || beat.landed - last.value >= limit) return true
+    last = beat
+  }
+  return !last || at - last.value >= limit
 }
 
 // Writes the time into the poll's note now and every BEAT_MS until stopped, and adds each beat the
@@ -1387,7 +1409,9 @@ async function readNotes($, pr, note) {
     const dead = gone(other)
     for (const push of [].concat(other.pending ?? [])) {
       if (typeof push?.at !== 'number') continue
-      pending.push(push)
+      // A push of a gone process is taken as finished, with nothing known of what it pushed, as one
+      // past its hold is: it counts once the head moves, so the baseline moves before relays go on
+      pending.push(dead && push.running ? { ...push, running: false } : push)
       // One left running by a session that died mid-push holds nothing back for long, and one whose
       // process is gone holds nothing back at all
       if (push.running && !dead && push.at >= note.at - RUNNING_MS) pushing = true
@@ -1451,7 +1475,11 @@ function aliveTimes(keys, values) {
 // Writes this process's alive time; a store that refuses it is tried again a minute later
 async function beatAlive($) {
   try {
-    await $.store.set(ALIVE_PREFIX + instance, { at: await $.clock.now() })
+    const value = await $.clock.now()
+    await $.store.set(ALIVE_PREFIX + instance, { at: value })
+    aliveBeats.push({ value, landed: await $.clock.now() })
+    // A poll's lease looks back no further than RUNNING_MS, and BEAT_MAX_MS bounds a poll
+    while (aliveBeats.length > 1 && aliveBeats[1].landed < value - BEAT_MAX_MS - RUNNING_MS) aliveBeats.shift()
   } catch {}
   await retryParked($)
 }

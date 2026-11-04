@@ -2967,6 +2967,44 @@ test('a running push of a gone process holds no relay back', async ($, on) => {
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
 })
 
+test('a running push of a gone process counts once the head has moved, before relays go on', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // A review of the head the push replaced, which GitHub no longer shows
+  const w = stubWorld(on, { pull: { head: 'b2', reviews: [{ id: 1, at: NOW - 5 * MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a:p9:' + URL.toLowerCase(), {
+    ...pollNote(NOW - 20 * MINUTE),
+    instance: 'p9',
+    idle: true,
+    pending: [{ id: 'a', at: NOW - 4 * MINUTE, head: 'a1', running: true }],
+  })
+  w.store.set('alive:p9', { at: NOW - 5 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ since: NOW - 4 * MINUTE })
+})
+
+test('a poll relays nothing while the store refuses this process\'s alive time', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  // The other sessions read this process as gone from three minutes on, and may take its rounds over
+  w.sets = async (key) => {
+    if (key.startsWith('alive:')) throw new Error('store busy')
+  }
+  await clock.advance(3 * MINUTE)
+  // A review comes once this process's alive time is three minutes old
+  w.pull.reviews = [{ id: 1, at: NOW + 3 * MINUTE + 10_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.status).toContain('poll outlasted its turn')
+  // Once the store takes it again, a later poll relays
+  w.sets = undefined
+  await clock.advance(2 * MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
 test('a process writes its alive time from the start and takes it away at a final session end', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
