@@ -4112,10 +4112,10 @@ test('a push that started and finished while the record was written still holds 
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
 })
 
@@ -4237,10 +4237,10 @@ test('a push another session started while the record was written holds back the
   })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
 })
 
@@ -4260,10 +4260,10 @@ test('a baseline another session\'s note shows once the record is written holds 
   w.store.set('poll:session-a:' + URL.toLowerCase(), { ...pollNote(NOW + MINUTE + 1_000), idle: true, since: NOW + 40_000 })
   await clock.advance(15_000)
   expect(w.prompts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get(record)).toMatchObject({ reviews: [] })
+  expect(marked(w, record)).toMatchObject({ reviews: [] })
   expect(w.prompts).toEqual([])
 })
 
@@ -4849,10 +4849,10 @@ test('a merge seen by a poll whose record lands past the lease raises no toast',
   await clock.advance(10 * MINUTE + 1_000)
   expect(w.toasts).toEqual([])
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10 * MINUTE)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ ended: null })
+  expect(marked(w)).toMatchObject({ ended: null })
   expect(w.toasts).toEqual([])
 })
 
@@ -4872,10 +4872,10 @@ test('a usage limit seen before a push that started while the record was written
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(15_000)
   expect(w.toasts).toEqual([])
-  // The take-back of the mark is itself a slow record write: let it land inside the test
+  // Let the slow writes and the take-back of the mark land inside the test
   w.sets = undefined
   await clock.advance(10_000)
-  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ usageLimitAt: 0 })
+  expect(marked(w)).toMatchObject({ usageLimitAt: 0 })
   expect(w.toasts).toEqual([])
 })
 
