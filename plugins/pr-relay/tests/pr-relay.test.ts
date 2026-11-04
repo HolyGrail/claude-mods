@@ -2665,6 +2665,45 @@ test('a session that polls in the same round as an earlier one leaves the waking
   expect(w.store.has('pr:' + URL.toLowerCase())).toBe(false)
 })
 
+test('another session\'s note left idle a day, whose pushes the record has counted, is pruned', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const DAY = 24 * 60 * MINUTE
+  w.store.set('pr:' + URL.toLowerCase(), { since: NOW - 2 * DAY, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - MINUTE })
+  const note = (at: number, extra: object) => ({ ...pollNote(at), since: NOW - 3 * DAY, ...extra })
+  // Left idle a day ago under an id a /clear retired, its push counted
+  w.store.set('poll:old-a:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, { idle: true, pending: [{ id: 'x', at: NOW - 3 * DAY, head: 'a0' }] }))
+  // Idle, but holding a push the record has not counted
+  w.store.set('poll:old-b:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, { idle: true, pending: [{ id: 'y', at: NOW - DAY - 2 * MINUTE, head: 'a0' }] }))
+  // Idle for less than a day
+  w.store.set('poll:old-c:p1:' + URL.toLowerCase(), note(NOW - DAY + MINUTE, { idle: true }))
+  // Not idle: its session may still poll, and rewrite it between the read and the delete
+  w.store.set('poll:old-d:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, {}))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.deleted.filter((key) => key.startsWith('poll:'))).toEqual(['poll:old-a:p1:' + URL.toLowerCase()])
+})
+
+test('the other sessions\' notes are read together, not one after another', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  for (let i = 0; i < 50; i++) w.store.set(`poll:other-${i}:p1:${URL.toLowerCase()}`, { ...pollNote(NOW - 60 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  // Measured from the next poll on, apart from the startup prune
+  let inFlight = 0
+  let most = 0
+  w.gets = async (key) => {
+    if (!key.startsWith('poll:other-')) return
+    most = Math.max(most, ++inFlight)
+    await clock.sleep(10)
+    inFlight--
+  }
+  await clock.advance(MINUTE)
+  expect(most).toBe(50)
+  w.gets = undefined
+})
+
 test('a poll of the same conversation in another process holds this one back like another session\'s', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
@@ -4614,6 +4653,24 @@ test('a push that finished in the millisecond GitHub answered holds back the rel
   })
   await $.session.start(START)
   await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push that finished while GitHub was being asked holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // GitHub takes 5 s to answer, and still shows the head the push replaces
+  const w = stubWorld(on, {
+    pull: { head: 'a1a1a1a0123456789', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    answers: () => clock.sleep(5_000),
+  })
+  w.store.set('poll:session-a', {
+    ...pollNote(NOW - 2 * MINUTE),
+    idle: true,
+    pending: [{ id: 'p', at: NOW - 1_000, head: 'a1a1a1a0123456789', shas: ['b2b2b2b'], doneAt: NOW + 2_000 }],
+  })
+  await $.session.start(START)
+  await clock.advance(10_000)
+  expect(w.queries).toBe(1)
   expect(w.prompts).toEqual([])
 })
 
