@@ -158,6 +158,8 @@ let desktopAvailable = null
 let desktopTimer = null
 // Writes this process's alive time, from session.start to a final session.end
 let aliveTimer = null
+// Parked take-backs of delivered prompts whose delete the store refused, tried again every minute
+const parkedLeft = new Set()
 // This generation is reading the desktop cache, so slow calls do not pile up within a watch
 let desktopPolling = null
 // Successful desktop reads keep the last primary URL here
@@ -235,6 +237,8 @@ export function register(on) {
       // Before the note goes idle, so a session that polls next finds the marks gone and sends them
       await takeBackUndelivered($)
       await retireFinally($)
+      // A parked take-back of a delivered prompt must be gone before the alive time is
+      await retryParked($)
       // The session leaves as the process does: the others need not wait out its alive time
       aliveTimer?.cancel()
       aliveTimer = null
@@ -1449,6 +1453,7 @@ async function beatAlive($) {
   try {
     await $.store.set(ALIVE_PREFIX + instance, { at: await $.clock.now() })
   } catch {}
+  await retryParked($)
 }
 
 // Marks what is new since the last push as relayed: reviews before an approval, then the usage
@@ -1518,19 +1523,19 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
-  // Kept until its turn starts or its mark is taken back, whichever comes first
-  const pending = { key, undo, undoKey: null }
-  undelivered.add(pending)
   // The take-back goes into the store at once, waiting on this process: a process killed before the
   // turn starts never takes the mark back itself, and the session that writes the record next
   // applies it once this process's alive time is stale. The same key becomes the take-back if the
-  // prompt does not enter, and goes once it does
-  const parked = $.clock.now().then((at) => {
-    const undoKey = UNDO_PREFIX + pushId(at)
-    return $.store.set(undoKey, { pr: key.slice(KEY_PREFIX.length), at, ...undo, pending: instance }).then(() => {
-      pending.undoKey = undoKey
-    })
-  }).catch(() => {})
+  // prompt does not enter, and goes once it does. The key is chosen before the write goes out, and
+  // whatever comes next waits for that write, so a session end during it rewrites the same key
+  // rather than leaving the parked one to land after it
+  const undoKey = UNDO_PREFIX + randomId() + randomId()
+  const parked = $.clock.now()
+    .then((at) => $.store.set(undoKey, { pr: key.slice(KEY_PREFIX.length), at, ...undo, pending: instance }))
+    .catch(() => {})
+  // Kept until its turn starts or its mark is taken back, whichever comes first
+  const pending = { key, undo, undoKey, parked }
+  undelivered.add(pending)
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
@@ -1545,10 +1550,7 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
       // A session end took the mark back already; taking it back again could remove the mark of
       // the session that sent the prompt since
       if (!undelivered.delete(pending)) return
-      return parked.then(() => {
-        if (!entered) return takeBack($, key, undo, pending.undoKey)
-        if (pending.undoKey) return $.store.delete(pending.undoKey)
-      })
+      return parked.then(() => (entered ? dropParked($, undoKey) : takeBack($, key, undo, undoKey)))
     })
     .catch(() => {})
 }
@@ -1557,7 +1559,23 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
 async function takeBackUndelivered($) {
   const pending = [...undelivered]
   undelivered.clear()
-  await Promise.all(pending.map(({ key, undo, undoKey }) => takeBack($, key, undo, undoKey).catch(() => {})))
+  await Promise.all(
+    pending.map(({ key, undo, undoKey, parked }) => parked.then(() => takeBack($, key, undo, undoKey)).catch(() => {})),
+  )
+}
+
+// Deletes the take-back a delivered prompt parked. One the store would not delete is tried again
+// with every alive time and at a final session end: left in the store, it would be applied once
+// this process is gone, and the delivered prompt sent again
+function dropParked($, undoKey) {
+  return $.store.delete(undoKey).then(
+    () => parkedLeft.delete(undoKey),
+    () => parkedLeft.add(undoKey),
+  )
+}
+
+function retryParked($) {
+  return Promise.all([...parkedLeft].map((undoKey) => dropParked($, undoKey)))
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll

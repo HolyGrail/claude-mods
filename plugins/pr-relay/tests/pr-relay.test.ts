@@ -195,6 +195,8 @@ type World = {
   sets?: (key: string) => Promise<void>
   // Whether reading a key of the store fails
   getFails?: (key: string) => boolean
+  // Whether deleting a key of the store fails
+  deleteFails?: (key: string) => boolean
   // What asking for the session id waits for
   ids?: () => Promise<void>
   // The pull requests other than the one in pull, by number
@@ -333,6 +335,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     return { value: undefined }
   })
   on('store.delete', ($, e) => {
+    if (w.deleteFails?.(e.key)) throw new Error('store busy')
     w.deleted.push(e.key)
     w.store.delete(e.key)
     return { value: undefined }
@@ -2397,6 +2400,49 @@ test('a delivered prompt takes away the take-back it parked', async ($, on) => {
   await clock.settle()
   expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
   expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
+test('a parked take-back the store would not delete once its prompt entered is deleted a minute later', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  let refusals = 1
+  w.deleteFails = (key) => key.startsWith('undo:') && refusals-- > 0
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  // Still there, and would resend the review once this process is gone
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:')).length).toBe(1)
+  await clock.advance(MINUTE)
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+  w.deleteFails = undefined
+})
+
+test('a session end while a prompt\'s take-back is still being parked rewrites that one key', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>(() => {}) })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  let slow = true
+  w.sets = async (key) => {
+    if (slow && key.startsWith('undo:')) {
+      slow = false
+      await clock.sleep(5_000)
+    }
+  }
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  // The parked write is still on its way as the session ends
+  const ended = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await clock.advance(10_000)
+  await ended
+  const undos = [...w.store.entries()].filter(([key]) => key.startsWith('undo:'))
+  expect(undos.length).toBe(1)
+  expect(undos[0]?.[1]).not.toHaveProperty('pending')
+  w.sets = undefined
 })
 
 test('a take-back no session applied for two weeks is pruned', async ($, on) => {
