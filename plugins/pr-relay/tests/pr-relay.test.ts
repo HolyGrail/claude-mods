@@ -4330,6 +4330,42 @@ async function scanAfterRecord($: Parameters<Parameters<typeof test>[1]>[0], on:
   return { clock, w, other, state }
 }
 
+test('a push another session starts while the review details are fetched holds back the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  const w = stubWorld(on, {
+    detailsAnswer: async () => {
+      w.store.set(other, { ...pollNote(NOW + MINUTE), idle: true, pending: [{ id: 'a', at: NOW + MINUTE + 1, head: 'a1', running: true }] })
+    },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.prompts).toEqual([])
+  // Its mark is taken back, so a round after the push sends it
+  expect(marked(w)).toMatchObject({ reviews: [] })
+})
+
+test('a newer push another session learns of while the review details are fetched holds back the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  const w = stubWorld(on, {
+    detailsAnswer: async () => {
+      w.store.set(other, { ...pollNote(NOW + MINUTE), idle: true, since: NOW + 50_000 })
+    },
+  })
+  w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.detailsArgv.length).toBe(1)
+  expect(w.prompts).toEqual([])
+  expect(marked(w)).toMatchObject({ reviews: [] })
+})
+
 test('a push note written under a new key while the last notes are read holds back the relay', async ($, on) => {
   const { clock, w, other, state } = await scanAfterRecord($, on)
   // Lands as the other note is read the second time since the record went out: during the last

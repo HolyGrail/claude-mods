@@ -826,18 +826,20 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     // they were read from
     let pushedSince = (pushStarts.get(pr.id) ?? 0) !== started
     // So may one another session started after its notes were read, which only they say
+    // A push known already that has finished since, even one that had run past the time it holds
+    // the relays back, counts the same as a new one
+    const state = (push) => `${push.running ? 'running' : 'done'}:${push.doneAt ?? ''}`
+    const known = new Map(pending.map((push) => [pushKey(push), state(push)]))
+    const moved = (again) =>
+      !again ||
+      // Notes still being written as the sends go out may hold a push this read cannot see yet
+      !again.stable ||
+      again.pushing ||
+      again.since > noted ||
+      again.pending.some((push) => known.get(pushKey(push)) !== state(push))
+    // Whether another session's notes show a push since they were read, as a prompt goes out
+    const pushedElsewhere = () => readNotes($, pr, note).then(moved, () => true)
     if (sends.length && !pushedSince) {
-      // A push known already that has finished since, even one that had run past the time it holds
-      // the relays back, counts the same as a new one
-      const state = (push) => `${push.running ? 'running' : 'done'}:${push.doneAt ?? ''}`
-      const known = new Map(pending.map((push) => [pushKey(push), state(push)]))
-      const moved = (again) =>
-        !again ||
-        // Notes still being written as the sends go out may hold a push this read cannot see yet
-        !again.stable ||
-        again.pushing ||
-        again.since > noted ||
-        again.pending.some((push) => known.get(pushKey(push)) !== state(push))
       pushedSince = moved(await readNotes($, pr, note).catch(() => null))
       // A read the store kept waiting past the lease may have let another session take the round
       // over; it read the marks, which this one wrote in time, so it sent nothing: they are taken back
@@ -856,7 +858,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     const current = (gen === generation || ended) && !pushedSince && !(watched?.id === pr.id && pushes.some((push) => holds(push, now)))
     if (current) {
       told = true
-      for (const send of sends) deliver($, key, send)
+      for (const send of sends) deliver($, key, send, pushedElsewhere)
     } else takeBackAll($, key, sends, pr)
     showStatus($)
   } finally {
@@ -1380,7 +1382,7 @@ function relay($, pr, signals, record) {
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
+function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedElsewhere) {
   if (toast) return $.ui.toast(toast)
   const gen = generation
   const id = watched?.id
@@ -1392,9 +1394,12 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
     : Promise.resolve(text)
+  // A new conversation, watch or push makes these details stale before they can be delivered
+  const fresh = () => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0)
   ready
-    // A new conversation, watch or push makes these details stale before they can be delivered
-    .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
+    // Fetching the details takes seconds, in which another session may have started a push the poll
+    // never saw, so the notes are read once more just before the prompt goes out
+    .then(async (text) => fresh() && !(await pushedElsewhere()) && fresh() ? submit($, text) : false)
     .then((entered) => {
       // A session end took the mark back already; taking it back again could remove the mark of
       // the session that sent the prompt since
