@@ -150,6 +150,10 @@ let sessionId = null
 let idAsks = 0
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
+// Prompts whose marks are in a record but whose turn has not started yet, each { key, undo }. A final
+// session.end takes their marks back, since a prompt still queued then never reaches the model and
+// the other sessions would otherwise read it as sent.
+const undelivered = new Set()
 // The read, change and write of a record in this session, one after another: a poll and a send
 // that takes its mark back would otherwise each write what they read before the other wrote
 let writes = Promise.resolve()
@@ -186,6 +190,8 @@ export function register(on) {
   on('session.end', async ($, e, next) => {
     if (FINAL_REASONS.includes(e.reason)) {
       stop({ desktop: true })
+      // Before the note goes idle, so a session that polls next finds the marks gone and sends them
+      await takeBackUndelivered($)
       await retire($)
     }
     return next(e)
@@ -1290,6 +1296,9 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
+  // Kept until its turn starts or its mark is taken back, whichever comes first
+  const pending = { key, undo }
+  undelivered.add(pending)
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
@@ -1297,8 +1306,20 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   ready
     // A new conversation, watch or push makes these details stale before they can be delivered
     .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
-    .then((entered) => entered || takeBack($, key, undo))
+    .then((entered) => {
+      // A session end took the mark back already; taking it back again could remove the mark of
+      // the session that sent the prompt since
+      if (!undelivered.delete(pending)) return
+      return entered || takeBack($, key, undo)
+    })
     .catch(() => {})
+}
+
+// Takes back the marks of the prompts whose turn has not started, as the session ends
+async function takeBackUndelivered($) {
+  const pending = [...undelivered]
+  undelivered.clear()
+  await Promise.all(pending.map(({ key, undo }) => takeBack($, key, undo).catch(() => {})))
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll

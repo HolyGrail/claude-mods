@@ -2769,6 +2769,64 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
   expect(w.store.get(NOTE)).toMatchObject({ idle: true })
 })
 
+test('a prompt still queued when the session ends gives its mark back for another session to send', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // The session is busy, so the prompt waits for a turn that never starts here
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>(() => {}) })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [] })
+
+  // Another session on the same pull request sends it
+  w.sessionId = 'session-c'
+  w.prompts = []
+  w.turnStarts = async () => {}
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a prompt whose turn has started keeps its mark when the session ends', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
+test('a queued prompt taken back at the session end and dropped later leaves a newer mark alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let startTurn = () => {}
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>((resolve) => { startTurn = resolve }) })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  // Another session sends the review and marks it, then the queue drops this session's prompt
+  w.store.set('pr:' + URL.toLowerCase(), { ...(w.store.get('pr:' + URL.toLowerCase()) as object), reviews: ['1'] })
+  w.dropPrompt = true
+  startTurn()
+  await clock.settle()
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
 for (const [where, stderr] of [
   ['outside a git repository', 'failed to run git: fatal: not a git repository (or any of the parent directories): .git'],
   ['in a repository without a remote', 'no git remotes found'],
