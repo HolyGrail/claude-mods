@@ -42,6 +42,9 @@ const LATE = 'poll outlasted its turn'
 // note left running holds the other sessions back for RUNNING_MS, and no later poll of this session
 // will write it again
 const FINAL_RETRIES_MS = [200, 1_000, 3_000]
+// The pauses before a push's last note, the one with the time its Bash call ran, goes out again
+// after the store refused it, for as long as the push runs
+const PUBLISH_RETRIES_MS = [1_000, 5_000, 15_000]
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // Option values are one unquoted, single-quoted or double-quoted shell word
 const SHELL_WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s"';&|<>]+)`
@@ -321,8 +324,27 @@ export function register(on) {
       // counts from here; the notes take this time with the push's end, which is when it applies
       push.at = await $.clock.now()
       for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
-      // and the other sessions hold back from it too, so it goes out as Bash runs, not before
-      publish()
+      // and the other sessions hold back from it too, so it goes out as Bash runs, not before. One the
+      // store refuses would leave them the time of an earlier note, from which they would take the
+      // push as hung too soon, so it is tried again while the push runs; once it ends, the note that
+      // says so carries the time anyway
+      const publishLast = (attempt = 0) =>
+        refreshNote($, { strict: true }).catch((error) => {
+          if (!push.running) return
+          const wait = PUBLISH_RETRIES_MS[attempt]
+          if (wait === undefined) {
+            if (generation !== watchGen || (watched?.id ?? null) !== prId) return
+            lastCheck = { at: startedAt, error: `push note: ${error?.message ?? error}` }
+            showStatus($)
+            return
+          }
+          $.clock.after(wait, () => {
+            if (!push.running) return
+            for (const note of [lastNote, ...retired.values()]) if (note?.pending.includes(push)) note.dirty = true
+            publishLast(attempt + 1)
+          })
+        })
+      publishLast()
     }
     // The other sessions hold back their relays only while the push runs
     const finish = async ({ dropped = false, shas = null, refs = null } = {}) => {

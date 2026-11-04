@@ -3554,6 +3554,38 @@ test('a session that leaves the waking to another pages through the same pages a
   expect(w.prompts).toEqual([expect.stringContaining('inline コメント 4 件')])
 })
 
+test('a push\'s last note, with the time its Bash call ran, goes out again when the store refuses it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('tool.call', { tool: 'Bash' }, async () => {
+    await clock.sleep(30_000)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' } as never
+  })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(10_000)
+  // The first three notes are slow, and the store refuses the fourth, the one the Bash call runs on
+  let writes = 0
+  w.sets = async (key) => {
+    if (key !== NOTE) return
+    writes++
+    if (writes <= 3) await clock.sleep(2_000)
+    else if (writes === 4) throw new Error('store busy')
+  }
+  const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(6_500)
+  expect(writes).toBe(4)
+  // The store holds the time from before the third note went out, 4 s older than the push's own
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 14_000, running: true }] })
+  // A second later the note goes out again with it
+  await clock.advance(1_000)
+  expect(writes).toBe(5)
+  expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW + 16_000, running: true }] })
+  w.sets = undefined
+  await clock.advance(30_000)
+  await push
+})
+
 test('a push whose note cannot be written still runs, and says so in the status line', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
