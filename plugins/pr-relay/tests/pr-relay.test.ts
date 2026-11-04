@@ -362,12 +362,18 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
 }
 
 // A pull request's record as the next session that writes it reads it: the marks taken back since
-// (undo:<id> keys the record has not applied yet) come off as the module applies them
+// (undo:<id> keys the record has not applied yet, but for those parked by a delivery whose process
+// is still alive) come off as the module applies them
 function marked(w: World, key = 'pr:' + URL.toLowerCase()) {
   const record = { ...(w.store.get(key) as Record<string, any>) }
   const undone: string[] = record.undone ?? []
   const undos = [...w.store.entries()]
     .filter(([k, v]) => k.startsWith('undo:') && (v as { pr?: string }).pr === key.slice('pr:'.length) && !undone.includes(k))
+    // One a delivery parked waits while its process writes its alive time, as the module has it
+    .filter(([, v]) => {
+      const pending = (v as { pending?: string }).pending
+      return typeof pending !== 'string' || !w.store.has('alive:' + pending)
+    })
     .map(([, v]) => v as Record<string, any>)
     .sort((a, b) => a.at - b.at)
   for (const u of undos) {
@@ -2356,6 +2362,43 @@ test('a take-back whose delete keeps failing stays applied however many come aft
   expect(w.store.get(record)).toMatchObject({ reviews: ['1'] })
 })
 
+for (const [what, alive, resent] of [
+  ['whose process is gone', NOW - 5 * MINUTE, true],
+  ['whose process still writes its alive time', NOW - MINUTE, false],
+] as const) {
+  test(`a prompt parked by a delivery ${what} is ${resent ? '' : 'not '}sent again`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+    // Another process relayed review 1 and was killed before the prompt's turn started
+    w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: ['1'], ended: null, at: NOW - 2 * MINUTE })
+    w.store.set('undo:parked', { pr: URL.toLowerCase(), at: NOW - 2 * MINUTE, reviews: ['1'], pending: 'p9' })
+    w.store.set('alive:p9', { at: alive })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts.length).toBe(resent ? 1 : 0)
+    expect(w.store.has('undo:parked')).toBe(!resent)
+  })
+}
+
+test('a delivered prompt takes away the take-back it parked', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let entered = () => {}
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>((resolve) => { entered = resolve }) })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  // Parked while the turn has not started
+  expect([...w.store.entries()].filter(([key]) => key.startsWith('undo:')).map(([, v]) => v)).toEqual([
+    expect.objectContaining({ reviews: ['1'], pending: 'p1' }),
+  ])
+  entered()
+  await clock.settle()
+  expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
 test('a take-back no session applied for two weeks is pruned', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { branchPr: null })
@@ -2846,6 +2889,51 @@ test('the other sessions\' notes are read together, not one after another', asyn
   w.gets = undefined
 })
 
+for (const [what, alive, defers] of [
+  ['whose process writes its alive time', NOW - MINUTE, true],
+  ['whose process stopped writing its alive time', NOW - 4 * MINUTE, false],
+  ['whose process left no alive time', null, false],
+] as const) {
+  test(`a running poll of another session ${what} ${defers ? 'holds' : 'does not hold'} this one back`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+    // Started two minutes ago and never finished: its process may have been killed
+    w.store.set('poll:session-a:p9:' + URL.toLowerCase(), { ...pollNote(NOW - 2 * MINUTE), instance: 'p9', running: true })
+    if (alive !== null) w.store.set('alive:p9', { at: alive })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts.length).toBe(defers ? 0 : 1)
+  })
+}
+
+test('a running push of a gone process holds no relay back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  w.store.set('poll:session-a:p9:' + URL.toLowerCase(), {
+    ...pollNote(NOW - 20 * MINUTE),
+    instance: 'p9',
+    idle: true,
+    pending: [{ id: 'a', at: NOW - 2 * MINUTE, head: 'a1', running: true }],
+  })
+  w.store.set('alive:p9', { at: NOW - 5 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a process writes its alive time from the start and takes it away at a final session end', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  expect(w.store.get('alive:p1')).toEqual({ at: NOW })
+  await clock.advance(MINUTE)
+  expect(w.store.get('alive:p1')).toEqual({ at: NOW + MINUTE })
+  expect(w.store.get(NOTE)).toMatchObject({ instance: 'p1' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.has('alive:p1')).toBe(false)
+})
+
 test('a poll of the same conversation in another process holds this one back like another session\'s', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
@@ -2937,7 +3025,7 @@ test('a push seen by a session that leaves the waking to another goes out in its
   w.pull.head = 'b2'
   w.store.set('poll:session-a', pollNote(NOW + MINUTE - 1_000))
   await clock.advance(40_000)
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW + MINUTE, since: NOW + 20_000, deferred: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW + MINUTE, since: NOW + 20_000, deferred: true })
 })
 
 test('the session that relays takes the last push from the other sessions\' notes', async ($, on) => {
@@ -2984,7 +3072,7 @@ test('a poll that could not ask GitHub leaves its note idle, with the push it kn
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
   await clock.settle()
   expect(w.status).toBe('PR #7 確認失敗 21:00: HTTP 502')
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH, idle: true })
 })
 
 test('a session that ends leaves its poll note idle', async ($, on) => {
@@ -3185,10 +3273,10 @@ test('a poll note carries the watch tool baseline from the start', async ($, on)
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: URL, since: iso(LAST_PUSH) })
   await clock.settle()
   // Still waiting on GitHub, so a session that relays meanwhile counts the push
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, running: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH, running: true })
 
   await clock.advance(10_000)
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH })
 })
 
 test('an idle note holds nothing back but its push still counts', async ($, on) => {
@@ -3216,7 +3304,7 @@ test('resuming another conversation mid-poll leaves the note idle rather than ru
   w.branchPr = null
   await $.classic.SessionStart({ source: 'resume' })
   await clock.advance(10_000)
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH, idle: true })
 })
 
 test('turning to another pull request leaves the last one\'s note behind', async ($, on) => {
@@ -3228,7 +3316,7 @@ test('turning to another pull request leaves the last one\'s note behind', async
   const other = 'https://github.com/HolyGrail/claude-mods/pull/9'
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: other })
   await clock.settle()
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH, idle: true })
   expect(w.store.get('poll:session-b:p1:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
 })
 
@@ -3483,7 +3571,7 @@ test('a poll overtaken by a new watch while it waits for the session id writes n
   const w = stubWorld(on)
   await $.session.start(START)
   await clock.settle()
-  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH })
+  expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), instance: 'p1', at: NOW, since: LAST_PUSH })
 
   w.ids = () => clock.sleep(5_000)
   await clock.advance(MINUTE)
@@ -4305,6 +4393,30 @@ test('a record write the store is slow to take keeps its round while the note\'s
   expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
   expect([...w.store.keys()].filter((key) => key.startsWith('undo:'))).toEqual([])
   w.sets = undefined
+})
+
+test('a record write that never lands stops beating half an hour after the poll began', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  let slow = true
+  w.sets = async (key) => {
+    if (slow && key.startsWith('pr:')) {
+      slow = false
+      await clock.sleep(45 * MINUTE)
+    }
+  }
+  await clock.advance(MINUTE)
+  await clock.advance(40 * MINUTE)
+  // The poll began a minute in; its last beat is from before half an hour on, so the others take
+  // the round over ten minutes after it
+  const beat = (w.store.get(NOTE) as { beat: number }).beat
+  expect(beat).toBeLessThan(NOW + MINUTE + 30 * MINUTE)
+  expect(beat).toBeGreaterThanOrEqual(NOW + 30 * MINUTE)
+  w.sets = undefined
+  await clock.advance(10 * MINUTE)
 })
 
 test('another session\'s running poll holds this one back from its newest beat', async ($, on) => {
