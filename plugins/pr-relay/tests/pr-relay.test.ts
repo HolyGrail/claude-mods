@@ -413,6 +413,41 @@ test('an auto-fix primary marks reviews without fetching details or prompting an
   expect(w.status).toBe('PR #7 監視中 · 21:00 確認 · CI モニター併用')
 })
 
+test('a review is left to the CI monitor of another session polling the same pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] } })
+  // A desktop session whose CI monitor fixes this pull request polled it in an earlier round
+  w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { pr: URL.toLowerCase(), at: NOW - 40_000, since: 0, monitored: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.detailsArgv).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
+for (const [what, note] of [
+  ['an idle note', { at: NOW - 40_000, idle: true }],
+  ['a note not written for three minutes', { at: NOW - 3 * MINUTE - 1_000 }],
+] as const) {
+  test(`a CI monitor known from ${what} does not hold back a review`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 2 }] } })
+    w.store.set('poll:session-a:p1:' + URL.toLowerCase(), { pr: URL.toLowerCase(), since: 0, monitored: true, ...note })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  })
+}
+
+test('a poll note says whether this session\'s CI monitor relays the pull request', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.store.get('poll:session-b:p1:' + URL.toLowerCase())).toMatchObject({ monitored: true })
+})
+
 test('turning off auto-fix relays the next review without resending silently marked reviews', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, {

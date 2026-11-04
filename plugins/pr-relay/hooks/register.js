@@ -41,6 +41,8 @@ const RUNNING_MS = 10 * 60_000
 // the other sessions hold back from the newest beat: a store slow to take the record must not let
 // another session take a round over that this one is still writing
 const BEAT_MS = 60_000
+// How fresh another session's note must be for its CI monitor to count: it polls every minute
+const MONITOR_FRESH_MS = 3 * TICK_MS
 const LATE = 'poll outlasted its turn'
 // The pauses before a final session.end writes again the notes the store would not take as idle: a
 // note left running holds the other sessions back for RUNNING_MS, and no later poll of this session
@@ -756,7 +758,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
   }
   // So may one whose store answered too late
   if (lapsed(now, readAt)) return late($, now, pr, note)
-  const { defers, since: othersSince, pending, pushing } = notes
+  const { defers, since: othersSince, pending, pushing, monitoredElsewhere } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) {
     lastNote.deferred = true
@@ -820,7 +822,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       // what its note said
       const owns = watched?.id === pr.id
       noted = Math.max(othersSince, owns ? knownSince : note.since)
-      const sends = update($, pr, data, record, noted, pending, defers, pushing, now, askedAt)
+      const sends = update($, pr, data, record, noted, pending, defers, pushing, now, askedAt, monitoredElsewhere)
       // The session that relays writes the record at about this moment, so a copy read before its
       // marks must not land over them: one that leaves it the waking writes only its own note
       if (owns) knownSince = Math.max(knownSince, record.since)
@@ -959,7 +961,7 @@ async function late($, now, pr, note) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, notedPush, pending, defers, pushing, now, askedAt) {
+function update($, pr, data, record, notedPush, pending, defers, pushing, now, askedAt, monitoredElsewhere) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -1010,7 +1012,7 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
   const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt >= askedAt : push.at >= askedAt)
   const replaced =
     (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
-  return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record)
+  return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record, monitoredElsewhere)
 }
 
 // The cache takes only the latest answer, so one asked before a /resume cannot land over it
@@ -1067,7 +1069,7 @@ async function notePoll($, pr, gen) {
       })
     }
   }
-  lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, serial: ++noteSerial }
+  lastNote = { key, pr: pr.id, at, since: knownSince, pending: [...pushes], running: true, monitored: monitored.has(pr.id), serial: ++noteSerial }
   await writeNote($, lastNote, { strict: true })
   // A note other sessions wrote while this one's was on its way may have been elected without
   // seeing it, so the poll yields to those too
@@ -1181,7 +1183,7 @@ function writeNote($, note, { strict = false } = {}) {
   return strict ? write : tail
 }
 
-function noteValue({ pr, at, since, pending = [], running, idle, deferred, beat }) {
+function noteValue({ pr, at, since, pending = [], running, idle, deferred, beat, monitored }) {
   const pushes = pending.filter((push) => !push.dropped).map(pushNote)
   return {
     pr,
@@ -1192,6 +1194,8 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred, beat 
     ...(running && typeof beat === 'number' ? { beat } : {}),
     ...(idle ? { idle } : {}),
     ...(deferred ? { deferred } : {}),
+    // Said only while the session polls, since an idle note's session no longer receives anything
+    ...(monitored && !idle ? { monitored } : {}),
   }
 }
 
@@ -1344,6 +1348,7 @@ async function readNotes($, pr, note) {
   let defers = false
   let pushing = false
   let since = 0
+  let monitoredElsewhere = false
   const pending = []
   for (const [i, key] of keys.entries()) {
     const other = values[i]
@@ -1355,6 +1360,9 @@ async function readNotes($, pr, note) {
       // One left running by a session that died mid-push holds nothing back for long
       if (push.running && push.at >= note.at - RUNNING_MS) pushing = true
     }
+    // A session polling the pull request, whose desktop CI monitor relays its comments; a poll every
+    // minute keeps its note this fresh
+    if (other.monitored === true && !other.idle && other.at >= note.at - MONITOR_FRESH_MS) monitoredElsewhere = true
     // A poll that left the round to another holds nothing back either: polls a few seconds apart
     // would otherwise each yield to the one before, round after round, and none would relay
     if (other.idle || other.deferred) continue
@@ -1372,7 +1380,7 @@ async function readNotes($, pr, note) {
     if (heldFrom < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
-  return { defers, since, pending, pushing, stable }
+  return { defers, since, pending, pushing, stable, monitoredElsewhere }
 }
 
 // The other notes as two reads in a row found them alike. $.store reads one key at a time, so a note
@@ -1398,9 +1406,11 @@ async function scanNotes($, note) {
 // Marks what is new since the last push as relayed: reviews before an approval, then the usage
 // limit. A newer approval is marked with the reviews, and mentioned only if it came after them.
 // Review details are fetched at delivery, once the record is written, outside the write queue
-function relay($, pr, signals, record) {
+function relay($, pr, signals, record, monitoredElsewhere = false) {
   const fresh = signals.reviews.filter((r) => !record.reviews.some((id) => String(id) === String(r.id))).sort((a, b) => a.at - b.at)
-  const usesMonitor = monitored.has(pr.id)
+  // The desktop CI monitor of any session still polling this pull request relays its comments to
+  // that session, so the session that relays here leaves them to it too
+  const usesMonitor = monitored.has(pr.id) || monitoredElsewhere
   const approvedAt = usesMonitor ? signals.reactedAt : signals.approvedAt
   const previous = record.approvedAt
   if (usesMonitor) {
