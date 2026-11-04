@@ -14,9 +14,9 @@ const CODEX = 'chatgpt-codex-connector'
 const KEY_PREFIX = 'pr:'
 // Each session notes under this prefix plus its id, its process's instance and the pull request's
 // when it last started a poll of it, as { pr, at, since, pending?, running?, idle? }, so sessions
-// polling the same pull request together let only the first of them relay. since is the last push the session knows of,
-// which the session that relays takes from it, and pending a push it ran that counts once the head
-// has moved, { at, head } with the head it last saw;
+// polling the same pull request together let only the first of them relay. since is the last push
+// the session knows of, which the session that relays takes from it, and pending a push it ran that
+// counts once the head has moved, { at, head } with the head it last saw;
 // running stays set until the poll has written what it relayed; idle marks a note whose session
 // stopped polling, kept only for its since. A session writes only its own key, since $.store has
 // no atomic update.
