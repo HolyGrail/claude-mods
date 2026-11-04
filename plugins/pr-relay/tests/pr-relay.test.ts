@@ -2301,6 +2301,26 @@ test('a take-back the record has applied is not applied again when its delete fa
   expect(w.store.has('undo:old')).toBe(false)
 })
 
+test('a take-back whose delete keeps failing stays applied however many come after it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  const record = 'pr:' + URL.toLowerCase()
+  const old = { pr: URL.toLowerCase(), at: NOW - 3 * MINUTE, reviews: ['1'] }
+  w.store.set(record, { since: LAST_PUSH, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: ['1'], ended: null, at: NOW - MINUTE, undone: ['undo:old'] })
+  w.store.set('undo:old', old)
+  // Sixty newer take-backs, of reviews this pull request never had
+  for (let i = 0; i < 60; i++) w.store.set(`undo:new-${String(i).padStart(2, '0')}`, { pr: URL.toLowerCase(), at: NOW - 2 * MINUTE, reviews: [`x${i}`] })
+  await $.session.start(START)
+  await clock.settle()
+  expect((w.store.get(record) as { undone: string[] }).undone).toContain('undo:old')
+
+  // Its delete failed again, and the next round must not take back review 1 once more
+  w.store.set('undo:old', old)
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(record)).toMatchObject({ reviews: ['1'] })
+})
+
 test('a take-back no session applied for two weeks is pruned', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on, { branchPr: null })

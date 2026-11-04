@@ -16,10 +16,9 @@ const KEY_PREFIX = 'pr:'
 // marks another session wrote meanwhile, or under a copy another session read before it. It goes
 // under this prefix plus an id of its own, as { pr, at, reviews?, approvedAt?, previous?,
 // usageLimitAt?, usagePrevious?, ended? }, and the next session that writes the record applies it
-// there, listing its id in the record's undone, then deletes it
+// there, listing its id in the record's undone, then deletes it. An id stays listed for as long as
+// its key is in the store, so one whose delete keeps failing is never applied again
 const UNDO_PREFIX = 'undo:'
-// How many applied take-backs the record remembers, so one whose delete failed is not applied again
-const UNDONE_KEPT = 50
 // Each session notes under this prefix plus its id, its process's instance and the pull request's
 // when it last started a poll of it, as { pr, at, since, pending?, running?, idle? }, so sessions
 // polling the same pull request together let only the first of them relay. since is the last push
@@ -781,7 +780,8 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       const undos = defers ? null : await readUndos($, pr.id, record)
       if (undos) {
         for (const { undo } of undos.open) applyUndo(record, undo)
-        record.undone = [...record.undone, ...undos.open.map(({ key }) => key)].slice(-UNDONE_KEPT)
+        // Those whose keys are gone are dropped; a count cap would drop one still in the store
+        record.undone = [...undos.applied, ...undos.open.map(({ key }) => key)]
       }
       const writeAt = await $.clock.now()
       // A watch that began while this waited its turn owns the pushes and the marks now
