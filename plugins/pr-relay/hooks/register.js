@@ -33,6 +33,8 @@ const POLL_PREFIX = 'poll:'
 // first relays what is new, and the others leave it to that one. The query a poll waits on takes
 // far longer than a store write, so each of them sees the earlier one's note by the time it reads.
 const ROUND_MS = 30_000
+// How many times a scan of the other notes reads them again before it takes them as they stand
+const SCAN_TRIES = 3
 // A poll still running holds back the later ones of other sessions past its round, since it has not
 // written what it relayed yet; one this old is taken to belong to a session that died mid-poll
 const RUNNING_MS = 10 * 60_000
@@ -831,6 +833,8 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       const known = new Map(pending.map((push) => [pushKey(push), state(push)]))
       const moved = (again) =>
         !again ||
+        // Notes still being written as the sends go out may hold a push this read cannot see yet
+        !again.stable ||
         again.pushing ||
         again.since > noted ||
         again.pending.some((push) => known.get(pushKey(push)) !== state(push))
@@ -1264,13 +1268,11 @@ async function headBefore($, prId) {
 // cannot be read throws, since a note it hides may be the one this poll should yield to.
 
 async function readNotes($, pr, note) {
-  const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key && key !== note.legacy)
+  const { keys, values, stable } = await scanNotes($, note)
   let defers = false
   let pushing = false
   let since = 0
   const pending = []
-  // Read together, so the scan is as short as one read, however many notes the store holds
-  const values = await Promise.all(keys.map((key) => $.store.get(key)))
   for (const [i, key] of keys.entries()) {
     const other = values[i]
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
@@ -1295,7 +1297,27 @@ async function readNotes($, pr, note) {
     if (other.at < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
-  return { defers, since, pending, pushing }
+  return { defers, since, pending, pushing, stable }
+}
+
+// The other notes as two reads in a row found them alike. $.store reads one key at a time, so a note
+// written while a scan runs (a key listed after it, or one rewritten once read) slips past one read;
+// a second that matches it says nothing was written meanwhile. Notes that keep changing come back
+// as the last read found them, marked unstable.
+async function scanNotes($, note) {
+  const read = async () => {
+    const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key && key !== note.legacy).sort()
+    // Read together, so the scan is as short as one read, however many notes the store holds
+    const values = await Promise.all(keys.map((key) => $.store.get(key)))
+    return { keys, values, text: JSON.stringify([keys, values]) }
+  }
+  let last = await read()
+  for (let tries = 0; tries < SCAN_TRIES; tries++) {
+    const again = await read()
+    if (again.text === last.text) return { ...again, stable: true }
+    last = again
+  }
+  return { ...last, stable: false }
 }
 
 // Marks what is new since the last push as relayed: reviews before an approval, then the usage

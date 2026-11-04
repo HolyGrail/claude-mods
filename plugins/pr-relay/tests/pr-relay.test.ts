@@ -4294,6 +4294,75 @@ test('a push another session started while the record was written holds back the
   expect(w.prompts).toEqual([])
 })
 
+// A poll whose record has been written, with review 1 marked, and the other session's idle note
+async function scanAfterRecord($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const other = 'poll:session-a:p1:' + URL.toLowerCase()
+  w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  const state = { written: false }
+  w.sets = async (key) => {
+    if (key === 'pr:' + URL.toLowerCase()) state.written = true
+  }
+  return { clock, w, other, state }
+}
+
+test('a push note written under a new key while the last notes are read holds back the relay', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  // Lands as the other note is read the second time since the record went out: during the last
+  // scan of a session that reads each note once a scan
+  let reads = 0
+  let done = false
+  w.gets = async (key) => {
+    if (key !== other || !state.written || ++reads !== 2) return
+    done = true
+    w.store.set('poll:session-z:p1:' + URL.toLowerCase(), { ...pollNote(NOW + MINUTE), idle: true, pending: [{ id: 'z', at: NOW + MINUTE, head: 'a1', running: true }] })
+  }
+  await clock.advance(MINUTE)
+  expect(done).toBe(true)
+  expect(w.prompts).toEqual([])
+  w.gets = undefined
+  w.sets = undefined
+})
+
+test('a note rewritten with a running push while the last notes are read holds back the relay', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  // Lands as the other note is read the second time since the record went out: during the last
+  // scan of a session that reads each note once a scan
+  let reads = 0
+  let done = false
+  w.gets = async (key) => {
+    if (key !== other || !state.written || ++reads !== 2) return
+    done = true
+    w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true, pending: [{ id: 'a', at: NOW + MINUTE, head: 'a1', running: true }] })
+  }
+  await clock.advance(MINUTE)
+  expect(done).toBe(true)
+  expect(w.prompts).toEqual([])
+  w.gets = undefined
+  w.sets = undefined
+})
+
+test('notes that change at every read hold back the relay until they settle', async ($, on) => {
+  const { clock, w, other, state } = await scanAfterRecord($, on)
+  let writes = 0
+  w.gets = async (key) => {
+    if (key !== other || !state.written) return
+    w.store.set(other, { ...pollNote(NOW - 20 * MINUTE), idle: true, writes: ++writes })
+  }
+  await clock.advance(MINUTE)
+  expect(writes).toBeGreaterThan(0)
+  expect(w.prompts).toEqual([])
+
+  w.gets = undefined
+  w.sets = undefined
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
 test('a baseline another session\'s note shows once the record is written holds back the relay', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
