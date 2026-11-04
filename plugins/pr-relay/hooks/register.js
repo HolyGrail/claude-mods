@@ -12,6 +12,14 @@ const CODEX = 'chatgpt-codex-connector'
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
 const KEY_PREFIX = 'pr:'
+// A mark taken back is not written into the record by the session that made it, which may land over
+// marks another session wrote meanwhile, or under a copy another session read before it. It goes
+// under this prefix plus an id of its own, as { pr, at, reviews?, approvedAt?, previous?,
+// usageLimitAt?, usagePrevious?, ended? }, and the next session that writes the record applies it
+// there, listing its id in the record's undone, then deletes it
+const UNDO_PREFIX = 'undo:'
+// How many applied take-backs the record remembers, so one whose delete failed is not applied again
+const UNDONE_KEPT = 50
 // Each session notes under this prefix plus its id, its process's instance and the pull request's
 // when it last started a poll of it, as { pr, at, since, pending?, running?, idle? }, so sessions
 // polling the same pull request together let only the first of them relay. since is the last push
@@ -158,8 +166,8 @@ let idAsks = 0
 // session.end takes their marks back, since a prompt still queued then never reaches the model and
 // the other sessions would otherwise read it as sent.
 const undelivered = new Set()
-// The read, change and write of a record in this session, one after another: a poll and a send
-// that takes its mark back would otherwise each write what they read before the other wrote
+// The read, change and write of a record in this session, one after another: an ended poll that
+// outlasts a new watch's first poll would otherwise write what it read before the other wrote
 let writes = Promise.resolve()
 
 export function register(on) {
@@ -762,6 +770,13 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     let noted = 0
     const sends = await exclusive(async () => {
       const record = normalize(await $.store.get(key))
+      // Marks taken back since the record was last written come off before what is new is marked,
+      // so what they took back is sent again in this round
+      const undos = defers ? null : await readUndos($, pr.id, record)
+      if (undos) {
+        for (const { undo } of undos.open) applyUndo(record, undo)
+        record.undone = [...record.undone, ...undos.open.map(({ key }) => key)].slice(-UNDONE_KEPT)
+      }
       const writeAt = await $.clock.now()
       // A watch that began while this waited its turn owns the pushes and the marks now
       if (gen !== generation && !ended) return null
@@ -779,6 +794,9 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       record.at = now
       if (data.headRefOid) record.headAt = seenAt
       await $.store.set(key, record)
+      // The record now says what they took back, so they can go; one whose delete fails is skipped
+      // by its id in undone and deleted next time
+      for (const done of [...undos.open.map(({ key }) => key), ...undos.applied]) $.store.delete(done).catch(() => {})
       // A write that landed past the lease may have gone over a session that took the round over and
       // relayed the same, so this one sends nothing; $.store has no conditional write to stop it.
       // Its marks are taken back, since a session that has not taken the round over yet would read
@@ -894,9 +912,7 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
         {
           toast: `PR #${pr.number} が${ENDED[state]}されました`,
           pr,
-          undo: (r) => {
-            if (r.ended === state) r.ended = null
-          },
+          undo: { ended: state },
         },
       ]
     }
@@ -1285,11 +1301,7 @@ function relay($, pr, signals, record) {
         pr,
         reviews: fresh,
         approvedAt: approvedAt > fresh[fresh.length - 1].at ? approvedAt : 0,
-        undo: (r) => {
-          if (approvedAt && r.approvedAt === approvedAt) r.approvedAt = previous
-          const pending = fresh.map((f) => String(f.id))
-          r.reviews = r.reviews.filter((id) => !pending.includes(String(id)))
-        },
+        undo: { reviews: fresh.map((f) => String(f.id)), ...(approvedAt ? { approvedAt, previous } : {}) },
       },
     ]
   }
@@ -1304,9 +1316,7 @@ function relay($, pr, signals, record) {
           (usesMonitor && fresh.length
             ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
             : ''),
-        undo: (r) => {
-          if (r.approvedAt === markedAt) r.approvedAt = previous
-        },
+        undo: { approvedAt: markedAt, previous },
       },
     ]
   }
@@ -1317,9 +1327,7 @@ function relay($, pr, signals, record) {
     return [
       {
         toast: `PR #${pr.number}: Codex の利用上限に達し、レビューが付きません`,
-        undo: (r) => {
-          if (r.usageLimitAt === usageLimitAt) r.usageLimitAt = previous
-        },
+        undo: { usageLimitAt, usagePrevious: previous },
       },
     ]
   }
@@ -1450,12 +1458,39 @@ function takeBackAll($, key, sends, pr) {
   }
 }
 
-function takeBack($, key, undo) {
-  return exclusive(async () => {
-    const record = normalize(await $.store.get(key))
-    undo(record)
-    await $.store.set(key, record)
-  })
+// Leaves the take-back for the next session that writes the record, under a key of its own
+async function takeBack($, key, undo) {
+  const at = await $.clock.now()
+  await $.store.set(UNDO_PREFIX + pushId(at), { pr: key.slice(KEY_PREFIX.length), at, ...undo })
+}
+
+// The take-backs left for a pull request that its record has not applied, oldest first, and those it
+// has, whose delete did not go through
+async function readUndos($, prId, record) {
+  const keys = (await $.store.keys()).filter((key) => key.startsWith(UNDO_PREFIX))
+  const values = await Promise.all(keys.map((key) => $.store.get(key)))
+  const open = []
+  const applied = []
+  for (const [i, key] of keys.entries()) {
+    const undo = values[i]
+    if (undo?.pr !== prId) continue
+    if (record.undone.includes(key)) applied.push(key)
+    else open.push({ key, undo })
+  }
+  open.sort((a, b) => (a.undo.at ?? 0) - (b.undo.at ?? 0) || (a.key < b.key ? -1 : 1))
+  return { open, applied }
+}
+
+// Takes one mark back from a record, as the prompt or toast that made it would have
+function applyUndo(record, undo) {
+  if (Array.isArray(undo.reviews)) {
+    const ids = undo.reviews.map(String)
+    record.reviews = record.reviews.filter((id) => !ids.includes(String(id)))
+  }
+  // Only while the record holds the mark that send wrote: a newer one stays
+  if (typeof undo.approvedAt === 'number' && undo.approvedAt && record.approvedAt === undo.approvedAt) record.approvedAt = undo.previous ?? 0
+  if (typeof undo.usageLimitAt === 'number' && undo.usageLimitAt && record.usageLimitAt === undo.usageLimitAt) record.usageLimitAt = undo.usagePrevious ?? 0
+  if (typeof undo.ended === 'string' && record.ended === undo.ended) record.ended = null
 }
 
 function exclusive(fn) {
@@ -1632,6 +1667,10 @@ async function prune($) {
       if (key.startsWith(KEY_PREFIX)) {
         if (record?.at >= (record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS))) return
         await $.store.delete(key)
+      } else if (key.startsWith(UNDO_PREFIX)) {
+        // A take-back no session applied in time: its pull request has not been polled since
+        if (record?.at >= cutoff) return
+        await $.store.delete(key)
       } else if (own(key)) {
         // Only this session writes its notes, so one it no longer holds goes once the record has
         // counted what it hands on, or once stale; the delete waits for any write still going out
@@ -1686,6 +1725,7 @@ function normalize(record) {
     reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],
     ended: record?.ended ?? null,
     at: record?.at ?? 0,
+    undone: Array.isArray(record?.undone) ? record.undone.filter((key) => typeof key === 'string') : [],
   }
 }
 
