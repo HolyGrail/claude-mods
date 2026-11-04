@@ -199,6 +199,8 @@ type World = {
   ids?: () => Promise<void>
   // The pull requests other than the one in pull, by number
   pulls?: Record<number, Pull>
+  // Process environment variables besides the note key instance
+  env?: Record<string, string>
   // The argument vectors of the polling gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -241,6 +243,8 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     ...world,
   }
   on('session.start', () => ({ cwd: '/repo' }))
+  // The process's part of the note keys
+  mock.env(on, { PR_RELAY_INSTANCE: 'p1', ...w.env })
   on('session.id', async () => {
     await w.ids?.()
     return { value: w.sessionId }
@@ -1360,9 +1364,8 @@ test('a terminal session never calls the desktop status tool', async ($, on) => 
 
 test('watches the branch pull request without reading skill session files', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on)
+  const w = stubWorld(on, { env: { HOME: '/home' } })
   const fileCalls: string[] = []
-  mock.env(on, { HOME: '/home' })
   // Any skill session lookup would find a different pull request in the same checkout.
   on('fs.list', ($, e) => {
     fileCalls.push(e.path)
@@ -2296,8 +2299,7 @@ for (const [command, cwd] of [
 ] as const) {
   test(`${command} looks up the branch in ${cwd ?? 'the session directory'}`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
-    const w = stubWorld(on, { branchPr: null })
-    mock.env(on, { HOME: '/home/tester' })
+    const w = stubWorld(on, { branchPr: null, env: { HOME: '/home/tester' } })
     on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
     await $.session.start(START)
     await clock.settle()
@@ -2333,8 +2335,8 @@ for (const command of [
 ]) {
   test(`${command} skips an unresolved or ambiguous directory lookup but still tracks the push`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
+    // No HOME in the environment
     const w = stubWorld(on, { branchPr: null })
-    mock.env(on, {})
     const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
     on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
     await $.session.start(START)
@@ -2645,7 +2647,7 @@ test('watching another pull request keeps the previous cleanup row until that pu
 })
 
 // This session's poll note on the pull request
-const NOTE = 'poll:session-b:' + URL.toLowerCase()
+const NOTE = 'poll:session-b:p1:' + URL.toLowerCase()
 
 // Another session's poll note, as that session writes it before asking GitHub
 const pollNote = (at: number, pr = URL.toLowerCase()) => ({ pr, at })
@@ -2661,6 +2663,53 @@ test('a session that polls in the same round as an earlier one leaves the waking
   expect(w.prompts).toEqual([])
   // The record is left to the session that relays, so nothing is lost if that one never does
   expect(w.store.has('pr:' + URL.toLowerCase())).toBe(false)
+})
+
+test('a poll of the same conversation in another process holds this one back like another session\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The same id resumed in a second Claude Code process, which started its poll a moment earlier
+  w.store.set('poll:session-b:p2:' + URL.toLowerCase(), { ...pollNote(NOW - 1_000), running: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
+  // Its note is left as it was
+  expect(w.store.get('poll:session-b:p2:' + URL.toLowerCase())).toEqual({ ...pollNote(NOW - 1_000), running: true })
+})
+
+test('a process with no instance in its environment makes one for its note keys', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { env: { PR_RELAY_INSTANCE: '' } })
+  await $.session.start(START)
+  await clock.settle()
+  const keys = [...w.store.keys()].filter((key) => key.startsWith('poll:session-b:'))
+  expect(keys).toEqual([expect.stringMatching(/^poll:session-b:[0-9a-z]+:https:\/\/github\.com\//)])
+})
+
+test('a note of version 0.10 under this session\'s id holds no election and hands on what it held', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Written by this process before the plugin was updated, in the middle of a poll
+  w.store.set('poll:session-b:' + URL.toLowerCase(), { ...pollNote(NOW - 1_000), running: true, since: NOW - 2 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  expect(w.store.get(NOTE)).toMatchObject({ since: NOW - 2 * MINUTE })
+})
+
+test('pruning drops this session\'s 0.10 note but leaves another process\'s under the same id', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('pr:' + URL.toLowerCase(), { since: NOW - 3 * 60 * MINUTE, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - MINUTE })
+  const legacy = 'poll:session-b:' + URL.toLowerCase()
+  const sibling = 'poll:session-b:p2:' + URL.toLowerCase()
+  w.store.set(legacy, { ...pollNote(NOW - 2 * 60 * MINUTE), idle: true, since: NOW - 3 * 60 * MINUTE })
+  w.store.set(sibling, { ...pollNote(NOW - 2 * 60 * MINUTE), idle: true, since: NOW - 3 * 60 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.deleted).toContain(legacy)
+  expect(w.store.has(sibling)).toBe(true)
 })
 
 test('a session whose poll started at the same moment yields only to a smaller key', async ($, on) => {
@@ -2944,7 +2993,7 @@ test('turning to another pull request leaves the last one\'s note behind', async
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: other })
   await clock.settle()
   expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
-  expect(w.store.get('poll:session-b:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
+  expect(w.store.get('poll:session-b:p1:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
 })
 
 test('a push another session ran counts once the head has moved past the one it saw', async ($, on) => {
@@ -3208,7 +3257,7 @@ test('a poll overtaken by a new watch while it waits for the session id writes n
   await clock.advance(10_000)
   expect(w.store.get(NOTE)).toMatchObject({ at: NOW })
   expect(w.store.get(NOTE)).not.toHaveProperty('running')
-  expect(w.store.get('poll:session-b:https://github.com/holygrail/claude-mods/pull/9')).not.toHaveProperty('running')
+  expect(w.store.get('poll:session-b:p1:https://github.com/holygrail/claude-mods/pull/9')).not.toHaveProperty('running')
 })
 
 test('a push that finishes after the session turned to another pull request clears it from the last one\'s note', async ($, on) => {
@@ -3404,7 +3453,7 @@ test('two pushes run side by side each count for what they pushed', async ($, on
 })
 
 const PR9 = 'https://github.com/HolyGrail/claude-mods/pull/9'
-const NOTE9 = 'poll:session-b:' + PR9.toLowerCase()
+const NOTE9 = 'poll:session-b:p1:' + PR9.toLowerCase()
 
 test('a push that moves another ref to the head the pull request already had does not count', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -4029,7 +4078,7 @@ test('a push made after a resume, before the first poll, goes under the resumed 
   await clock.advance(MINUTE)
   await Promise.all([turned, push])
   expect(w.store.has(NOTE9)).toBe(false)
-  expect(w.store.get('poll:session-c:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 11_000 }] })
+  expect(w.store.get('poll:session-c:p1:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 11_000 }] })
   w.ids = undefined
 })
 
@@ -4456,7 +4505,7 @@ test('a push made after a fork, before the first poll, goes under the fork\'s id
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(MINUTE)
   expect(w.store.get(NOTE)).not.toHaveProperty('pending')
-  expect(w.store.get('poll:session-c:' + URL.toLowerCase())).toMatchObject({ pending: [{ at: NOW }] })
+  expect(w.store.get('poll:session-c:p1:' + URL.toLowerCase())).toMatchObject({ pending: [{ at: NOW }] })
 })
 
 test('a push another session started and finished after GitHub answered holds back the relay', async ($, on) => {
