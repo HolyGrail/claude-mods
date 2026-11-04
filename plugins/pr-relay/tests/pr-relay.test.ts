@@ -199,6 +199,8 @@ type World = {
   ids?: () => Promise<void>
   // The pull requests other than the one in pull, by number
   pulls?: Record<number, Pull>
+  // Process environment variables besides the note key instance
+  env?: Record<string, string>
   // The argument vectors of the polling gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -241,6 +243,8 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     ...world,
   }
   on('session.start', () => ({ cwd: '/repo' }))
+  // The process's part of the note keys
+  mock.env(on, { PR_RELAY_INSTANCE: 'p1', ...w.env })
   on('session.id', async () => {
     await w.ids?.()
     return { value: w.sessionId }
@@ -1360,9 +1364,8 @@ test('a terminal session never calls the desktop status tool', async ($, on) => 
 
 test('watches the branch pull request without reading skill session files', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const w = stubWorld(on)
+  const w = stubWorld(on, { env: { HOME: '/home' } })
   const fileCalls: string[] = []
-  mock.env(on, { HOME: '/home' })
   // Any skill session lookup would find a different pull request in the same checkout.
   on('fs.list', ($, e) => {
     fileCalls.push(e.path)
@@ -2296,8 +2299,7 @@ for (const [command, cwd] of [
 ] as const) {
   test(`${command} looks up the branch in ${cwd ?? 'the session directory'}`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
-    const w = stubWorld(on, { branchPr: null })
-    mock.env(on, { HOME: '/home/tester' })
+    const w = stubWorld(on, { branchPr: null, env: { HOME: '/home/tester' } })
     on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
     await $.session.start(START)
     await clock.settle()
@@ -2333,8 +2335,8 @@ for (const command of [
 ]) {
   test(`${command} skips an unresolved or ambiguous directory lookup but still tracks the push`, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
+    // No HOME in the environment
     const w = stubWorld(on, { branchPr: null })
-    mock.env(on, {})
     const pushed = '   a1a1a1a..b2b2b2b  feature -> feature\n'
     on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: pushed, interrupted: false }, text: pushed }) as never)
     await $.session.start(START)
@@ -2645,7 +2647,7 @@ test('watching another pull request keeps the previous cleanup row until that pu
 })
 
 // This session's poll note on the pull request
-const NOTE = 'poll:session-b:' + URL.toLowerCase()
+const NOTE = 'poll:session-b:p1:' + URL.toLowerCase()
 
 // Another session's poll note, as that session writes it before asking GitHub
 const pollNote = (at: number, pr = URL.toLowerCase()) => ({ pr, at })
@@ -2661,6 +2663,92 @@ test('a session that polls in the same round as an earlier one leaves the waking
   expect(w.prompts).toEqual([])
   // The record is left to the session that relays, so nothing is lost if that one never does
   expect(w.store.has('pr:' + URL.toLowerCase())).toBe(false)
+})
+
+test('another session\'s note left idle a day, whose pushes the record has counted, is pruned', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  const DAY = 24 * 60 * MINUTE
+  w.store.set('pr:' + URL.toLowerCase(), { since: NOW - 2 * DAY, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - MINUTE })
+  const note = (at: number, extra: object) => ({ ...pollNote(at), since: NOW - 3 * DAY, ...extra })
+  // Left idle a day ago under an id a /clear retired, its push counted
+  w.store.set('poll:old-a:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, { idle: true, pending: [{ id: 'x', at: NOW - 3 * DAY, head: 'a0' }] }))
+  // Idle, but holding a push the record has not counted
+  w.store.set('poll:old-b:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, { idle: true, pending: [{ id: 'y', at: NOW - DAY - 2 * MINUTE, head: 'a0' }] }))
+  // Idle for less than a day
+  w.store.set('poll:old-c:p1:' + URL.toLowerCase(), note(NOW - DAY + MINUTE, { idle: true }))
+  // Not idle: its session may still poll, and rewrite it between the read and the delete
+  w.store.set('poll:old-d:p1:' + URL.toLowerCase(), note(NOW - DAY - MINUTE, {}))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.deleted.filter((key) => key.startsWith('poll:'))).toEqual(['poll:old-a:p1:' + URL.toLowerCase()])
+})
+
+test('the other sessions\' notes are read together, not one after another', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  for (let i = 0; i < 50; i++) w.store.set(`poll:other-${i}:p1:${URL.toLowerCase()}`, { ...pollNote(NOW - 60 * MINUTE), idle: true })
+  await $.session.start(START)
+  await clock.settle()
+  // Measured from the next poll on, apart from the startup prune
+  let inFlight = 0
+  let most = 0
+  w.gets = async (key) => {
+    if (!key.startsWith('poll:other-')) return
+    most = Math.max(most, ++inFlight)
+    await clock.sleep(10)
+    inFlight--
+  }
+  await clock.advance(MINUTE)
+  expect(most).toBe(50)
+  w.gets = undefined
+})
+
+test('a poll of the same conversation in another process holds this one back like another session\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // The same id resumed in a second Claude Code process, which started its poll a moment earlier
+  w.store.set('poll:session-b:p2:' + URL.toLowerCase(), { ...pollNote(NOW - 1_000), running: true })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([])
+  expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
+  // Its note is left as it was
+  expect(w.store.get('poll:session-b:p2:' + URL.toLowerCase())).toEqual({ ...pollNote(NOW - 1_000), running: true })
+})
+
+test('a process with no instance in its environment makes one for its note keys', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { env: { PR_RELAY_INSTANCE: '' } })
+  await $.session.start(START)
+  await clock.settle()
+  const keys = [...w.store.keys()].filter((key) => key.startsWith('poll:session-b:'))
+  expect(keys).toEqual([expect.stringMatching(/^poll:session-b:[0-9a-z]+:https:\/\/github\.com\//)])
+})
+
+test('a note of version 0.10 under this session\'s id holds no election and hands on what it held', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] } })
+  // Written by this process before the plugin was updated, in the middle of a poll
+  w.store.set('poll:session-b:' + URL.toLowerCase(), { ...pollNote(NOW - 1_000), running: true, since: NOW - 2 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+  expect(w.store.get(NOTE)).toMatchObject({ since: NOW - 2 * MINUTE })
+})
+
+test('pruning drops this session\'s 0.10 note but leaves another process\'s under the same id', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  w.store.set('pr:' + URL.toLowerCase(), { since: NOW - 3 * 60 * MINUTE, head: 'a1', approvedAt: 0, usageLimitAt: 0, reviews: [], ended: null, at: NOW - MINUTE })
+  const legacy = 'poll:session-b:' + URL.toLowerCase()
+  const sibling = 'poll:session-b:p2:' + URL.toLowerCase()
+  w.store.set(legacy, { ...pollNote(NOW - 2 * 60 * MINUTE), idle: true, since: NOW - 3 * 60 * MINUTE })
+  w.store.set(sibling, { ...pollNote(NOW - 2 * 60 * MINUTE), idle: true, since: NOW - 3 * 60 * MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.deleted).toContain(legacy)
+  expect(w.store.has(sibling)).toBe(true)
 })
 
 test('a session whose poll started at the same moment yields only to a smaller key', async ($, on) => {
@@ -2767,6 +2855,64 @@ test('a session that ends leaves its poll note idle', async ($, on) => {
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
   expect(w.store.get(NOTE)).toMatchObject({ idle: true })
+})
+
+test('a prompt still queued when the session ends gives its mark back for another session to send', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // The session is busy, so the prompt waits for a turn that never starts here
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>(() => {}) })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: [] })
+
+  // Another session on the same pull request sends it
+  w.sessionId = 'session-c'
+  w.prompts = []
+  w.turnStarts = async () => {}
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([expect.stringContaining('レビュー 1 件')])
+})
+
+test('a prompt whose turn has started keeps its mark when the session ends', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
+})
+
+test('a queued prompt taken back at the session end and dropped later leaves a newer mark alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let startTurn = () => {}
+  const w = stubWorld(on, { turnStarts: () => new Promise<void>((resolve) => { startTurn = resolve }) })
+  on('session.end', () => ({ sessionId: 'session-b' }))
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.reviews = [{ id: 1, at: NOW + 30_000, comments: 1 }]
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  // Another session sends the review and marks it, then the queue drops this session's prompt
+  w.store.set('pr:' + URL.toLowerCase(), { ...(w.store.get('pr:' + URL.toLowerCase()) as object), reviews: ['1'] })
+  w.dropPrompt = true
+  startTurn()
+  await clock.settle()
+  expect(w.store.get('pr:' + URL.toLowerCase())).toMatchObject({ reviews: ['1'] })
 })
 
 for (const [where, stderr] of [
@@ -2886,7 +3032,7 @@ test('turning to another pull request leaves the last one\'s note behind', async
   await $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: other })
   await clock.settle()
   expect(w.store.get(NOTE)).toEqual({ pr: URL.toLowerCase(), at: NOW, since: LAST_PUSH, idle: true })
-  expect(w.store.get('poll:session-b:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
+  expect(w.store.get('poll:session-b:p1:' + other.toLowerCase())).toMatchObject({ pr: other.toLowerCase() })
 })
 
 test('a push another session ran counts once the head has moved past the one it saw', async ($, on) => {
@@ -3150,7 +3296,7 @@ test('a poll overtaken by a new watch while it waits for the session id writes n
   await clock.advance(10_000)
   expect(w.store.get(NOTE)).toMatchObject({ at: NOW })
   expect(w.store.get(NOTE)).not.toHaveProperty('running')
-  expect(w.store.get('poll:session-b:https://github.com/holygrail/claude-mods/pull/9')).not.toHaveProperty('running')
+  expect(w.store.get('poll:session-b:p1:https://github.com/holygrail/claude-mods/pull/9')).not.toHaveProperty('running')
 })
 
 test('a push that finishes after the session turned to another pull request clears it from the last one\'s note', async ($, on) => {
@@ -3346,7 +3492,7 @@ test('two pushes run side by side each count for what they pushed', async ($, on
 })
 
 const PR9 = 'https://github.com/HolyGrail/claude-mods/pull/9'
-const NOTE9 = 'poll:session-b:' + PR9.toLowerCase()
+const NOTE9 = 'poll:session-b:p1:' + PR9.toLowerCase()
 
 test('a push that moves another ref to the head the pull request already had does not count', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -3971,7 +4117,7 @@ test('a push made after a resume, before the first poll, goes under the resumed 
   await clock.advance(MINUTE)
   await Promise.all([turned, push])
   expect(w.store.has(NOTE9)).toBe(false)
-  expect(w.store.get('poll:session-c:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 11_000 }] })
+  expect(w.store.get('poll:session-c:p1:' + PR9.toLowerCase())).toMatchObject({ pending: [{ at: NOW + 11_000 }] })
   w.ids = undefined
 })
 
@@ -4398,7 +4544,7 @@ test('a push made after a fork, before the first poll, goes under the fork\'s id
   await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
   await clock.advance(MINUTE)
   expect(w.store.get(NOTE)).not.toHaveProperty('pending')
-  expect(w.store.get('poll:session-c:' + URL.toLowerCase())).toMatchObject({ pending: [{ at: NOW }] })
+  expect(w.store.get('poll:session-c:p1:' + URL.toLowerCase())).toMatchObject({ pending: [{ at: NOW }] })
 })
 
 test('a push another session started and finished after GitHub answered holds back the relay', async ($, on) => {
@@ -4507,6 +4653,24 @@ test('a push that finished in the millisecond GitHub answered holds back the rel
   })
   await $.session.start(START)
   await clock.settle()
+  expect(w.prompts).toEqual([])
+})
+
+test('a push that finished while GitHub was being asked holds back the relay', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // GitHub takes 5 s to answer, and still shows the head the push replaces
+  const w = stubWorld(on, {
+    pull: { head: 'a1a1a1a0123456789', reviews: [{ id: 1, at: NOW - MINUTE, comments: 1 }] },
+    answers: () => clock.sleep(5_000),
+  })
+  w.store.set('poll:session-a', {
+    ...pollNote(NOW - 2 * MINUTE),
+    idle: true,
+    pending: [{ id: 'p', at: NOW - 1_000, head: 'a1a1a1a0123456789', shas: ['b2b2b2b'], doneAt: NOW + 2_000 }],
+  })
+  await $.session.start(START)
+  await clock.advance(10_000)
+  expect(w.queries).toBe(1)
   expect(w.prompts).toEqual([])
 })
 

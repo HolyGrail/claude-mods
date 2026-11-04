@@ -12,11 +12,11 @@ const CODEX = 'chatgpt-codex-connector'
 // $.store, so another session on the same pull request, or this one after a restart, is not woken
 // again for the same event
 const KEY_PREFIX = 'pr:'
-// Each session notes under this prefix plus its id and the pull request's when it last started a
-// poll of it, as { pr, at, since, pending?, running?, idle? }, so sessions polling the same pull
-// request together let only the first of them relay. since is the last push the session knows of,
-// which the session that relays takes from it, and pending a push it ran that counts once the head
-// has moved, { at, head } with the head it last saw;
+// Each session notes under this prefix plus its id, its process's instance and the pull request's
+// when it last started a poll of it, as { pr, at, since, pending?, running?, idle? }, so sessions
+// polling the same pull request together let only the first of them relay. since is the last push
+// the session knows of, which the session that relays takes from it, and pending a push it ran that
+// counts once the head has moved, { at, head } with the head it last saw;
 // running stays set until the poll has written what it relayed; idle marks a note whose session
 // stopped polling, kept only for its since. A session writes only its own key, since $.store has
 // no atomic update.
@@ -46,6 +46,7 @@ const NO_PR = /no pull requests found|not a git repository|no git remotes found|
 const FINAL_REASONS = ['prompt_input_exit', 'other']
 
 const HOUR_MS = 3_600_000
+const DAY_MS = 24 * HOUR_MS
 // Records of pull requests that ended and are untouched this long are of no more use. One left
 // open keeps what was relayed for it far longer, since a session that finds it again would
 // otherwise be woken for the same events.
@@ -145,11 +146,18 @@ const monitored = new Set()
 let pushes = []
 // How many pushes this session started for each pull request
 const pushStarts = new Map()
+// This process's part of the note keys, made here and replaced at session.start by the one the
+// process environment holds, so a worker respawn writes under the keys it wrote before
+let instance = randomId()
 // The session id as last asked, so a push need not wait on it
 let sessionId = null
 let idAsks = 0
 // git push calls still running. While one is, what Codex said may be about the head it replaces,
 // so nothing is relayed until it ends.
+// Prompts whose marks are in a record but whose turn has not started yet, each { key, undo }. A final
+// session.end takes their marks back, since a prompt still queued then never reaches the model and
+// the other sessions would otherwise read it as sent.
+const undelivered = new Set()
 // The read, change and write of a record in this session, one after another: a poll and a send
 // that takes its mark back would otherwise each write what they read before the other wrote
 let writes = Promise.resolve()
@@ -157,6 +165,7 @@ let writes = Promise.resolve()
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
+    await adoptInstance($)
     sessionIdOf($).catch(() => {})
     stop({ desktop: true })
     await retire($)
@@ -186,6 +195,8 @@ export function register(on) {
   on('session.end', async ($, e, next) => {
     if (FINAL_REASONS.includes(e.reason)) {
       stop({ desktop: true })
+      // Before the note goes idle, so a session that polls next finds the marks gone and sends them
+      await takeBackUndelivered($)
       await retire($)
     }
     return next(e)
@@ -271,7 +282,7 @@ export function register(on) {
       // it up
       if (prId && !notesOf(prId).length) {
         // The id is known from the start, so the push goes out without waiting on it
-        const key = `${POLL_PREFIX}${sessionId ?? (await sessionIdOf($))}:${prId}`
+        const key = noteKey(sessionId ?? (await sessionIdOf($)), prId)
         if (!notesOf(prId).length) retired.set(key, { key, pr: prId, at: startedAt, since: 0, pending: [push], idle: true, dirty: true })
       }
       // The other sessions hold back their relays only if they can see the push, so it goes out
@@ -668,8 +679,9 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
   // record is on its way may have replaced the head the query saw
   const started = pushStarts.get(pr.id) ?? 0
   const answer = await query($, pr, floor).catch((error) => ({ error }))
-  // When GitHub showed the head, which is what tells a fresher head from a staler one
-  const seenAt = answer.seenAt
+  // When GitHub showed the head, which is what tells a fresher head from a staler one, and when it
+  // was asked, which is what tells a push it may not have seen
+  const { seenAt, askedAt } = answer
   const answeredAt = await $.clock.now()
   // A watch that began meanwhile owns the state now
   if (gen !== generation) return
@@ -759,7 +771,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       // what its note said
       const owns = watched?.id === pr.id
       noted = Math.max(othersSince, owns ? knownSince : note.since)
-      const sends = update($, pr, data, record, noted, pending, defers, pushing, now, seenAt)
+      const sends = update($, pr, data, record, noted, pending, defers, pushing, now, askedAt)
       // The session that relays writes the record at about this moment, so a copy read before its
       // marks must not land over them: one that leaves it the waking writes only its own note
       if (owns) knownSince = Math.max(knownSince, record.since)
@@ -850,7 +862,7 @@ async function late($, now, pr, note) {
 }
 
 // Brings the record up to the pull request's state, and returns the prompts to send for what is new
-function update($, pr, data, record, notedPush, pending, defers, pushing, now, seenAt) {
+function update($, pr, data, record, notedPush, pending, defers, pushing, now, askedAt) {
   // Codex reviews pushes, so only its activity after the latest push counts. The thumbs-up in
   // particular is one reaction per pull request whose time can stay at an earlier push: its mere
   // presence would read as an approval of every later push.
@@ -895,10 +907,12 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, s
   // A push running in any session may be replacing the head GitHub still shows; this session's
   // own are those it bound to this pull request
   const running = pushes.some((push) => holds(push, now))
-  // So may one that finished after GitHub answered, which the head GitHub showed cannot tell from a
-  // push that moved nothing; the next poll sees what it left. One that finished in the same
-  // millisecond may have too, and one handed on with no end time counts from its start
-  const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt >= seenAt : push.at >= seenAt)
+  // So may one that finished after GitHub was asked, which the head GitHub showed cannot tell from
+  // a push that moved nothing; the next poll sees what it left. The time GitHub answered is read
+  // only once gh has exited, so a push that finished while gh did may still have replaced the head.
+  // One that finished in the same millisecond may have too, and one handed on with no end time
+  // counts from its start
+  const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt >= askedAt : push.at >= askedAt)
   const replaced =
     (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
   return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record)
@@ -915,10 +929,14 @@ async function sessionIdOf($) {
 // Notes that this session starts a poll of the pull request now, and returns the note
 async function notePoll($, pr, gen) {
   // One note per pull request, so a session that turns to another leaves this one's push behind
-  const key = `${POLL_PREFIX}${await sessionIdOf($)}:${pr.id}`
+  const id = await sessionIdOf($)
+  const key = noteKey(id, pr.id)
+  // Where version 0.10 and before noted this session's poll, with no instance in the key: the same
+  // process before an update, whose note is taken up as a respawn's is and holds no election
+  const legacy = `${POLL_PREFIX}${id}:${pr.id}`
   // A worker respawn starts this module afresh while the session's note from before stays in the
   // store, still holding what the record may not have counted; a read that fails is retried
-  const stored = lastNote?.key === key || retired.has(key) ? null : await $.store.get(key)
+  const stored = lastNote?.key === key || retired.has(key) ? null : (await $.store.get(key)) ?? (await $.store.get(legacy))
   // Read just before the note goes out, since the time is this poll's place in the election
   const at = await $.clock.now()
   if (gen !== generation) return null
@@ -958,7 +976,7 @@ async function notePoll($, pr, gen) {
   await writeNote($, lastNote, { strict: true })
   // A note other sessions wrote while this one's was on its way may have been elected without
   // seeing it, so the poll yields to those too
-  return { ...lastNote, landedAt: await $.clock.now() }
+  return { ...lastNote, landedAt: await $.clock.now(), legacy }
 }
 
 // Marks the note of a poll that has written what it relayed as finished, with what it now knows
@@ -1086,6 +1104,29 @@ function pushId(at) {
   return `${at.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+function randomId() {
+  return Math.random().toString(36).slice(2, 10)
+}
+
+// One note per session, process and pull request
+function noteKey(id, prId) {
+  return `${POLL_PREFIX}${id}:${instance}:${prId}`
+}
+
+// Takes the process's instance from PR_RELAY_INSTANCE in its environment, or puts this one there.
+// It tells apart Claude Code processes running the same conversation (the same id resumed in two
+// places), whose notes would otherwise share one key and never see each other; a worker respawn
+// keeps the process, and so the value and its notes. A process whose environment cannot be read
+// or written keeps the one made at load, which only a worker respawn changes: its notes from
+// before are then read as another session's.
+async function adoptInstance($) {
+  try {
+    const held = await $.env.get('PR_RELAY_INSTANCE')
+    if (typeof held === 'string' && /^[0-9a-z]+$/.test(held)) instance = held
+    else await $.env.set('PR_RELAY_INSTANCE', instance)
+  } catch {}
+}
+
 // What tells one push from another: its id, or for a note written without one, its start
 function pushKey(push) {
   return push.id ?? `at:${push.at}`
@@ -1185,13 +1226,15 @@ async function headBefore($, prId) {
 // cannot be read throws, since a note it hides may be the one this poll should yield to.
 
 async function readNotes($, pr, note) {
-  const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key)
+  const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key && key !== note.legacy)
   let defers = false
   let pushing = false
   let since = 0
   const pending = []
-  for (const key of keys) {
-    const other = await $.store.get(key)
+  // Read together, so the scan is as short as one read, however many notes the store holds
+  const values = await Promise.all(keys.map((key) => $.store.get(key)))
+  for (const [i, key] of keys.entries()) {
+    const other = values[i]
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
     if (typeof other.since === 'number') since = Math.max(since, other.since)
     for (const push of [].concat(other.pending ?? [])) {
@@ -1290,6 +1333,9 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
+  // Kept until its turn starts or its mark is taken back, whichever comes first
+  const pending = { key, undo }
+  undelivered.add(pending)
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
     ? reviewPrompt($, pr, reviews, approvedAt).catch(() => reviewPromptParts(pr, reviews, approvedAt).fallback)
@@ -1297,8 +1343,20 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }) {
   ready
     // A new conversation, watch or push makes these details stale before they can be delivered
     .then((text) => gen === generation && id === watched?.id && started === (pushStarts.get(id) ?? 0) ? submit($, text) : false)
-    .then((entered) => entered || takeBack($, key, undo))
+    .then((entered) => {
+      // A session end took the mark back already; taking it back again could remove the mark of
+      // the session that sent the prompt since
+      if (!undelivered.delete(pending)) return
+      return entered || takeBack($, key, undo)
+    })
     .catch(() => {})
+}
+
+// Takes back the marks of the prompts whose turn has not started, as the session ends
+async function takeBackUndelivered($) {
+  const pending = [...undelivered]
+  undelivered.clear()
+  await Promise.all(pending.map(({ key, undo }) => takeBack($, key, undo).catch(() => {})))
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll
@@ -1445,6 +1503,9 @@ function read(data, since) {
 // The pull request, with every connection followed back until it reaches the last push: the
 // head commit's date, or since when that is later
 async function query($, pr, since) {
+  // GitHub may have taken the head at any moment from here to its answer, so a push that finished
+  // after this may have replaced it
+  const askedAt = await $.clock.now()
   const data = await graphql($, pr, QUERY)
   // The head comes from this first page only, so it was seen now, not once the older pages came
   const seenAt = await $.clock.now()
@@ -1460,7 +1521,7 @@ async function query($, pr, since) {
       page = older
     }
   }
-  return { data, seenAt }
+  return { data, seenAt, askedAt }
 }
 
 // One page of a connection; the reactors that matter are the thumbs-up's
@@ -1560,7 +1621,10 @@ async function findForBranch($, cwd) {
 async function prune($) {
   const now = await $.clock.now()
   const cutoff = now - STALE_MS
-  const own = `${POLL_PREFIX}${await sessionIdOf($)}:`
+  const id = await sessionIdOf($)
+  // This process's notes, and those of version 0.10 and before (poll:<id>:<pull request>), which
+  // had no instance. Another process's under the same id is left like any other session's.
+  const own = (key) => key.startsWith(`${POLL_PREFIX}${id}:${instance}:`) || key.startsWith(`${POLL_PREFIX}${id}:https://`)
   const keys = await $.store.keys()
   await Promise.all(
     keys.map(async (key) => {
@@ -1568,7 +1632,7 @@ async function prune($) {
       if (key.startsWith(KEY_PREFIX)) {
         if (record?.at >= (record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS))) return
         await $.store.delete(key)
-      } else if (key.startsWith(own)) {
+      } else if (own(key)) {
         // Only this session writes its notes, so one it no longer holds goes once the record has
         // counted what it hands on, or once stale; the delete waits for any write still going out
         if (notesOf(record?.pr).some((note) => note.key === key)) return
@@ -1588,10 +1652,17 @@ async function prune($) {
         // The store has no conditional delete, so another session's note is left while its pull
         // request may still hold an election: one that session rewrote between the read and the
         // delete would vanish from it. Only a stale note of a pull request that ended (or whose record
-        // is gone) goes, since no session polls that one any more
-        if (record?.at >= cutoff) return
-        const pr = await $.store.get(KEY_PREFIX + record?.pr)
-        if (pr && !pr.ended) return
+        // is gone) goes, since no session polls that one any more; and one left idle a day, whose
+        // pushes the record has counted, since it holds no election and hands on nothing. Its session
+        // writes it again only when it watches that pull request again, which a day's quiet makes
+        // unlikely in the moment of the delete. Every /clear, /resume and /branch leaves one under
+        // its last id, and each poll reads them all
+        if (record?.at >= cutoff) {
+          if (!record?.idle || record.at >= now - DAY_MS || !(await counted($, record))) return
+        } else {
+          const pr = await $.store.get(KEY_PREFIX + record?.pr)
+          if (pr && !pr.ended) return
+        }
         if (JSON.stringify(await $.store.get(key)) !== JSON.stringify(record)) return
         await $.store.delete(key)
       }
