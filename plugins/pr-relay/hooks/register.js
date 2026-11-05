@@ -41,6 +41,15 @@ const RUNNING_MS = 10 * 60_000
 // the other sessions hold back from the newest beat: a store slow to take the record must not let
 // another session take a round over that this one is still writing
 const BEAT_MS = 60_000
+// A poll beats for at most this long from its start, so a record write that never ends does not
+// hold the other sessions back for good
+const BEAT_MAX_MS = 3 * RUNNING_MS
+// Each Claude Code process writes the time under this prefix plus its instance every ALIVE_MS while
+// pr-relay runs in it. A process whose time is ALIVE_STALE_MS old is taken as gone: its running
+// polls and pushes hold nobody back, and the prompts it had not delivered are sent again
+const ALIVE_PREFIX = 'alive:'
+const ALIVE_MS = 60_000
+const ALIVE_STALE_MS = 3 * ALIVE_MS
 // How fresh another session's note must be for its CI monitor to count: it polls every minute
 const MONITOR_FRESH_MS = 3 * TICK_MS
 const LATE = 'poll outlasted its turn'
@@ -147,6 +156,13 @@ const cleanupPending = new Set()
 let desktopAvailable = null
 // The desktop timer survives a watch change or the watched pull request ending
 let desktopTimer = null
+// Writes this process's alive time, from session.start to a final session.end
+let aliveTimer = null
+// Parked take-backs of delivered prompts whose delete the store refused, tried again every minute
+const parkedLeft = new Set()
+// This process's alive times the store took, { value, landed }, oldest first: a poll's lease lapses
+// when another session may have read this process as gone
+const aliveBeats = []
 // This generation is reading the desktop cache, so slow calls do not pile up within a watch
 let desktopPolling = null
 // Successful desktop reads keep the last primary URL here
@@ -188,6 +204,10 @@ export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
     await adoptInstance($)
+    // Before any note goes out, so no other session takes this one's polls as a gone process's
+    aliveTimer?.cancel()
+    await beatAlive($)
+    aliveTimer = $.clock.every(ALIVE_MS, () => beatAlive($))
     sessionIdOf($).catch(() => {})
     stop({ desktop: true })
     await retire($)
@@ -220,6 +240,12 @@ export function register(on) {
       // Before the note goes idle, so a session that polls next finds the marks gone and sends them
       await takeBackUndelivered($)
       await retireFinally($)
+      // A parked take-back of a delivered prompt must be gone before the alive time is
+      await retryParked($)
+      // The session leaves as the process does: the others need not wait out its alive time
+      aliveTimer?.cancel()
+      aliveTimer = null
+      await $.store.delete(ALIVE_PREFIX + instance).catch(() => {})
     }
     return next(e)
   })
@@ -730,7 +756,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
   if (gen !== generation) return
   // A query that outlasted the time the others wait on a running note may have seen another
   // session take the round over, which this one's election cannot tell: it relays nothing
-  if (!answer.error && lapsed(now, answeredAt)) answer.error = new Error(LATE)
+  if (!answer.error && lease.lapsed(answeredAt)) answer.error = new Error(LATE)
   if (answer.error) {
     // A poll that learned nothing relays nothing, so it must not hold back the others' this round,
     // but the push it knows of still counts
@@ -757,7 +783,7 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
     return
   }
   // So may one whose store answered too late
-  if (lapsed(now, readAt)) return late($, now, pr, note)
+  if (lease.lapsed(readAt)) return late($, now, pr, note)
   const { defers, since: othersSince, pending, pushing, monitoredElsewhere } = notes
   // Said in the note, so a later poll of another session does not yield to this one in turn
   if (defers && lastNote?.serial === note.serial) {
@@ -926,9 +952,28 @@ function leaseOf(now, landedAt) {
     beats,
     lapsed(at) {
       for (let i = 1; i < beats.length; i++) if (lapsed(beats[i - 1].value, beats[i].landed)) return true
-      return lapsed(beats[beats.length - 1].value, at)
+      return lapsed(beats[beats.length - 1].value, at) || aliveLapsed(now, at)
     },
   }
+}
+
+// Whether this process's alive time may have read as stale to another session at some moment from
+// from to at, which then takes its polls as a gone process's and may take the round over: the
+// newest alive time the store held was ever 30 s short of ALIVE_STALE_MS old. None the store took
+// counts as stale from the start
+function aliveLapsed(from, at) {
+  const limit = ALIVE_STALE_MS - ROUND_MS
+  let last = null
+  for (const beat of aliveBeats) {
+    if (beat.landed > at) break
+    if (beat.landed <= from) {
+      last = beat
+      continue
+    }
+    if (!last || beat.landed - last.value >= limit) return true
+    last = beat
+  }
+  return !last || at - last.value >= limit
 }
 
 // Writes the time into the poll's note now and every BEAT_MS until stopped, and adds each beat the
@@ -938,6 +983,7 @@ function beatWhile($, note, lease) {
   const beat = async () => {
     if (!beating || lastNote?.serial !== note.serial) return
     const value = await $.clock.now()
+    if (value - note.at >= BEAT_MAX_MS) return
     lastNote.beat = value
     const landed = await writeNote($, lastNote, { strict: true }).then(() => $.clock.now(), () => null)
     if (beating && landed !== null) lease.beats.push({ value, landed })
@@ -1189,6 +1235,8 @@ function noteValue({ pr, at, since, pending = [], running, idle, deferred, beat,
     pr,
     at,
     since,
+    // Whose alive time says whether its running poll and pushes still hold the others back
+    instance,
     ...(pushes.length ? { pending: pushes } : {}),
     ...(running ? { running } : {}),
     ...(running && typeof beat === 'number' ? { beat } : {}),
@@ -1344,7 +1392,10 @@ async function headBefore($, prId) {
 // cannot be read throws, since a note it hides may be the one this poll should yield to.
 
 async function readNotes($, pr, note) {
-  const { keys, values, stable } = await scanNotes($, note)
+  const { keys, values, stable, alive } = await scanNotes($, note)
+  // A note of version 0.11 or later names its process, and one whose process is gone holds nothing
+  // back past its round, running or not; one of 0.10 and before is taken as alive
+  const gone = (other) => typeof other.instance === 'string' && !(alive.get(other.instance) >= note.at - ALIVE_STALE_MS)
   let defers = false
   let pushing = false
   let since = 0
@@ -1352,13 +1403,18 @@ async function readNotes($, pr, note) {
   const pending = []
   for (const [i, key] of keys.entries()) {
     const other = values[i]
+    if (key.startsWith(ALIVE_PREFIX)) continue
     if (other?.pr !== pr.id || typeof other.at !== 'number') continue
     if (typeof other.since === 'number') since = Math.max(since, other.since)
+    const dead = gone(other)
     for (const push of [].concat(other.pending ?? [])) {
       if (typeof push?.at !== 'number') continue
-      pending.push(push)
-      // One left running by a session that died mid-push holds nothing back for long
-      if (push.running && push.at >= note.at - RUNNING_MS) pushing = true
+      // A push of a gone process is taken as finished, with nothing known of what it pushed, as one
+      // past its hold is: it counts once the head moves, so the baseline moves before relays go on
+      pending.push(dead && push.running ? { ...push, running: false } : push)
+      // One left running by a session that died mid-push holds nothing back for long, and one whose
+      // process is gone holds nothing back at all
+      if (push.running && !dead && push.at >= note.at - RUNNING_MS) pushing = true
     }
     // A session polling the pull request, whose desktop CI monitor relays its comments; a poll every
     // minute keeps its note this fresh
@@ -1376,8 +1432,9 @@ async function readNotes($, pr, note) {
     if (other.at > note.at) continue
     // A running poll holds the others back from its newest beat, so one still writing its record
     // keeps its round however slow the store is
-    const heldFrom = other.running && typeof other.beat === 'number' ? Math.max(other.at, other.beat) : other.at
-    if (heldFrom < note.at - (other.running ? RUNNING_MS : ROUND_MS)) continue
+    const running = other.running && !dead
+    const heldFrom = running && typeof other.beat === 'number' ? Math.max(other.at, other.beat) : other.at
+    if (heldFrom < note.at - (running ? RUNNING_MS : ROUND_MS)) continue
     if (other.at < note.at || key < note.key) defers = true
   }
   return { defers, since, pending, pushing, stable, monitoredElsewhere }
@@ -1389,18 +1446,42 @@ async function readNotes($, pr, note) {
 // as the last read found them, marked unstable.
 async function scanNotes($, note) {
   const read = async () => {
-    const keys = (await $.store.keys()).filter((key) => key.startsWith(POLL_PREFIX) && key !== note.key && key !== note.legacy).sort()
+    const keys = (await $.store.keys())
+      .filter((key) => (key.startsWith(POLL_PREFIX) && key !== note.key && key !== note.legacy) || key.startsWith(ALIVE_PREFIX))
+      .sort()
     // Read together, so the scan is as short as one read, however many notes the store holds
     const values = await Promise.all(keys.map((key) => $.store.get(key)))
     return { keys, values, text: JSON.stringify([keys, values]) }
   }
+  // The processes' alive times, by instance, read with the notes
+  const withAlive = (read, stable) => ({ ...read, stable, alive: aliveTimes(read.keys, read.values) })
   let last = await read()
   for (let tries = 0; tries < SCAN_TRIES; tries++) {
     const again = await read()
-    if (again.text === last.text) return { ...again, stable: true }
+    if (again.text === last.text) return withAlive(again, true)
     last = again
   }
-  return { ...last, stable: false }
+  return withAlive(last, false)
+}
+
+function aliveTimes(keys, values) {
+  const alive = new Map()
+  for (const [i, key] of keys.entries()) {
+    if (key.startsWith(ALIVE_PREFIX) && typeof values[i]?.at === 'number') alive.set(key.slice(ALIVE_PREFIX.length), values[i].at)
+  }
+  return alive
+}
+
+// Writes this process's alive time; a store that refuses it is tried again a minute later
+async function beatAlive($) {
+  try {
+    const value = await $.clock.now()
+    await $.store.set(ALIVE_PREFIX + instance, { at: value })
+    aliveBeats.push({ value, landed: await $.clock.now() })
+    // A poll's lease looks back no further than RUNNING_MS, and BEAT_MAX_MS bounds a poll
+    while (aliveBeats.length > 1 && aliveBeats[1].landed < value - BEAT_MAX_MS - RUNNING_MS) aliveBeats.shift()
+  } catch {}
+  await retryParked($)
 }
 
 // Marks what is new since the last push as relayed: reviews before an approval, then the usage
@@ -1470,8 +1551,18 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
+  // The take-back goes into the store at once, waiting on this process: a process killed before the
+  // turn starts never takes the mark back itself, and the session that writes the record next
+  // applies it once this process's alive time is stale. The same key becomes the take-back if the
+  // prompt does not enter, and goes once it does. The key is chosen before the write goes out, and
+  // whatever comes next waits for that write, so a session end during it rewrites the same key
+  // rather than leaving the parked one to land after it
+  const undoKey = UNDO_PREFIX + randomId() + randomId()
+  const parked = $.clock.now()
+    .then((at) => $.store.set(undoKey, { pr: key.slice(KEY_PREFIX.length), at, ...undo, pending: instance }))
+    .catch(() => {})
   // Kept until its turn starts or its mark is taken back, whichever comes first
-  const pending = { key, undo }
+  const pending = { key, undo, undoKey, parked }
   undelivered.add(pending)
   // A mark the store would not take back stays, and that prompt is not sent again
   const ready = reviews
@@ -1487,7 +1578,7 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
       // A session end took the mark back already; taking it back again could remove the mark of
       // the session that sent the prompt since
       if (!undelivered.delete(pending)) return
-      return entered || takeBack($, key, undo)
+      return parked.then(() => (entered ? dropParked($, undoKey) : takeBack($, key, undo, undoKey)))
     })
     .catch(() => {})
 }
@@ -1496,7 +1587,23 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
 async function takeBackUndelivered($) {
   const pending = [...undelivered]
   undelivered.clear()
-  await Promise.all(pending.map(({ key, undo }) => takeBack($, key, undo).catch(() => {})))
+  await Promise.all(
+    pending.map(({ key, undo, undoKey, parked }) => parked.then(() => takeBack($, key, undo, undoKey)).catch(() => {})),
+  )
+}
+
+// Deletes the take-back a delivered prompt parked. One the store would not delete is tried again
+// with every alive time and at a final session end: left in the store, it would be applied once
+// this process is gone, and the delivered prompt sent again
+function dropParked($, undoKey) {
+  return $.store.delete(undoKey).then(
+    () => parkedLeft.delete(undoKey),
+    () => parkedLeft.add(undoKey),
+  )
+}
+
+function retryParked($) {
+  return Promise.all([...parkedLeft].map((undoKey) => dropParked($, undoKey)))
 }
 
 // The opening, approval note and fallback use only the review counts already read by the poll
@@ -1591,22 +1698,27 @@ function takeBackAll($, key, sends, pr) {
 }
 
 // Leaves the take-back for the next session that writes the record, under a key of its own
-async function takeBack($, key, undo) {
+async function takeBack($, key, undo, undoKey = null) {
   const at = await $.clock.now()
-  await $.store.set(UNDO_PREFIX + pushId(at), { pr: key.slice(KEY_PREFIX.length), at, ...undo })
+  // Under the key the delivery parked it at, if any, so it is applied once and no longer waits
+  await $.store.set(undoKey ?? UNDO_PREFIX + pushId(at), { pr: key.slice(KEY_PREFIX.length), at, ...undo })
 }
 
 // The take-backs left for a pull request that its record has not applied, oldest first, and those it
 // has, whose delete did not go through
 async function readUndos($, prId, record) {
-  const keys = (await $.store.keys()).filter((key) => key.startsWith(UNDO_PREFIX))
+  const now = await $.clock.now()
+  const keys = (await $.store.keys()).filter((key) => key.startsWith(UNDO_PREFIX) || key.startsWith(ALIVE_PREFIX))
   const values = await Promise.all(keys.map((key) => $.store.get(key)))
+  const alive = aliveTimes(keys, values)
   const open = []
   const applied = []
   for (const [i, key] of keys.entries()) {
     const undo = values[i]
-    if (undo?.pr !== prId) continue
+    if (!key.startsWith(UNDO_PREFIX) || undo?.pr !== prId) continue
     if (record.undone.includes(key)) applied.push(key)
+    // A take-back parked by a delivery waits while its process lives, whose prompt may still enter
+    else if (typeof undo.pending === 'string' && alive.get(undo.pending) >= now - ALIVE_STALE_MS) continue
     else open.push({ key, undo })
   }
   open.sort((a, b) => (a.undo.at ?? 0) - (b.undo.at ?? 0) || (a.key < b.key ? -1 : 1))
@@ -1798,6 +1910,10 @@ async function prune($) {
       const record = await $.store.get(key)
       if (key.startsWith(KEY_PREFIX)) {
         if (record?.at >= (record?.ended ? cutoff : cutoff - (OPEN_STALE_MS - STALE_MS))) return
+        await $.store.delete(key)
+      } else if (key.startsWith(ALIVE_PREFIX)) {
+        // A process gone this long ago; one still running writes its time every minute
+        if (record?.at >= cutoff) return
         await $.store.delete(key)
       } else if (key.startsWith(UNDO_PREFIX)) {
         // A take-back no session applied in time: its pull request has not been polled since
