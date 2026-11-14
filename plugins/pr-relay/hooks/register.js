@@ -95,16 +95,29 @@ const JST_OFFSET_MS = 9 * HOUR_MS
 // back a page at a time, up to MAX_PAGES.
 const PAGE = 'last: 100, before: $before'
 const PAGE_INFO = 'pageInfo { hasPreviousPage startCursor }'
+const COMMENT = 'createdAt lastEditedAt author { login } body'
 const CONNECTIONS = {
   reactors: `reactionGroups { content reactors(${PAGE}) { ${PAGE_INFO} edges { reactedAt node { ... on Bot { login } ... on User { login } } } } }`,
   reviews: `reviews(${PAGE}) { ${PAGE_INFO} nodes { id databaseId fullDatabaseId submittedAt author { login } comments { totalCount } } }`,
-  comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { createdAt author { login } body } }`,
+  comments: `comments(${PAGE}) { ${PAGE_INFO} nodes { ${COMMENT} } }`,
 }
 const MAX_PAGES = 10
 const queryOf = (fields) => `query($owner: String!, $name: String!, $number: Int!, $before: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${fields} } }
 }`
-const QUERY = queryOf(`state headRefOid headRefName baseRefName baseRef { target { oid } } commits(last: 1) { nodes { commit { committedDate } } } ${Object.values(CONNECTIONS).join(' ')}`)
+// opening is the pull request's first comments: Codex writes its summary as the pull request opens,
+// which a pull request with more than a page of comments since would leave off the newest page
+const QUERY = queryOf(`state isDraft viewerDidAuthor headRefOid headRefName baseRefName baseRef { target { oid } } commits(last: 1) { nodes { commit { committedDate } } } opening: comments(first: 10) { nodes { ${COMMENT} } } ${Object.values(CONNECTIONS).join(' ')}`)
+// What Codex keeps in the one summary comment it edits as its reviews run: the commit each review is
+// of, its status and whether it found anything. Seen on its pull requests in 2026-11; not a
+// documented format, so a pull request without one that reads goes by the thumbs-up as before
+const CODEX_STATE = /<!--\s*codex-review-state:v1\s+(\{[\s\S]*?\})\s*-->/
+// The comment that asks Codex for a review, and how to tell one a person or a session posted
+const NUDGE = '@codex review'
+const NUDGED = /@codex\s+review\b/i
+// How long the head may go without Codex starting on it before it is asked. Codex starts within 20 s
+// of the commit when it starts by itself (6 pushes seen), and now and then does not start at all
+const NUDGE_AFTER_MS = 3 * 60_000
 // Review bodies stay out of the per-minute query so gh's output does not get cut
 const REVIEW_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) { ... on PullRequestReview {
@@ -139,6 +152,9 @@ let lastHeadAt = 0
 // The watched pull request's base branch and its tip, and the pull request's own branch, as this
 // session's last poll found them
 let lastBase = null
+// The head of the watched pull request that the record says Codex was asked to review, for the
+// watch tool to tell the model, which would otherwise ask again itself
+let lastNudged = null
 // This session's latest poll note, { key, pr, at, since, pending, running, serial }, as last written,
 // so an older poll does not mark it finished, a push can update it and a stop can leave it idle
 let lastNote = null
@@ -218,6 +234,9 @@ export function register(on) {
         'pr-relay polls a pull request for this session and sends a prompt when it is merged, when Codex ' +
         'reviews it, or when Codex gives it a thumbs-up. While it watches, do not poll for those yourself ' +
         '(sleep loops, polling scripts, ScheduleWakeup): end the turn and wait to be woken. ' +
+        'When Codex has not started on the head 3 minutes after it was pushed, pr-relay comments ' +
+        '"@codex review" on the pull request itself, once a head, so do not post that comment for a ' +
+        'push either. ' +
         'Without arguments, returns what it watches. With pr_url, watches that pull request; since (ISO ' +
         '8601) is the last push, and only Codex activity after it counts.',
       inputSchema: {
@@ -415,7 +434,7 @@ export function register(on) {
       ran = { ...ran, context: [...(ran.context ?? []), fix] }
     }
     if (creates) {
-      const url = ran.text?.match(PR_URL)?.[0]
+      const url = createdUrl(ran.text)
       if (url) watch($, { url, since: startedAt })
     } else {
       if (!watched || watched.ended) timers.push($.clock.after(0, async () => {
@@ -505,6 +524,7 @@ function reset($) {
   monitored.clear()
   pushes = []
   lastBase = null
+  lastNudged = null
   $.ui.invalidate('ui.render')
   showStatus($)
 }
@@ -558,6 +578,7 @@ function watch($, { url, since }) {
   for (const push of pushes) push.pr ??= pr.id
   // Watching the same pull request again keeps the baseline its polls learned
   if (watched?.id !== pr.id) knownSince = 0
+  if (watched?.id !== pr.id) lastNudged = null
   watched = { ...pr, since }
   lookupFailure = null
   lastHead = null
@@ -852,6 +873,8 @@ async function pollNoted($, gen, { pr, key, now, floor, note }) {
       // The session that relays writes the record at about this moment, so a copy read before its
       // marks must not land over them: one that leaves it the waking writes only its own note
       if (owns) knownSince = Math.max(knownSince, record.since)
+      // One that leaves the waking to another session learns from the record what that one asked
+      if (owns) lastNudged = record.nudgedHead
       if (defers) return sends
       record.at = now
       if (data.headRefOid) record.headAt = seenAt
@@ -1029,6 +1052,9 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
   for (const push of pending) {
     if (pushCounts(push, data, now)) record.since = Math.max(record.since, push.at)
   }
+  // When the head came, as far as the polls can tell: the first that saw it. A record a version
+  // before 0.11 wrote last holds the head without it, and counts from here
+  if (data.headRefOid && (data.headRefOid !== record.head || !record.headSince)) record.headSince = now
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
     if (!record.ended && !defers) {
@@ -1058,7 +1084,42 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
   const unseen = (push) => !push.running && (typeof push.doneAt === 'number' ? push.doneAt >= askedAt : push.at >= askedAt)
   const replaced =
     (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
-  return running || pushing || defers || replaced ? [] : relay($, pr, read(data, record.since), record, monitoredElsewhere)
+  if (running || pushing || defers || replaced) return []
+  const signals = read(data, record.since)
+  const sends = relay($, pr, signals, record, monitoredElsewhere)
+  return sends.length ? sends : nudge(pr, data, signals, record, now)
+}
+
+// Asks Codex for the review it has not started: its summary speaks of another commit than the head,
+// or of none, NUDGE_AFTER_MS after the head came. Once a head, and only where Codex reviews by
+// itself (a summary is there), on a pull request of the gh user's own that is open for review
+function nudge(pr, data, signals, record, now) {
+  const head = data.headRefOid
+  if (signals.verdict !== 'unreviewed' || !head) return []
+  if (data.isDraft !== false || data.viewerDidAuthor !== true) return []
+  // Codex reviews nothing while its usage limit lasts
+  if (signals.usageLimitAt) return []
+  // Asked already: by a session that marked it, or by anyone since the last push, which a record
+  // written by a version before 0.11 (it drops the mark) or by the dev skill's fallback still shows.
+  // The mod's own comment for an earlier head stays among those until a push moves since past it,
+  // which a head pushed elsewhere with an older commit date never does: so where the record says
+  // another head was asked for, only a request made after this one came counts
+  const asked = record.nudgedHead && record.nudgedHead !== head ? signals.askedAt > record.headSince : signals.askedAt > 0
+  if (record.nudgedHead === head || asked) return []
+  if (now - Math.max(record.since, record.headSince) < NUDGE_AFTER_MS) return []
+  const previous = record.nudgedHead
+  record.nudgedHead = head
+  return [{ nudge: head, pr, undo: { nudgedHead: head, nudgedPrevious: previous } }]
+}
+
+// The pull request a create command printed: the last URL that ends where a pull request's does. A
+// command that also replies to a review prints that comment's URL (.../pull/7#discussion_r1) before
+// it, and the first URL in the output then watched the pull request replied to, not the new one
+const WHOLE_PR_URL = new RegExp(PR_URL.source + String.raw`(?![\w/#?])`, 'g')
+function createdUrl(text) {
+  if (typeof text !== 'string') return undefined
+  const whole = [...text.matchAll(WHOLE_PR_URL)]
+  return whole.length ? whole[whole.length - 1][0] : text.match(PR_URL)?.[0]
 }
 
 // The cache takes only the latest answer, so one asked before a /resume cannot land over it
@@ -1521,7 +1582,9 @@ function relay($, pr, signals, record, monitoredElsewhere = false) {
     return [
       {
         text:
-          `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}）。` +
+          // The head it was read with: a prompt waits for the running turn to end, and a push made
+          // meanwhile would otherwise read as approved too
+          `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}${record.head ? `、head ${record.head.slice(0, 7)}` : ''}）。` +
           'CI の結果を確かめ、問題がなければ作業の完了を報告してください。' +
           (usesMonitor && fresh.length
             ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
@@ -1546,8 +1609,9 @@ function relay($, pr, signals, record, monitoredElsewhere = false) {
 
 // Queues a prompt without waiting for it, since it resolves only when its turn starts. A prompt
 // that did not enter (refused, or dropped by a hook) takes its mark back, so a later poll sends it.
-function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedElsewhere) {
+function deliver($, key, { text, toast, nudge, pr, reviews, approvedAt, undo }, pushedElsewhere) {
   if (toast) return $.ui.toast(toast)
+  if (nudge) return ask($, key, { head: nudge, pr, undo }, pushedElsewhere)
   const gen = generation
   const id = watched?.id
   const started = pushStarts.get(id) ?? 0
@@ -1579,6 +1643,38 @@ function deliver($, key, { text, toast, pr, reviews, approvedAt, undo }, pushedE
       // the session that sent the prompt since
       if (!undelivered.delete(pending)) return
       return parked.then(() => (entered ? dropParked($, undoKey) : takeBack($, key, undo, undoKey)))
+    })
+    .catch(() => {})
+}
+
+// Comments "@codex review" on the pull request without waiting for gh. A push that started since the
+// poll read the head, here or in another session, makes it a request for a head being replaced, and
+// a comment gh could not post was not made: either way the mark is taken back, and a later round
+// asks again. The toast says so only once the comment is there
+function ask($, key, { head, pr, undo }, pushedElsewhere) {
+  const gen = generation
+  const started = pushStarts.get(pr.id) ?? 0
+  const fresh = () => gen === generation && watched?.id === pr.id && started === (pushStarts.get(pr.id) ?? 0)
+  pushedElsewhere()
+    // null when a push made the request stale, which is no failure; otherwise what gh said
+    .then(async (pushed) => {
+      if (pushed || !fresh()) return null
+      const { exitCode, stderr } = await $.process.run(['gh', 'pr', 'comment', pr.url, '--body', NUDGE])
+      return exitCode === 0 ? true : stderr.trim().split('\n')[0] || `gh exited ${exitCode}`
+    })
+    .catch((error) => String(error?.message ?? error))
+    .then(async (posted) => {
+      if (posted === true) {
+        $.ui.toast(`PR #${pr.number}: Codex が最新の push (${head.slice(0, 7)}) をレビューしていないため、${NUDGE} を投稿しました`)
+        return
+      }
+      takeBackAll($, key, [{ undo }], pr)
+      if (watched?.id !== pr.id) return
+      // The watch tool must not tell the model Codex was asked: the model then leaves it to the mod
+      if (lastNudged === head) lastNudged = undo.nudgedPrevious ?? null
+      if (posted === null) return
+      lastCheck = { at: await $.clock.now(), error: `${NUDGE}: ${posted}` }
+      showStatus($)
     })
     .catch(() => {})
 }
@@ -1735,6 +1831,7 @@ function applyUndo(record, undo) {
   if (typeof undo.approvedAt === 'number' && undo.approvedAt && record.approvedAt === undo.approvedAt) record.approvedAt = undo.previous ?? 0
   if (typeof undo.usageLimitAt === 'number' && undo.usageLimitAt && record.usageLimitAt === undo.usageLimitAt) record.usageLimitAt = undo.usagePrevious ?? 0
   if (typeof undo.ended === 'string' && record.ended === undo.ended) record.ended = null
+  if (typeof undo.nudgedHead === 'string' && record.nudgedHead === undo.nudgedHead) record.nudgedHead = undo.nudgedPrevious ?? null
 }
 
 function exclusive(fn) {
@@ -1767,8 +1864,13 @@ function read(data, since) {
   }
   let approvedAt = reactedAt
   let usageLimitAt = 0
+  // When someone other than Codex last asked it for a review
+  let askedAt = 0
   for (const comment of data.comments?.nodes ?? []) {
-    if (!byCodex(comment.author)) continue
+    if (!byCodex(comment.author)) {
+      if (NUDGED.test(comment.body ?? '')) askedAt = Math.max(askedAt, after(comment.createdAt))
+      continue
+    }
     // The second form of an approval
     if (/Didn't find any major issues/i.test(comment.body)) approvedAt = Math.max(approvedAt, after(comment.createdAt))
     if (/reached your Codex usage limits/i.test(comment.body)) usageLimitAt = Math.max(usageLimitAt, after(comment.createdAt))
@@ -1776,7 +1878,49 @@ function read(data, since) {
   const reviews = (data.reviews?.nodes ?? [])
     .filter((r) => byCodex(r.author) && after(r.submittedAt) > 0)
     .map((r) => ({ id: r.fullDatabaseId ?? String(r.databaseId), nodeId: r.id, at: after(r.submittedAt), comments: r.comments?.totalCount ?? 0 }))
-  return { approvedAt, reactedAt, usageLimitAt, reviews }
+  // The summary names the commit it speaks of, which a thumbs-up does not: one left from an earlier
+  // push stays on a pull request whose later push Codex never reviewed, and reads as approved to
+  // anyone looking. So where there is a summary it alone says whether the head is approved, at the
+  // time it was last edited, whatever the thumbs-up and since say
+  const summary = codexSummary(data)
+  const verdict = summary ? verdictOf(summary, data.headRefOid) : null
+  if (verdict) reactedAt = approvedAt = verdict === 'clean' ? summary.at : 0
+  return { approvedAt, reactedAt, usageLimitAt, reviews, verdict, askedAt }
+}
+
+// Codex's summary comment as last edited: its reviews' states and when, or null when the pull request
+// has none that reads
+function codexSummary(data) {
+  let found = null
+  for (const comment of [...(data.opening?.nodes ?? []), ...(data.comments?.nodes ?? [])]) {
+    if (comment?.author?.login !== CODEX || typeof comment.body !== 'string') continue
+    const json = comment.body.match(CODEX_STATE)?.[1]
+    if (!json) continue
+    let state
+    try {
+      state = JSON.parse(json)
+    } catch {
+      continue
+    }
+    if (!state || typeof state !== 'object') continue
+    const at = Date.parse(comment.lastEditedAt ?? comment.createdAt ?? '') || 0
+    if (!found || at >= found.at) found = { at, code: state.code_review, security: state.security_review }
+  }
+  return found
+}
+
+// How the summary stands for the head: 'clean' (reviewed, nothing found), 'findings' (reviewed),
+// 'running', or 'unreviewed'. The code review decides the last two: it is the one "@codex review"
+// asks for. Anything but a review completed on the head counts as unreviewed (another commit, none,
+// a failed run, a status not seen yet), so a head Codex gave up on is asked for again rather than
+// waited on. A security review, where there is one, must be clean on the head too before the head
+// is approved
+function verdictOf(summary, head) {
+  const { code, security } = summary
+  if (code?.status === 'running' || security?.status === 'running') return 'running'
+  if (!head || code?.status !== 'completed' || code.commit_sha !== head) return 'unreviewed'
+  const clean = (review) => review.status === 'completed' && review.commit_sha === head && review.has_any_findings === false
+  return clean(code) && (security?.status == null || clean(security)) ? 'clean' : 'findings'
 }
 
 // The pull request, with every connection followed back until it reaches the last push: the
@@ -1968,6 +2112,8 @@ function normalize(record) {
     since: record?.since ?? 0,
     head: record?.head ?? null,
     headAt: record?.headAt ?? 0,
+    headSince: record?.headSince ?? 0,
+    nudgedHead: typeof record?.nudgedHead === 'string' ? record.nudgedHead : null,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
     reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],
@@ -2000,7 +2146,10 @@ function describe() {
   if (!watched) return 'pr-relay is not watching a pull request in this session.'
   if (watched.ended) return `pr-relay watched ${watched.url}, which is now ${watched.ended.toLowerCase()}.`
   const checked = lastCheck ? ` Last checked ${new Date(lastCheck.at).toISOString()}.` : ''
-  return `pr-relay is watching ${watched.url} and will send a prompt when it changes.${checked}`
+  const asked = lastNudged
+    ? ` It asked Codex to review head ${lastNudged.slice(0, 7)} with an "${NUDGE}" comment; do not post another for that head.`
+    : ''
+  return `pr-relay is watching ${watched.url} and will send a prompt when it changes.${checked}${asked}`
 }
 
 // HH:MM in JST
