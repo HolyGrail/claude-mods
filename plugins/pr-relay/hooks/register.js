@@ -1054,7 +1054,15 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
   }
   // When the head came, as far as the polls can tell: the first that saw it. A record a version
   // before 0.11 wrote last holds the head without it, and counts from here
-  if (data.headRefOid && (data.headRefOid !== record.head || !record.headSince)) record.headSince = now
+  if (data.headRefOid && (data.headRefOid !== record.head || !record.headSince)) {
+    record.headSince = now
+    // A request for a review a poll saw before this head came was for an earlier head. The mod's own
+    // for the head before, when no poll has seen it yet, cannot be told from one made for this head
+    // since: unless a push moved since past the mark (the request is then no longer among those
+    // read), only one made from here on counts
+    const ownUnseen = record.nudgedAt > Math.max(record.askedSeen, record.since)
+    record.askedBefore = ownUnseen ? now : record.askedSeen
+  }
   record.head = data.headRefOid ?? record.head
   if (data.state === 'MERGED' || data.state === 'CLOSED') {
     if (!record.ended && !defers) {
@@ -1086,6 +1094,8 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
     (watched?.id === pr.id && pushes.some(unseen)) || pending.some((push) => unseen(push) && !pushCounts(push, data, now))
   if (running || pushing || defers || replaced) return []
   const signals = read(data, record.since)
+  // Kept here and not in nudge, which a review to relay, a running review or a draft skips
+  record.askedSeen = Math.max(record.askedSeen, signals.askedAt)
   const sends = relay($, pr, signals, record, monitoredElsewhere)
   return sends.length ? sends : nudge(pr, data, signals, record, now)
 }
@@ -1101,15 +1111,16 @@ function nudge(pr, data, signals, record, now) {
   if (signals.usageLimitAt) return []
   // Asked already: by a session that marked it, or by anyone since the last push, which a record
   // written by a version before 0.11 (it drops the mark) or by the dev skill's fallback still shows.
-  // The mod's own comment for an earlier head stays among those until a push moves since past it,
-  // which a head pushed elsewhere with an older commit date never does: so where the record says
-  // another head was asked for, only a request made after this one came counts
-  const asked = record.nudgedHead && record.nudgedHead !== head ? signals.askedAt > record.headSince : signals.askedAt > 0
-  if (record.nudgedHead === head || asked) return []
+  // A request for an earlier head stays among those until a push moves since past it, which a head
+  // pushed elsewhere with an older commit date never does: so one the polls saw before this head
+  // came (askedBefore) does not count, while one made since does, even before a poll saw the head
+  if (record.nudgedHead === head || signals.askedAt > record.askedBefore) return []
   if (now - Math.max(record.since, record.headSince) < NUDGE_AFTER_MS) return []
   const previous = record.nudgedHead
+  const previousAt = record.nudgedAt
   record.nudgedHead = head
-  return [{ nudge: head, pr, undo: { nudgedHead: head, nudgedPrevious: previous } }]
+  record.nudgedAt = now
+  return [{ nudge: head, pr, undo: { nudgedHead: head, nudgedPrevious: previous, nudgedPreviousAt: previousAt } }]
 }
 
 // The pull request a create command printed: the last URL that ends where a pull request's does. A
@@ -1831,7 +1842,10 @@ function applyUndo(record, undo) {
   if (typeof undo.approvedAt === 'number' && undo.approvedAt && record.approvedAt === undo.approvedAt) record.approvedAt = undo.previous ?? 0
   if (typeof undo.usageLimitAt === 'number' && undo.usageLimitAt && record.usageLimitAt === undo.usageLimitAt) record.usageLimitAt = undo.usagePrevious ?? 0
   if (typeof undo.ended === 'string' && record.ended === undo.ended) record.ended = null
-  if (typeof undo.nudgedHead === 'string' && record.nudgedHead === undo.nudgedHead) record.nudgedHead = undo.nudgedPrevious ?? null
+  if (typeof undo.nudgedHead === 'string' && record.nudgedHead === undo.nudgedHead) {
+    record.nudgedHead = undo.nudgedPrevious ?? null
+    record.nudgedAt = undo.nudgedPreviousAt ?? 0
+  }
 }
 
 function exclusive(fn) {
@@ -2114,6 +2128,11 @@ function normalize(record) {
     headAt: record?.headAt ?? 0,
     headSince: record?.headSince ?? 0,
     nudgedHead: typeof record?.nudgedHead === 'string' ? record.nudgedHead : null,
+    // When nudgedHead was marked, the newest request for a review a poll has seen, and the newest
+    // seen before the head came
+    nudgedAt: record?.nudgedAt ?? 0,
+    askedSeen: record?.askedSeen ?? 0,
+    askedBefore: record?.askedBefore ?? 0,
     approvedAt: record?.approvedAt ?? 0,
     usageLimitAt: record?.usageLimitAt ?? 0,
     reviews: Array.isArray(record?.reviews) ? record.reviews.map(String) : [],

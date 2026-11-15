@@ -469,7 +469,10 @@ function marked(w: World, key = 'pr:' + URL.toLowerCase()) {
     if (u.approvedAt && record.approvedAt === u.approvedAt) record.approvedAt = u.previous ?? 0
     if (u.usageLimitAt && record.usageLimitAt === u.usageLimitAt) record.usageLimitAt = u.usagePrevious ?? 0
     if (typeof u.ended === 'string' && record.ended === u.ended) record.ended = null
-    if (typeof u.nudgedHead === 'string' && record.nudgedHead === u.nudgedHead) record.nudgedHead = u.nudgedPrevious ?? null
+    if (typeof u.nudgedHead === 'string' && record.nudgedHead === u.nudgedHead) {
+      record.nudgedHead = u.nudgedPrevious ?? null
+      record.nudgedAt = u.nudgedPreviousAt ?? 0
+    }
   }
   return record
 }
@@ -5670,6 +5673,41 @@ test('the next head Codex does not start on is asked for too', async ($, on) => 
   expect(marked(w)).toMatchObject({ nudgedHead: 'b2' })
 })
 
+test('a request made for the next head before a poll saw that head is not made again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  // A poll sees the mod's own request while the head it was for still stands
+  await clock.advance(MINUTE)
+
+  // Someone pushes and asks within the minute, so the request is older than the first poll of the head
+  w.pull.head = 'b2'
+  w.pull.comments = [...(w.pull.comments ?? []), { at: NOW + 4 * MINUTE + 30_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+})
+
+test('a request made after a push that followed the mod\'s own is for that push, seen under the last head or not', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  // The push and the request both come before the next poll, which never saw the mod's own request
+  // under the head it was for: the commit is newer than that request, which so no longer counts
+  w.pull.head = 'b2'
+  w.pull.committedAt = NOW + 3 * MINUTE + 20_000
+  w.pull.comments = [...(w.pull.comments ?? []), { at: NOW + 3 * MINUTE + 40_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
+})
+
 test('a review that did not complete on the head is asked for again', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   // A status the summary has not been seen to hold, as a failed run may leave
@@ -5720,6 +5758,23 @@ test('a request gh could not post is made again the next round', async ($, on) =
   expect(w.asks.length).toBe(2)
   expect(w.toasts).toEqual([ASKED])
   expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+})
+
+test('a request gh could not post is not taken for one a later request might be', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE }, askError: 'HTTP 502' })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  // Nothing of the mod's is on the pull request, so the request made for the next head before a
+  // poll saw that head is the only one, and counts
+  w.askError = undefined
+  w.pull.head = 'b2'
+  w.pull.comments = [{ at: NOW + 3 * MINUTE + 30_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
 })
 
 // The record of a pull request whose head another session saw come ten minutes ago
