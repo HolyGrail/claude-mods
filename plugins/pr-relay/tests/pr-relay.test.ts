@@ -68,7 +68,66 @@ type Pull = {
   reviews?: Review[]
   // Reviews on the page before the newest, which gh hands out for the cursor 'older'
   olderReviews?: Review[]
-  comments?: { at: number; body: string }[]
+  // by is who wrote it, Codex unless said
+  comments?: { at: number; body: string; by?: string }[]
+  draft?: boolean
+  // Whether the gh user opened it
+  mine?: boolean
+  // What Codex's summary comment says of its reviews
+  codex?: Codex
+}
+
+// at is when Codex last edited the comment. paged leaves it off the newest page of comments, as on a
+// pull request with more than a page of them since
+type Codex = { at: number; paged?: true; security?: CodexReview } & CodexReview
+type CodexReview = { sha?: string | null; status?: string | null; findings?: boolean | null }
+
+// The summary comment as Codex left it on HolyGrail/yomizome#11
+const CODEX_SUMMARY = [
+  '<!-- codex-pull-request-review-summary -->',
+  '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"08df217b9e322cb974a83ffda2121461b89109dc","has_any_findings":false,"has_unresolved_findings":false,"status":"completed"},"security_review":{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->',
+  '',
+  '<details>',
+  '<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>',
+  '',
+  'This comment shows the latest Codex review activity on this pull request.',
+  '',
+  '| Review | Status | Commit | Review trigger |',
+  '| --- | --- | --- | --- |',
+  '| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-11-14T07:43:00.881406Z">2026-11-14T07:43:00.881406Z</relative-time> | `08df217` | New commits |',
+  '',
+  '',
+  '',
+  '<details> <summary>ℹ️ About Codex in GitHub</summary>',
+  '<br/>',
+  '',
+  '[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you',
+  '- Open a pull request for review',
+  '- Mark a draft as ready',
+  '- Comment "@codex review" or "@codex security review".',
+  '',
+  'Codex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.',
+  '',
+  '</details>',
+  '',
+  '</details>',
+].join('\n')
+
+// That comment with the state under test in place of its own
+function codexSummary(codex: Codex) {
+  const review = (r?: CodexReview) => ({
+    commit_sha: r?.sha ?? null,
+    has_any_findings: r?.findings ?? null,
+    has_unresolved_findings: r?.findings ?? null,
+    status: r?.status ?? null,
+  })
+  const state = JSON.stringify({ code_review: review(codex), security_review: review(codex.security) })
+  return {
+    createdAt: iso(LAST_PUSH),
+    lastEditedAt: iso(codex.at),
+    author: { login: 'chatgpt-codex-connector' },
+    body: CODEX_SUMMARY.replace(/\{"code_review".*\}(?= -->)/, () => state),
+  }
 }
 
 const reviewNodes = (reviews: NonNullable<Pull['reviews']>) =>
@@ -88,8 +147,12 @@ function graphql(pull: Pull, before?: string) {
       data: { repository: { pullRequest: { reviews: { pageInfo: { hasPreviousPage: false }, nodes: reviewNodes(pull.olderReviews ?? []) } } } },
     })
   }
+  const summary = pull.codex ? [codexSummary(pull.codex)] : []
   const pullRequest = {
     state: pull.state ?? 'OPEN',
+    isDraft: pull.draft ?? false,
+    viewerDidAuthor: pull.mine ?? true,
+    opening: { nodes: summary },
     headRefOid: pull.head ?? 'a1',
     headRefName: pull.branch ?? 'feature',
     baseRefName: pull.base ?? 'main',
@@ -108,7 +171,15 @@ function graphql(pull: Pull, before?: string) {
       nodes: reviewNodes(pull.reviews ?? []),
     },
     comments: {
-      nodes: (pull.comments ?? []).map((c) => ({ createdAt: iso(c.at), author: { login: 'chatgpt-codex-connector' }, body: c.body })),
+      nodes: [
+        ...(pull.codex?.paged ? [] : summary),
+        ...(pull.comments ?? []).map((c) => ({
+          createdAt: iso(c.at),
+          lastEditedAt: null,
+          author: { login: c.by ?? 'chatgpt-codex-connector' },
+          body: c.body,
+        })),
+      ],
     },
   }
   return JSON.stringify({ data: { repository: { pullRequest } } })
@@ -210,6 +281,9 @@ type World = {
   deleted: string[]
   prompts: string[]
   toasts: string[]
+  // The argument vectors of the gh pr comment calls, and what they fail with when they do
+  asks: (readonly string[])[]
+  askError?: string
   // What git merge-base --is-ancestor of the base tip answers: contained, behind, or a tip the
   // repository has not fetched
   ancestry?: 'contained' | 'behind' | 'missing'
@@ -230,6 +304,7 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     deleted: [],
     prompts: [],
     toasts: [],
+    asks: [],
     gitRuns: [],
     status: undefined,
     queries: 0,
@@ -296,6 +371,16 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
       if (w.ancestry === 'behind') return run(1, '')
       if (w.ancestry === 'missing') return run(128, '', `fatal: Not a valid commit name ${e.argv[3]}`)
       return run(0, '')
+    }
+    if (e.argv[1] === 'pr' && e.argv[2] === 'comment') {
+      w.asks.push(e.argv)
+      if (w.askError) return run(1, '', w.askError)
+      // The comment stays on the pull request, posted a moment after the poll that asked for it
+      const url = e.argv[3] ?? ''
+      const pull = w.pulls?.[Number(url.match(/\d+$/)?.[0])] ?? w.pull
+      const at = (w.store.get('pr:' + url.toLowerCase()) as { at: number }).at + 2_000
+      pull.comments = [...(pull.comments ?? []), { at, body: '@codex review', by: 'HolyGrail' }]
+      return run(0, `${url}#issuecomment-1\n`)
     }
     if (e.argv[1] === 'pr') {
       w.branchLookups += 1
@@ -384,6 +469,10 @@ function marked(w: World, key = 'pr:' + URL.toLowerCase()) {
     if (u.approvedAt && record.approvedAt === u.approvedAt) record.approvedAt = u.previous ?? 0
     if (u.usageLimitAt && record.usageLimitAt === u.usageLimitAt) record.usageLimitAt = u.usagePrevious ?? 0
     if (typeof u.ended === 'string' && record.ended === u.ended) record.ended = null
+    if (typeof u.nudgedHead === 'string' && record.nudgedHead === u.nudgedHead) {
+      record.nudgedHead = u.nudgedPrevious ?? null
+      record.nudgedAt = u.nudgedPreviousAt ?? 0
+    }
   }
   return record
 }
@@ -672,7 +761,7 @@ test('a monitored review followed by a thumbs-up sends only an approval with the
   await $.session.start({ ...START, surface: 'desktop' })
   await clock.settle()
   expect(w.prompts).toEqual([
-    `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。\n` + MONITORED_APPROVAL_NOTE,
+    `Codex が PR #7 (${URL}) を approved にしました（20:59、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。\n` + MONITORED_APPROVAL_NOTE,
   ])
   expect(w.detailsArgv).toEqual([])
   expect(marked(w)).toMatchObject({ reviews: ['1'], approvedAt: NOW - MINUTE })
@@ -690,7 +779,7 @@ for (const autoFix of [false, true]) {
     await $.session.start({ ...START, surface: 'desktop' })
     await clock.settle()
     expect(w.prompts).toEqual(autoFix ? [] : [
-      `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+      `Codex が PR #7 (${URL}) を approved にしました（20:59、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
     ])
     expect(marked(w)).toMatchObject({ approvedAt: NOW - MINUTE })
     w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
@@ -709,7 +798,7 @@ for (const commentAt of [NOW - 2 * MINUTE, NOW]) {
     await $.session.start({ ...START, surface: 'desktop' })
     await clock.settle()
     expect(w.prompts).toEqual([
-      `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+      `Codex が PR #7 (${URL}) を approved にしました（20:59、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
     ])
     expect(marked(w)).toMatchObject({ approvedAt: Math.max(NOW - MINUTE, commentAt) })
     w.desktop = { primary: { number: 7, state: 'open' }, monitor: { auto_fix: false } }
@@ -749,7 +838,7 @@ test('a dropped monitored thumbs-up retries when the same poll marks a later app
   w.store.set(record, { since: LAST_PUSH, approvedAt: previous, at: NOW - MINUTE })
   await $.session.start({ ...START, surface: 'desktop' })
   await clock.settle()
-  expect(w.prompts).toEqual([expect.stringContaining('approved にしました（20:58）')])
+  expect(w.prompts).toEqual([expect.stringContaining('approved にしました（20:58、head a1）')])
   expect(marked(w, record)).toMatchObject({ approvedAt: previous })
   w.dropPrompt = false
   await clock.advance(MINUTE)
@@ -770,7 +859,7 @@ test('a monitored thumbs-up alone sends the usual approval prompt', async ($, on
   await $.session.start({ ...START, surface: 'desktop' })
   await clock.settle()
   expect(w.prompts).toEqual([
-    `Codex が PR #7 (${URL}) を approved にしました（20:59）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+    `Codex が PR #7 (${URL}) を approved にしました（20:59、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
   ])
 })
 
@@ -1462,7 +1551,7 @@ test('a thumbs-up from before the last push is not an approval', async ($, on) =
   w.pull.thumbsUpAt = NOW + 30_000
   await clock.advance(MINUTE)
   expect(w.prompts).toEqual([
-    `Codex が PR #7 (${URL}) を approved にしました（21:00）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
+    `Codex が PR #7 (${URL}) を approved にしました（21:00、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`,
   ])
 
   await clock.advance(MINUTE)
@@ -5488,4 +5577,305 @@ test('a poll that yields says so before the record is read', async ($, on) => {
   expect(w.store.get(NOTE)).toMatchObject({ deferred: true })
   w.gets = undefined
   await clock.advance(20_000)
+})
+
+// Codex's summary comment names the commit each review is of, which tells the head it approved from
+// one it never reviewed
+
+const APPROVED = (at: string) =>
+  `Codex が PR #7 (${URL}) を approved にしました（${at}、head a1）。CI の結果を確かめ、問題がなければ作業の完了を報告してください。`
+const ASK = ['gh', 'pr', 'comment', URL, '--body', '@codex review']
+const ASKED = 'PR #7: Codex が最新の push (a1) をレビューしていないため、@codex review を投稿しました'
+// Codex reviewed the commit before the head, found nothing, and has not touched the head
+const REVIEWED_BEFORE: Codex = { sha: '0ld0ld0', status: 'completed', findings: false, at: LAST_PUSH - MINUTE }
+
+test('a summary that found nothing on the head is an approval before any thumbs-up', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: { sha: 'a1', status: 'completed', findings: false, at: NOW - MINUTE } } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([APPROVED('20:59')])
+  expect(marked(w)).toMatchObject({ approvedAt: NOW - MINUTE })
+
+  // The thumbs-up follows the summary by seconds, and is the same approval
+  w.pull.thumbsUpAt = NOW - MINUTE + 3_000
+  await clock.advance(MINUTE)
+  expect(w.prompts.length).toBe(1)
+  expect(w.asks).toEqual([])
+})
+
+test('the summary is read from the first comments when the newest page no longer holds it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: { sha: 'a1', status: 'completed', findings: false, at: NOW - MINUTE, paged: true } } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([APPROVED('20:59')])
+})
+
+for (const [what, codex] of [
+  ['speaks of another commit', REVIEWED_BEFORE],
+  ['found something on the head', { sha: 'a1', status: 'completed', findings: true, at: NOW - 2 * MINUTE }],
+  ['is of a review still running', { sha: 'a1', status: 'running', at: NOW - 2 * MINUTE }],
+  ['holds a security review that found something', {
+    sha: 'a1', status: 'completed', findings: false, at: NOW - 2 * MINUTE, security: { sha: 'a1', status: 'completed', findings: true },
+  }],
+] as [string, Codex][]) {
+  test(`a thumbs-up after the last push is not an approval while the summary ${what}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull: { thumbsUpAt: NOW - MINUTE, codex } })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.prompts).toEqual([])
+    expect(marked(w)).toMatchObject({ approvedAt: 0 })
+  })
+}
+
+test('a head Codex has not started on is asked for once, three minutes after it came', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { thumbsUpAt: LAST_PUSH - 5 * MINUTE, codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  // Codex starts within seconds when it starts by itself, so the head is given a while first
+  await clock.advance(2 * MINUTE)
+  expect(w.asks).toEqual([])
+  await clock.advance(MINUTE)
+  expect(w.asks).toEqual([ASK])
+  expect(w.toasts).toEqual([ASKED])
+  expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+  expect(w.prompts).toEqual([])
+
+  // The model is told too, so it does not ask again itself
+  const told = await $.tool.call({ tool: 'mcp__pr-relay__watch' })
+  expect(told.result).toContain('asked Codex to review head a1')
+  await clock.advance(5 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  // Codex answers the request
+  w.pull.codex = { sha: 'a1', status: 'completed', findings: false, at: NOW + 9 * MINUTE }
+  await clock.advance(MINUTE)
+  expect(w.prompts).toEqual([APPROVED('21:09')])
+  expect(w.asks.length).toBe(1)
+})
+
+test('the next head Codex does not start on is asked for too', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  w.pull.head = 'b2'
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  await clock.advance(MINUTE)
+  expect(w.asks.length).toBe(2)
+  expect(marked(w)).toMatchObject({ nudgedHead: 'b2' })
+})
+
+test('a request made for the next head before a poll saw that head is not made again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  // A poll sees the mod's own request while the head it was for still stands
+  await clock.advance(MINUTE)
+
+  // Someone pushes and asks within the minute, so the request is older than the first poll of the head
+  w.pull.head = 'b2'
+  w.pull.comments = [...(w.pull.comments ?? []), { at: NOW + 4 * MINUTE + 30_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+})
+
+test('a request made after a push that followed the mod\'s own is for that push, seen under the last head or not', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  // The push and the request both come before the next poll, which never saw the mod's own request
+  // under the head it was for: the commit is newer than that request, which so no longer counts
+  w.pull.head = 'b2'
+  w.pull.committedAt = NOW + 3 * MINUTE + 20_000
+  w.pull.comments = [...(w.pull.comments ?? []), { at: NOW + 3 * MINUTE + 40_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
+})
+
+test('a review that did not complete on the head is asked for again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // A status the summary has not been seen to hold, as a failed run may leave
+  const w = stubWorld(on, { pull: { codex: { sha: 'a1', status: 'failed', at: NOW - MINUTE } } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks).toEqual([ASK])
+})
+
+for (const [what, pull] of [
+  ['it is running a review', { codex: { sha: '0ld0ld0', status: 'running', at: NOW - MINUTE } }],
+  ['it found something on the head', { codex: { sha: 'a1', status: 'completed', findings: true, at: NOW - MINUTE } }],
+  ['it left no summary', { thumbsUpAt: LAST_PUSH - MINUTE }],
+  ['it reached its usage limit', {
+    codex: REVIEWED_BEFORE, comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }],
+  }],
+  ['someone asked since the last push', { codex: REVIEWED_BEFORE, comments: [{ at: NOW - MINUTE, body: '@codex review', by: 'HolyGrail' }] }],
+  ['the pull request is a draft', { codex: REVIEWED_BEFORE, draft: true }],
+  ['someone else opened the pull request', { codex: REVIEWED_BEFORE, mine: false }],
+] as [string, Pull][]) {
+  test(`Codex is not asked for a review when ${what}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, { pull })
+    await $.session.start(START)
+    await clock.settle()
+    await clock.advance(10 * MINUTE)
+    expect(w.asks).toEqual([])
+  })
+}
+
+test('a request gh could not post is made again the next round', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE }, askError: 'HTTP 502' })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+  expect(w.toasts).toEqual([])
+  expect(marked(w)).toMatchObject({ nudgedHead: null })
+  // The failure shows, and the model is not told Codex was asked
+  expect(w.status).toBe('PR #7 確認失敗 21:03: @codex review: HTTP 502')
+  const told = await $.tool.call({ tool: 'mcp__pr-relay__watch' })
+  expect(told.result).not.toContain('asked Codex')
+
+  w.askError = undefined
+  await clock.advance(MINUTE)
+  expect(w.asks.length).toBe(2)
+  expect(w.toasts).toEqual([ASKED])
+  expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+})
+
+test('a request gh could not post is not taken for one a later request might be', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE }, askError: 'HTTP 502' })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks.length).toBe(1)
+
+  // Nothing of the mod's is on the pull request, so the request made for the next head before a
+  // poll saw that head is the only one, and counts
+  w.askError = undefined
+  w.pull.head = 'b2'
+  w.pull.comments = [{ at: NOW + 3 * MINUTE + 30_000, body: '@codex review', by: 'HolyGrail' }]
+  await clock.advance(10 * MINUTE)
+  expect(w.asks.length).toBe(1)
+})
+
+// The record of a pull request whose head another session saw come ten minutes ago
+const WAITED = { since: LAST_PUSH, head: 'a1', headSince: NOW - 10 * MINUTE, at: NOW - MINUTE }
+
+test('a head the record saw come long enough ago is asked for at the first poll', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  w.store.set('pr:' + URL.toLowerCase(), WAITED)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.asks).toEqual([ASK])
+})
+
+test('a session that leaves the waking to another does not ask Codex', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  w.store.set('pr:' + URL.toLowerCase(), WAITED)
+  w.store.set('poll:session-a', pollNote(NOW - 1_000))
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.asks).toEqual([])
+  expect(w.store.get('pr:' + URL.toLowerCase())).toEqual(WAITED)
+})
+
+test('a record that holds the head without when it came counts it from the next poll', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  // As a session of version 0.10 leaves it
+  w.store.set('pr:' + URL.toLowerCase(), { since: LAST_PUSH, head: 'a1', at: NOW - MINUTE })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(2 * MINUTE)
+  expect(w.asks).toEqual([])
+  await clock.advance(MINUTE)
+  expect(w.asks).toEqual([ASK])
+})
+
+test('a request read before a push that started while the record was written is not posted', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(2 * MINUTE)
+
+  const record = 'pr:' + URL.toLowerCase()
+  w.sets = async (key) => {
+    if (key === record) await clock.sleep(10_000)
+  }
+  await clock.advance(MINUTE + 1_000)
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  await clock.advance(15_000)
+  expect(w.asks).toEqual([])
+  // Let the slow writes and the take-back of the mark land inside the test
+  w.sets = undefined
+  await clock.advance(10_000)
+  expect(marked(w)).toMatchObject({ nudgedHead: null })
+  expect(w.toasts).toEqual([])
+})
+
+test('a push that starts while the notes are read once more before the comment keeps it from going out', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { pull: { codex: REVIEWED_BEFORE } })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(2 * MINUTE)
+
+  // Once the record holds the mark, each read of the notes takes 5 s: the poll's two scans after its
+  // write end 20 s after it, and the scan before the comment 10 s after those
+  const record = 'pr:' + URL.toLowerCase()
+  w.gets = async (key) => {
+    if (key.startsWith('alive:') && (w.store.get(record) as { nudgedHead?: string } | undefined)?.nudgedHead) await clock.sleep(5_000)
+  }
+  await clock.advance(MINUTE + 25_000)
+  expect(marked(w)).toMatchObject({ nudgedHead: 'a1' })
+  expect(w.asks).toEqual([])
+  await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
+  w.gets = undefined
+  await clock.advance(10_000)
+  expect(w.asks).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(marked(w)).toMatchObject({ nudgedHead: null })
+  // A push is no failure of the request
+  expect(w.status).toBe('PR #7 監視中 · 21:03 確認')
+})
+
+test('a command that replies to a review before it opens a pull request watches the one it opened', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on)
+  // As gh prints them: the reply's URL, then the new pull request's
+  const text = `${URL}#discussion_r4571727770\ntrue\n${PR9}\n`
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: text, stderr: '', interrupted: false }, text }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  await $.tool.call({
+    tool: 'Bash',
+    command: 'gh api repos/HolyGrail/claude-mods/pulls/7/comments/1/replies -f body=ok -q .html_url; gh pr create',
+  })
+  await clock.settle()
+  await clock.advance(MINUTE)
+  expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
 })
