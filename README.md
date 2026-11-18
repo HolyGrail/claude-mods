@@ -11,6 +11,7 @@ Claude Code の mod 集です。
 | [cache-meter](plugins/cache-meter/README.md) | 会話のプロンプトキャッシュがあと何分もつかをゲージで、切れたら次の送信で何トークンを書き直すかを、プロンプト入力欄の上に常時表示する |
 | [notice-board](plugins/notice-board/README.md) | 同じリポジトリのセッション全体にお知らせを出し、各セッションの帯とモデルに届ける |
 | [pr-relay](plugins/pr-relay/README.md) | セッションの PR を監視し、マージされたときと Codex がレビューを付けたときだけセッションを起こす |
+| [status-board](plugins/status-board/README.md) | モデルが書くセッション全体の要約（状況ボード）と指示ごとの履歴を会話の横の枠に、いまの状況をプロンプト入力欄の上に表示する |
 | [zsh-safe](plugins/zsh-safe/README.md) | bash の書き方で書かれた Bash コマンドを、macOS の zsh でもそのまま通す |
 
 ## インストール
