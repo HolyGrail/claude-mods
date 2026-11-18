@@ -123,6 +123,9 @@ let boardError = null
 // `summarizing` is whether the latest still runs
 let boardRuns = 0
 let summarizing = false
+// An answer ended while a board was being asked for, which that board may lack: once it is in,
+// the board is asked for again if the pane is still shown
+let summarizeAgain = false
 // Whether a main turn runs, and when the last one ended: the cache is taken as warm then
 let turnRunning = false
 let lastTurnEnd = null
@@ -247,6 +250,7 @@ function reset() {
   failures = 0
   boardRuns += 1
   summarizing = false
+  summarizeAgain = false
   board = null
   boardError = null
 }
@@ -319,9 +323,12 @@ async function readOnce($) {
     const stat = await $.fs.stat(file)
     if (stat.kind !== 'file') return false
     size = stat.size
-  } catch {
-    // The engine writes the file with the first prompt; until then there is nothing to read
-    return false
+  } catch (error) {
+    // The engine writes the file with the first prompt; until then there is nothing to read. A
+    // missing file reads as `HooksError: <plugin>: $.fs.stat(<path>) failed: ENOENT` (probed on
+    // 2.1.327); any other failure counts toward the status line
+    if (isMissing(error)) return false
+    throw error
   }
   if (started !== generation) return false
   let changed = false
@@ -348,6 +355,10 @@ async function readOnce($) {
   }
   if (changed) $.ui.invalidate('ui.render')
   return started === generation
+}
+
+function isMissing(error) {
+  return error?.code === 'ENOENT' || /\bENOENT\b/.test(String(error?.message ?? error))
 }
 
 // Takes one chunk of bytes. Only whole lines are decoded: a newline byte is never part of a
@@ -710,10 +721,9 @@ function cardFooter(card) {
 // draws a Button's nested Text without its color.
 function paneBody($, e, now) {
   const { Box, Text, Button, Markdown } = $.ui.resolve(e)
+  // The board and its button are drawn even with no events: a conversation may have none (an
+  // image alone typed in a terminal) and still be summed up
   const cards = cardsOf(data.timeline)
-  if (cards.length === 0 && !board) {
-    return Text({ dimColor: true, children: ['まだ記録はありません。指示や計画がここに並びます。'] })
-  }
   const pip = (kind) => Text({ color: PIPS[kind].color, children: [PIPS[kind].glyph] })
   const time = (ts) => Text({ dimColor: true, children: [when(ts, now)] })
   const oneLine = (text) => text.replace(/\s+/g, ' ').trim()
@@ -802,7 +812,7 @@ function paneBody($, e, now) {
     }),
   )
   if (!historyShown) return Box({ flexDirection: 'column', rowGap: 1, children })
-  if (cards.length === 0) children.push(Text({ dimColor: true, children: ['まだ記録はありません。'] }))
+  if (cards.length === 0) children.push(Text({ dimColor: true, children: ['まだ記録はありません。指示や計画がここに並びます。'] }))
 
   const newestFirst = [...cards].reverse()
   const shown = showAll ? newestFirst : newestFirst.slice(0, SHOWN)
@@ -832,7 +842,11 @@ async function toggle($) {
     return false
   }
   const opened = await $.ui.open({ id: PANE, title: PANE_TITLE })
-  if (!opened.isPlaced) $.ui.toast(`状況ボードを表示できません: ${opened.reason}`)
+  if (!opened.isPlaced) {
+    // Nobody would see a board asked for now
+    $.ui.toast(`状況ボードを表示できません: ${opened.reason}`)
+    return true
+  }
   // A missing or outdated board is asked for only on a warm cache; otherwise the button waits
   const now = await $.clock.now()
   if ((!board || isStale(board)) && isWarm(now)) void summarize($)
@@ -845,10 +859,12 @@ function isWarm(now) {
   return turnRunning || (lastTurnEnd !== null && now - lastTurnEnd <= WARM_MS)
 }
 
-// Something happened after the board was written
+// Something happened after the board was written: an event, or a turn that ended, since in a
+// terminal session a plain answer is no event
 function isStale(written) {
   const latest = data.timeline[data.timeline.length - 1]
-  return latest !== undefined && latest.ts > written.at
+  if (latest !== undefined && latest.ts > written.at) return true
+  return lastTurnEnd !== null && lastTurnEnd > written.at
 }
 
 // Takes up the conversation `id`: its board from the store unless `load` is false, and, at
@@ -878,9 +894,10 @@ function isBoard(value) {
   return typeof value === 'object' && value !== null && typeof value.at === 'number' && typeof value.text === 'string'
 }
 
+// Only a pane a surface places and shows is looked at
 async function summarizeIfShown($) {
   try {
-    if ((await $.ui.panes()).some((pane) => pane.id === PANE)) await summarize($)
+    if ((await $.ui.panes()).some((pane) => pane.id === PANE && pane.isPlaced && pane.isShown)) await summarize($, true)
   } catch {
     // Unloading
   }
@@ -888,9 +905,13 @@ async function summarizeIfShown($) {
 
 // Asks the model for a board over the session's own transcript, one ask at a time. An answer to
 // an ask begun before a reset or a switch of conversation is dropped. A failure keeps the board
-// there was and says why under the button.
-async function summarize($) {
-  if (summarizing) return
+// there was and says why under the button. An ask from a turn's end (`auto`) while one runs is
+// made again once that one is in; a press while one runs does nothing.
+async function summarize($, auto = false) {
+  if (summarizing) {
+    if (auto) summarizeAgain = true
+    return
+  }
   const run = ++boardRuns
   summarizing = true
   boardError = null
@@ -923,6 +944,10 @@ async function summarize($) {
     if (run === boardRuns) {
       summarizing = false
       $.ui.invalidate('ui.render')
+      if (summarizeAgain) {
+        summarizeAgain = false
+        void summarizeIfShown($)
+      }
     }
   }
 }

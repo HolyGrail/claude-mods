@@ -38,6 +38,7 @@ type Host = {
   // What the status line shows, and how many more fs.read calls fail
   status: string | undefined
   failReads: number
+  failStats: number
   // The conversation's id, $.store, the forks asked for and how the next one answers; a fork
   // waits on `hold` while it is set
   sessionId: string
@@ -57,6 +58,7 @@ function stubHost(on: On, files: Record<string, string> = {}): Host {
     toasts: [],
     status: undefined,
     failReads: 0,
+    failStats: 0,
     sessionId: 's1',
     store: new Map(),
     forks: [],
@@ -85,8 +87,12 @@ function stubHost(on: On, files: Record<string, string> = {}): Host {
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('fs.stat', ($, e) => {
+    if (h.failStats > 0) {
+      h.failStats -= 1
+      return { deny: 'EACCES: permission denied' }
+    }
     const bytes = h.files.get(e.path)
-    if (!bytes) throw new Error(`ENOENT: ${e.path}`)
+    if (!bytes) return { deny: `ENOENT: no such file or directory, lstat '${e.path}'` }
     return { value: { kind: 'file', size: bytes.length, mtimeMs: 0, isLink: false } }
   })
   // Byte ranges, as the engine reads them
@@ -585,8 +591,8 @@ for (const c of [
     // Written before or after the prompt at 13:30
     if (c.stored) h.store.set('board:s1', { at: NOW - (c.stale ? 40 : 20) * MINUTE, text: '前のボード', usage: { read: 1_500, output: 20 } })
     await start($, clock)
-    await completeTurn($, clock)
-    if (!c.warm) await clock.advance(6 * MINUTE)
+    // A turn that runs keeps the cache warm; with none yet it is taken as cold
+    if (c.warm) await $.turn.start({ text: '', turnId: 't' })
     await openPane($, clock)
 
     expect(h.forks).toHaveLength(c.forks)
@@ -684,4 +690,86 @@ test('session.start deletes the boards nobody wrote for eight days', async ($, o
   h.store.set('other', 1)
   await start($, clock)
   expect([...h.store.keys()].sort()).toEqual(['board:recent', 'other'])
+})
+
+test('an answer that ends while a board is asked for is summed up again once that board is in; a second press is not', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 10) })
+  await start($, clock)
+  await openPane($, clock)
+
+  let release = () => {}
+  h.hold = new Promise<void>((resolve) => (release = resolve))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'status-board-refresh' })
+  await ui.press({ key: 'status-board-refresh' })
+  await ui.unmount()
+  await completeTurn($, clock)
+  expect(h.forks).toHaveLength(1)
+
+  release()
+  h.hold = undefined
+  await clock.settle()
+  expect(h.forks).toHaveLength(2)
+})
+
+test('a board written before a turn ended is outdated though no event came after it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 30) })
+  h.store.set('board:s1', { at: NOW - 20 * MINUTE, text: '前のボード' })
+  await start($, clock)
+  expect((await boardOf($)).meta).toBe('13:40 時点 · モデルによる要約')
+
+  await completeTurn($, clock)
+  expect((await boardOf($)).meta).toBe('13:40 時点 · モデルによる要約 · その後に動きあり')
+  // Reopened while warm, it is asked for again
+  await openPane($, clock)
+  expect(h.forks).toHaveLength(1)
+})
+
+test('a pane that could not be placed, or is not shown, asks the model for nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 10) })
+  h.placed = false
+  await start($, clock)
+  await $.turn.start({ text: '', turnId: 't' })
+  await openPane($, clock)
+  expect(h.toasts).toEqual(['状況ボードを表示できません: no-surface'])
+  await completeTurn($, clock)
+  expect(h.forks).toHaveLength(0)
+})
+
+test('with no events the board can still be made, and the history says there is nothing yet', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  await start($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'status-board-refresh' }))?.text).toBe('状況ボードを作る（キャッシュ切れの可能性あり）')
+  await ui.press({ key: 'status-board-refresh' })
+  await clock.settle()
+  expect(h.forks).toHaveLength(1)
+  expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe('## 目的\n- 帯を直す')
+  await ui.unmount()
+  expect(await paneCards($, 'terminal')).toEqual(['まだ記録はありません。指示や計画がここに並びます。'])
+})
+
+test('a transcript that cannot be looked up counts toward the status line, unless it is not there yet', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on)
+  await start($, clock)
+  await completeTurn($, clock)
+  await completeTurn($, clock)
+  // Missing: never a failure
+  expect(h.status).toBeUndefined()
+
+  h.files.set(FILE, utf8(prompt('読める', 1)))
+  h.failStats = 3
+  await completeTurn($, clock)
+  await completeTurn($, clock)
+  expect(h.status).toBeUndefined()
+  await completeTurn($, clock)
+  expect(h.status).toBe('status-board: 会話ログを読めません: status-board: $.fs.stat: EACCES: permission denied')
+  await completeTurn($, clock)
+  expect(h.status).toBeUndefined()
 })
