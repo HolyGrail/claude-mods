@@ -29,6 +29,11 @@
       "name": "zsh-safe",
       "source": "./plugins/zsh-safe",
       "description": "Lets Bash commands written for bash run under zsh: unmatched globs, leading =, and a missing timeout"
+    },
+    {
+      "name": "status-board",
+      "source": "./plugins/status-board",
+      "description": "Shows a status board the model writes for this session, a one-line status above the prompt, and the per-prompt history of plans, steps, recaps, questions and linked pull requests"
     }
   ]
 }
