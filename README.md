@@ -1,22 +1,29 @@
 # claude-mods
 
-Claude Code の mod 集です。
-このリポジトリ自体が plugin marketplace なので、Claude Code から直接インストールできます。
+English | [日本語](README.ja.md)
 
-## mod 一覧
+A collection of Claude Code mods.
+The repository is itself a plugin marketplace, so the mods install straight from Claude Code.
 
-| mod | 内容 |
+## Mods
+
+| mod | What it does |
 | --- | --- |
-| [usage-meter](plugins/usage-meter/README.md) | プロンプト入力欄の上に、コンテキストと 5 時間制限・週間制限・モデル別の週間制限（Fable など）の使用率を常時表示する |
-| [cache-meter](plugins/cache-meter/README.md) | 会話のプロンプトキャッシュがあと何分もつかをゲージで、切れたら次の送信で何トークンを書き直すかを、プロンプト入力欄の上に常時表示する |
-| [notice-board](plugins/notice-board/README.md) | 同じリポジトリのセッション全体にお知らせを出し、各セッションの帯とモデルに届ける |
-| [pr-relay](plugins/pr-relay/README.md) | セッションの PR を監視し、マージされたときと Codex がレビューを付けたときだけセッションを起こす |
-| [status-board](plugins/status-board/README.md) | モデルが書くセッション全体の要約（状況ボード）と指示ごとの履歴を会話の横の枠に、いまの状況をプロンプト入力欄の上に表示する |
-| [zsh-safe](plugins/zsh-safe/README.md) | bash の書き方で書かれた Bash コマンドを、macOS の zsh でもそのまま通す |
+| [usage-meter](plugins/usage-meter/README.md) | Keeps the usage of the context, the 5-hour limit, the weekly limit and per-model weekly limits (such as Fable's) on view above the prompt |
+| [cache-meter](plugins/cache-meter/README.md) | Keeps on view above the prompt a gauge of how many minutes the conversation's prompt cache has left, and, once it has expired, how many tokens the next request will write to the cache again |
+| [notice-board](plugins/notice-board/README.md) | Posts notices to every session of the same repository, delivered to each session's band and model |
+| [pr-relay](plugins/pr-relay/README.md) | Watches the session's PR and wakes the session only when it is merged or Codex reviews it |
+| [status-board](plugins/status-board/README.md) | Shows a summary of the whole session written by the model (the status board) and a history by prompt in a pane beside the conversation, and where things stand above the prompt |
+| [zsh-safe](plugins/zsh-safe/README.md) | Lets Bash commands written the bash way run as they are under macOS's zsh |
 
-## インストール
+The mods' text is in English by default.
+pr-relay and status-board switch to Japanese when Claude Code's `language` setting, or the `LC_ALL` / `LC_MESSAGES` / `LANG` environment variables, say Japanese ([pr-relay](plugins/pr-relay/README.md#display-language), [status-board](plugins/status-board/README.md#display-language)).
+The other four mods have English text only.
+Times the mods show are in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`).
 
-Claude Code のプロンプトで、次の 3 つを順に実行します。
+## Install
+
+At the Claude Code prompt, run these three in order.
 
 ```text
 /plugin marketplace add HolyGrail/claude-mods
@@ -24,11 +31,11 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 /reload-plugins
 ```
 
-`/reload-plugins` で mod が動き始めます。
-表示されないときは Claude Code を再起動してください。
-mod ごとに必要な Claude Code のバージョンは、各 mod の README に書いてあります。
+`/reload-plugins` starts the mod.
+If it does not show up, restart Claude Code.
+The Claude Code version each mod needs is in that mod's README.
 
-ターミナルからなら、次のコマンドでも同じことができます。
+From a terminal, these commands do the same.
 
 ```bash
 claude plugin marketplace add HolyGrail/claude-mods
@@ -38,13 +45,13 @@ claude plugin marketplace add HolyGrail/claude-mods
 claude plugin install usage-meter@claude-mods
 ```
 
-Team / Enterprise プランでは、管理者が追加できる marketplace を制限していることがあります。
-その場合は、管理者にこのリポジトリを許可してもらってください。
+On Team and Enterprise plans, an administrator may restrict which marketplaces can be added.
+In that case, ask the administrator to allow this repository.
 
-## 更新
+## Update
 
-marketplace の情報を取り込んでから、mod を更新します。
-更新は Claude Code の再起動後に反映されます。
+Pull in the marketplace's information, then update the mod.
+The update takes effect after Claude Code restarts.
 
 ```bash
 claude plugin marketplace update claude-mods
@@ -54,15 +61,15 @@ claude plugin marketplace update claude-mods
 claude plugin update usage-meter@claude-mods
 ```
 
-## 注意
+## Caution
 
-mod は Claude Code と同じ権限で、サンドボックスなしに手元のマシンで動きます。
-インストールする前に、`plugins/` 以下のコードに目を通してください。
+Mods run on your machine with the same permissions as Claude Code, with no sandbox.
+Read through the code under `plugins/` before installing.
 
-## 開発
+## Development
 
-各 mod は `plugins/<name>/` にあり、ルートの `.claude-plugin/marketplace.json` に登録しています。
-手元の変更を試すときは、インストールせずにディレクトリを直接読み込めます。
+Each mod lives in `plugins/<name>/` and is registered in `.claude-plugin/marketplace.json` at the root.
+To try local changes, load the directory directly without installing.
 
 ```bash
 claude --plugin-dir ./plugins/usage-meter

@@ -1,33 +1,35 @@
 # usage-meter
 
-プロンプト入力欄の上の帯に、コンテキストの使用率と、5 時間制限と週間制限の使用率を常時表示する Claude Code の mod です。
-Fable のようにモデル別の週間制限があるアカウントでは、その使用率も並べます。
+English | [日本語](README.ja.md)
+
+A Claude Code mod that keeps the context usage and the 5-hour and weekly limit usage on view in the band above the prompt.
+For an account with per-model weekly limits, such as Fable's, it shows those too.
 
 ```text
 ctx ██░░░░░░░░ 20%   5h ██████┃░░░ 62% 2h13m (23:13)   7d ┃░░░░░░░░░ 5% 4d18h   Fable ┃░░░░░░░░░ 3%
 ```
 
-## 表示
+## Display
 
-- **ゲージ**：使用率の塗りに、ウィンドウの経過位置を示す縦線を重ねる。Desktop アプリでは SVG、ターミナルでは文字のバーで描く。ターミナルでは、すべてのメーターがバー付きで 1 行に収まらないときにバーを省く。Desktop アプリでは、メーターが 4 本以上になるとバーを短くし、それでも収まらない幅ではメーター単位で次の行へ送る
-- **色**：経過時間の割合から使用率を引いた差で決める。差が +10 以上なら緑、−15 未満か使用率 90% 以上なら赤、その間は黄
-- **残り時間**：リセットまでの残り時間を添える。5 時間制限には、リセット時刻を JST の 24 時間表記で続ける
-- **コンテキスト**：時間の軸がないので、使用率だけで色を決める（50% と 80% が境目）
-- **モデル別の週間制限**：モデル名をラベルにして、週間制限と同じ規則で描く。リセットが週間制限と同時なら残り時間を省き、ずれているときだけ添える
+- **Gauge**: the usage is filled in, with a vertical line over it marking how far the window has run. The desktop app draws it in SVG, the terminal as a bar of characters. In the terminal the bars are dropped when every meter with its bar does not fit on one line. In the desktop app the bars get shorter once there are four or more meters, and where even that does not fit, whole meters wrap to the next row
+- **Color**: set by the share of the window elapsed minus the usage. Green when that is +10 or more, red when it is under −15 or the usage is 90% or more, yellow in between
+- **Time left**: the time until the reset follows the meter. The 5-hour limit also gives the reset time on a 24-hour clock, in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`)
+- **Context**: with no time axis, its color comes from the usage alone (with 50% and 80% as the thresholds)
+- **Per-model weekly limits**: labeled with the model's name and drawn by the same rules as the weekly limit. The time left is dropped when the reset falls at the same time as the weekly limit's, and shown only when they differ
 
-## 使い方
+## Usage
 
-公式ドキュメントでは、mod には Claude Code v2.1.287 以降が必要とされています。
-実際には v2.1.286 でも動作を確認しており、v2.1.284 では mod が読み込まれませんでした。
+The official documentation says mods need Claude Code v2.1.287 or later.
+In practice it has been seen working on v2.1.286, while on v2.1.284 the mod was not loaded.
 
-Desktop アプリは、本体に同梱された Claude Code で動きます。
-帯が表示されるのは、Claude Code v2.1.286 以降を同梱した本体（2.19675.0 以降）で新しく始めたセッションです。
-本体を更新する前から続いているセッションは、再開しても帯が表示されないことがありました。
-その場合は、新しいセッションを開いてください。
+The desktop app runs on the Claude Code bundled with it.
+The band appears in sessions started afresh in an app that bundles Claude Code v2.1.286 or later (2.19675.0 or later).
+A session that has been running since before the app was updated sometimes showed no band, even when resumed.
+In that case, open a new session.
 
-### インストール
+### Install
 
-Claude Code のプロンプトで、次の 3 つを順に実行します。
+At the Claude Code prompt, run these three in order.
 
 ```text
 /plugin marketplace add HolyGrail/claude-mods
@@ -35,42 +37,42 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 /reload-plugins
 ```
 
-更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+How to update, and what to keep in mind, is in the [repository README](../../README.md).
 
-### インストールせずに試す
+### Try it without installing
 
-clone したリポジトリのルートで、次のように起動します。
+From the root of the cloned repository, start Claude Code like this.
 
 ```bash
 claude --plugin-dir ./plugins/usage-meter
 ```
 
-手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
-## 制約
+To always load the local code, put this directory's absolute path in `CLAUDE_CODE_PLUGIN_DIRS` under `env` in `~/.claude/settings.json`.
+## Limitations
 
-5 時間制限と週間制限はアカウント単位の値なので、読み取った値を `$.store` でマシン上のセッション全体に共有しています。
-まだ値を受け取っていないセッションも、ほかのセッションが保存した最新の値を表示し、別のセッションで使った分も 1 分以内に反映されます。
+The 5-hour and weekly limits are per account, so the readings are shared through `$.store` with every session on the machine.
+A session that has not received a reading yet shows the newest one another session saved, and usage in another session shows up within a minute.
 
-`$.store` には atomic な更新がないため、各セッションは自分専用のキーにだけ書き込み、ほかのセッションの値を上書きしません。
-それでも、キーの削除と書き込みがミリ秒単位で重なったときの競合は防げません。
-たとえば、8 日以上測定していなかったセッションが測定した瞬間に、別のセッションがそのキーを古いものとして削除すると、その測定値は共有されません。
-その場合も、各セッションの表示は次の測定で正しい値に戻ります。
+`$.store` has no atomic update, so each session writes only its own key and never overwrites another session's reading.
+Even so, a delete and a write of a key that overlap within milliseconds can still race.
+For example, if a session that has not measured for 8 days or more measures at the very moment another session deletes its key as stale, that reading is not shared.
+Even then, every session's display comes right again at the next measurement.
 
-mods API にはアカウントを識別する手段がないため、共有する値はアカウントを区別しません。
-同じマシンで別のアカウントに切り替えると、新しいセッションが最初の応答を受け取るまで、前のアカウントの値が表示されます。
+The mods API gives no way to tell accounts apart, so the shared readings do not either.
+After switching to another account on the same machine, the previous account's readings show until a new session receives its first response.
 
-### モデル別の週間制限
+### Per-model weekly limits
 
-モデル別の週間制限は、`/usage` 画面が読むのと同じ `https://api.anthropic.com/api/oauth/usage` から取得しています。
-mods API が渡す値は 5 時間制限と週間制限だけで、モデル別の値を含まないためです。
-認証には `$.session.authorize()` のハンドルを使うので、トークンが mod に渡ることはありません。
+The per-model weekly limits come from `https://api.anthropic.com/api/oauth/usage`, the same endpoint the `/usage` screen reads.
+That is because the mods API passes only the 5-hour and weekly limits, with no per-model values.
+It authenticates with the handle from `$.session.authorize()`, so no token ever reaches the mod.
 
-- 問い合わせはマシン全体でおよそ 5 分に 1 回で、読み取った値は `$.store` でセッション全体に共有する。表示は最大 5 分遅れる
-- API キー、サードパーティのプロバイダー、ゲートウェイで使っているセッションは問い合わせない。応答にモデル別の制限がないアカウントでは、メーターを出さない
-- メーターが 4 本になるぶん、ターミナルでバーを保つのに必要な幅が広がる。冒頭の例の値なら 101 桁からで、それより狭いとすべてのメーターがバーを省く
-- 公開された API ではないので、応答の形が変わるとメーターは更新されなくなる。そのメーターはリセット時刻に消える
+- The endpoint is asked about once every 5 minutes across the whole machine, and the reading is shared with every session through `$.store`. The display can lag by up to 5 minutes
+- Sessions on an API key, a third-party provider or a gateway do not ask. An account whose answer has no per-model limit gets no meter for it
+- The extra meter widens what the terminal needs to keep the bars. With the values in the example at the top, that is 101 columns; anything narrower drops the bars from every meter
+- This is not a public API, so if the shape of its answer changes, the meter stops updating. Such a meter disappears at its reset time
 
-## テスト
+## Tests
 
 ```bash
 cd plugins/usage-meter

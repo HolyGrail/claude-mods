@@ -1,260 +1,262 @@
-# pr-relay: #24 のあとに残ったマルチセッション競合の整理
+# pr-relay: the multi-session races left after #24
 
-対象: `plugins/pr-relay/hooks/register.js`（main `25a8969` 時点）、issue [HolyGrail/claude-mods#26](https://github.com/HolyGrail/claude-mods/issues/26)、PR [HolyGrail/claude-mods#24](https://github.com/HolyGrail/claude-mods/pull/24)
+English | [日本語](pr-relay-races.ja.md)
 
-このレポートは修正を実装しない。次に何から直すかを決める材料として、競合を一つずつ「起きる条件・再現の有無・影響・直し方・優先度」で整理する。
+Scope: `plugins/pr-relay/hooks/register.js` (as of main `25a8969`), issue [HolyGrail/claude-mods#26](https://github.com/HolyGrail/claude-mods/issues/26), PR [HolyGrail/claude-mods#24](https://github.com/HolyGrail/claude-mods/pull/24)
 
-**2026-11-04 追記:** このレポートを受けて、11 件すべてに手を入れた。修正の状況は「0. 修正状況」にまとめた。1 章以降は、調査した時点（main `25a8969`）の記述をそのまま残している。行番号や「いまのコード」は、その時点のものである。
+This report implements no fix. As material for deciding what to fix first, it sets out each race by its conditions, whether it was reproduced, its impact, how to fix it, and its priority.
 
-## 0. 修正状況
+**Added 2026-11-04:** Following this report, all 11 have been worked on. Where the fixes stand is in "0. Fix status". Sections 1 onward are left as written at the time of the investigation (main `25a8969`). Line numbers and "the current code" refer to that time.
 
-修正は 2 つの PR に分かれている。
+## 0. Fix status
 
-- [HolyGrail/claude-mods#45](https://github.com/HolyGrail/claude-mods/pull/45): N3・N2・N6・R2。マージ済み（pr-relay 0.10.1）。
-- [HolyGrail/claude-mods#47](https://github.com/HolyGrail/claude-mods/pull/47): N1・R1・R4・N5・R3・R5・N4。2026-11-04 時点で未マージ（pr-relay 0.10.2）。
+The fixes are split across two PRs.
 
-どちらの PR も「Part of #26」としているので、マージしても issue #26 は自動では閉じない。完全には閉じていない競合が残るためで、閉じるかどうかは下の「残る制限」を見て判断する。
+- [HolyGrail/claude-mods#45](https://github.com/HolyGrail/claude-mods/pull/45): N3, N2, N6, R2. Merged (pr-relay 0.10.1).
+- [HolyGrail/claude-mods#47](https://github.com/HolyGrail/claude-mods/pull/47): N1, R1, R4, N5, R3, R5, N4. Not merged as of 2026-11-04 (pr-relay 0.10.2).
 
-| ID | 状態 | PR | 直し方 | 残る制限 |
+Both PRs say "Part of #26", so merging them does not close issue #26 automatically. That is because some races are not fully closed; whether to close it is decided by the "Remaining limit" column below.
+
+| ID | State | PR | Fix | Remaining limit |
 |---|---|---|---|---|
-| N3 | 修正 | #45 | 最後の `session.end` で、まだターンが始まっていないプロンプトの印を取り消す（`undelivered`） | プロセスが kill されると `session.end` が走らず、印が残る |
-| N2 | 修正 | #45 | ノートのキーを `poll:<sessionId>:<instance>:<pr>` にする。`instance` は環境変数 `PR_RELAY_INSTANCE` に持つので、ワーカーの入れ替わりでは変わらない | 環境変数は子プロセスに引き継がれる。同じ会話をそのセッションの Bash の中から開き直すと、同じ `instance` になる |
-| N6 | 修正 | #45 | ノートを並列に読む。1 日以上 idle で、push の時刻を記録が数え終えた他セッションのノートを prune で消す | なし |
-| R2 | 修正 | #45 | GitHub に問い合わせる直前の時刻（`askedAt`）で、見ていない push を判定する | 問い合わせ中に終わった push があると、中継が 1 ラウンド（1 分）遅れる |
-| N1 | 修正 | #47 | 取り消しを記録に直接書かず `undo:<id>` に置き、次に記録を書くセッションが反映する。反映済みは `undone` に載せ、キーがストアに残る限り外さない | 反映が 1 ラウンド遅れる |
-| R1 | 一部 | #47 | 最後の `session.end` で、idle の書き込みを 200 ms・1 秒・3 秒の間隔でやり直す（`retireFinally`） | 4 回とも拒まれた場合と、kill された場合は残る。終了時にホストが最大 4.2 秒待つかは未確認 |
-| R4 | 一部 | #47 | ノートを、2 回続けて同じになるまで読み直す（`scanNotes`）。落ち着かなければ、そのラウンドは送らない | 最後に一致した読み出しから送るまでの間に書かれたノートは見えない |
-| N5 | 一部 | #47 | プロンプトを送る直前に、ノートをもう一度読んで同じ確認をする（`pushedElsewhere`） | 最後に読んでから `submit` までの、ストアの読み出し数回分の間は見えない |
-| R3 | 一部 | #47 | 最後の push ノートが拒まれたら、push が走っている間、1 秒・5 秒・15 秒の間隔でやり直す | 受け付けられたが返事が遅れた書き込みは防げない |
-| R5 | 一部 | #47 | 記録を書いている間、ノートに 60 秒ごとに `beat` を書く。ほかのセッションは最新の `beat` から 10 分身を引き、自分のリースも `beat` から数える（`beatWhile`・`leaseOf`） | `beat` が拒まれた・遅れた場合は残る。`beat` は記録の書き込み中だけで、GitHub への問い合わせだけでリースを使い切る場合は守らない |
-| N4 | 修正 | #47 | ノートに `monitored: true` を載せ、生きているノート（idle でなく 3 分以内）のどれかがそう言っていれば、レビューを CI モニターに任せる | 仕様として、CI モニターが動いている間は、端末側のセッションにはレビューを送らない |
+| N3 | Fixed | #45 | At the final `session.end`, take back the marks of prompts whose turn has not begun (`undelivered`) | If the process is killed, `session.end` does not run and the marks stay |
+| N2 | Fixed | #45 | Make the note key `poll:<sessionId>:<instance>:<pr>`. `instance` lives in the environment variable `PR_RELAY_INSTANCE`, so a worker replacement does not change it | Environment variables pass to child processes. Reopening the same conversation from within that session's Bash gives the same `instance` |
+| N6 | Fixed | #45 | Read the notes in parallel. `prune` deletes other sessions' notes that have been idle a day or more and whose push times the record has counted | None |
+| R2 | Fixed | #45 | Judge unseen pushes by the time just before GitHub is asked (`askedAt`) | A push that finishes during the query delays the relay by one round (one minute) |
+| N1 | Fixed | #47 | Do not write a take-back into the record directly; put it under `undo:<id>`, for the next session that writes the record to apply. Applied ones are listed in `undone` and stay listed for as long as their key is in the store | Applying is one round late |
+| R1 | Partly | #47 | At the final `session.end`, retry the idle write at 200 ms, 1 s and 3 s intervals (`retireFinally`) | Remains when all four are refused, and when the process is killed. Whether the host waits up to 4.2 s at exit is unverified |
+| R4 | Partly | #47 | Read the notes again until two reads in a row match (`scanNotes`). If they do not settle, that round sends nothing | A note written between the last matching read and the send is not seen |
+| N5 | Partly | #47 | Just before a prompt is sent, read the notes once more and make the same checks (`pushedElsewhere`) | The gap of a few store reads between the last read and the `submit` is not seen |
+| R3 | Partly | #47 | If the last push note is refused, retry at 1 s, 5 s and 15 s intervals while the push runs | A write that was accepted but answered late is not prevented |
+| R5 | Partly | #47 | While the record is being written, write a `beat` into the note every 60 seconds. Other sessions hold back for 10 minutes from the newest `beat`, and the session's own lease also counts from its `beat` (`beatWhile`, `leaseOf`) | Remains when a `beat` is refused or late. `beat` is written only during the record write, so a lease used up by the GitHub query alone is not protected |
+| N4 | Fixed | #47 | Put `monitored: true` in the note, and leave the review to the CI monitor if any live note (not idle, within 3 minutes) says so | By design, while the CI monitor runs, the terminal session is sent no reviews |
 
-すべてに共通する制限が 1 つある。0.10 系のセッションは、`undo:`・`beat`・`monitored` を読まず、記録を書くときに `undone` を落とす。更新の直後に新旧のセッションが混ざっている間は、旧いセッション経由で同じ競合が起こりうる。
+One limit is common to all of them. Sessions of the 0.10 series do not read `undo:`, `beat` or `monitored`, and drop `undone` when they write the record. Right after an update, while old and new sessions are mixed, the same races can happen through the old sessions.
 
-**再現テストについて:** `reports/pr-relay-races.repro.ts` は、修正前の「競合した結果」を期待値にしている。そのため、修正後のコードでは失敗するのが正しい。#47 のブランチ（`75dfb25`）で流した結果は、7 件中 5 件（R1・R4・N1・N3・N6）が失敗し、2 件が通った。通った 2 件の理由は次のとおり。
+**On the reproduction tests:** `reports/pr-relay-races.repro.ts` takes the pre-fix "outcome of the race" as its expectations. So on the fixed code it is right for them to fail. Run on the #47 branch (`75dfb25`), 5 of the 7 (R1, R4, N1, N3, N6) failed and 2 passed. The 2 passed for these reasons.
 
-- **`RACE N2`:** このテストが置くキーは 0.10 形式なので、修正後のコードは自分の古いノートとして無視し、通知を送る。期待値は満たして通るが、競合を再現していることにはならない。
-- **`RACE R5`:** このテストは、後継のセッションが引き継いで印を付けた状態を、ストアへ直接書き込んで模している。修正後は `beat` が着地している限り、新しい版のセッションは引き継がない。ところがテストが模す後継は `beat` を見ないので、0.10 系のセッションに引き継がれた場合と同じになり、重複はそのまま起きる。上の「すべてに共通する制限」の例である。
+- **`RACE N2`:** the key this test puts in place is in the 0.10 form, so the fixed code ignores it as its own old note and sends the notification. It meets the expectation and passes, but it does not reproduce the race.
+- **`RACE R5`:** this test imitates a successor session that took over and marked by writing to the store directly. After the fix, a session of the new version does not take over as long as the `beat` lands. But the successor the test imitates does not look at `beat`, so it is the same as being taken over by a session of the 0.10 series, and the duplicate happens as before. It is an example of the "limit common to all of them" above.
 
-修正後の振る舞いは、#45 と #47 で `tests/pr-relay.test.ts` に足したテストが確かめている。
+The behavior after the fix is checked by the tests #45 and #47 added to `tests/pr-relay.test.ts`.
 
-なお、#47 ではテストファイルの先頭のヘルパーが増え、3 章の「先頭 378 行」では切れ目が合わない。新しいコードで流すときは、最初の `test(` の行の手前で切る。
+Note that #47 added helpers at the top of the test file, so the "first 378 lines" of section 3 no longer fall at the boundary. When running against the new code, cut just before the first `test(` line.
 
 ```bash
 n=$(grep -n "^test(" /tmp/pr-relay.test.ts.bak | head -1 | cut -d: -f1)
 { head -n $((n-1)) /tmp/pr-relay.test.ts.bak; cat ../../reports/pr-relay-races.repro.ts; } > tests/pr-relay.test.ts
 ```
 
-**根本対策（6 章）について:** ロック方式への作り直しはしていない。ノート方式のまま、窓を狭め、取り消しと引き継ぎの規則を足す形で直した。R4・N5・R5 を完全に閉じるには、いまも 6 章のアトミックな操作が要る。
+**On the root fix (section 6):** there was no rebuild around a lock. The fixes keep the note scheme and narrow the windows, adding rules for take-backs and takeovers. Closing R4, N5 and R5 completely still needs the atomic operations of section 6.
 
-## 1. 結論
+## 1. Conclusion
 
-issue に挙がっている 5 件に加え、コードを読んで 6 件の競合を見つけた。そのうち 7 件はテストハーネスで再現できた。残りはコードを読んだうえでの推測である。
+Besides the 5 listed in the issue, reading the code turned up 6 more races. 7 of them were reproduced in the test harness. The rest are inferences from reading the code.
 
-issue #26 には「どの場合も最悪で古い通知か遅れた通知が 1 回届くだけで、取りこぼしはない」とある。この前提は崩れる。**N3 では通知が取りこぼされ、N1 では取りこぼしも重複も起きうる。** N2 は条件がそろうと、イベントのたびに重複が出る。
+Issue #26 says "in every case the worst is one stale or late notification, and nothing is lost". That premise does not hold. **In N3 a notification is lost, and in N1 both a loss and a duplicate can happen.** N2, when its conditions are met, duplicates at every event.
 
-| ID | 競合 | 出どころ | 確認 | 最悪の結果 | 起きやすさ | 優先度 |
+| ID | Race | Source | Checked | Worst outcome | Likelihood | Priority |
 |---|---|---|---|---|---|---|
-| N3 | 選ばれたセッションが、キューに積んだプロンプトを届ける前に終了すると、印だけが残る | 新規 | 再現（ホスト側の挙動は推測） | **取りこぼし** | 中（作業中のセッションを閉じるだけで起きる） | **P1** |
-| N2 | 同じ会話を 2 つのプロセスで開くと、ノートのキーが重なり、選挙が成り立たない | 新規 | 再現（片側） | 毎回の重複 | 中（`--resume` を 2 か所で開いたとき） | **P1** |
-| N6 | 過去のセッション ID のノートが溜まり続け、ポーリングのたびに 1 件ずつ順番に 3 回読まれる | 新規 | 再現 | すべての競合の窓が広がる | 高（`/clear` のたびに ID が増える） | P2 |
-| R2 | `seenAt` を GraphQL の応答のあとに取っている | #26 | 推測 | 古い通知が 1 回 | 低 | P2（直すのは安い） |
-| N4 | CI モニターの有無をセッションごとにしか知らないため、選ばれたセッション次第で結果が変わる | 新規 | 推測 | 重複（デスクトップと端末が混在しているとき） | 中 | P2 |
-| N1 | 印を取り消すときの読んで・変えて・書く処理が、別セッションの新しい印を上書きする | 新規 | 再現 | 重複、または取りこぼし | 低 | P3 |
-| R1 | `session.end` での最後の書き込みが失敗すると、ノートが `running` のまま残る | #26 | 再現 | 最大 10 分の遅延 | 低 | P3 |
-| R4 | 最後のノート走査がスナップショットではない | #26 | 再現 | 古い通知が 1 回 | 低 | P3 |
-| N5 | 最後の走査から実際に送るまでの間に、他セッションの push を見ていない | 新規 | 推測 | 古い通知が 1 回 | 低 | P3 |
-| R3 | 最後の push ハートビートを待たずに投げている | #26 | 推測 | 遅延、または古い通知 | 極低 | P4 |
-| R5 | リースを過ぎて書いた記録を取り消すと、後継のセッションが付けた印まで消える | #26 | 再現 | 重複 1 回 | 極低 | P4（保留でよい） |
+| N3 | When the elected session ends before delivering a prompt it queued, only the mark is left | New | Reproduced (the host's behavior is inferred) | **Loss** | Medium (closing a busy session is enough) | **P1** |
+| N2 | When the same conversation is open in two processes, the note keys collide and the election fails | New | Reproduced (one side) | A duplicate every time | Medium (when `--resume` is opened in two places) | **P1** |
+| N6 | Notes under past session ids keep piling up, and every poll reads them one at a time, three times | New | Reproduced | Every race's window widens | High (each `/clear` adds an id) | P2 |
+| R2 | `seenAt` is taken after the GraphQL answer | #26 | Inferred | One stale notification | Low | P2 (cheap to fix) |
+| N4 | Whether the CI monitor runs is known only per session, so the outcome depends on which session is elected | New | Inferred | Duplicate (when desktop and terminal are mixed) | Medium | P2 |
+| N1 | The read, change and write of a take-back overwrites another session's newer marks | New | Reproduced | Duplicate, or loss | Low | P3 |
+| R1 | If the last write at `session.end` fails, the note stays `running` | #26 | Reproduced | Up to 10 minutes' delay | Low | P3 |
+| R4 | The last scan of the notes is not a snapshot | #26 | Reproduced | One stale notification | Low | P3 |
+| N5 | Other sessions' pushes between the last scan and the actual send are not seen | New | Inferred | One stale notification | Low | P3 |
+| R3 | The last push heartbeat is fired without being awaited | #26 | Inferred | Delay, or a stale notification | Very low | P4 |
+| R5 | Taking back a record written past the lease also erases the marks a successor session made | #26 | Reproduced | One duplicate | Very low | P4 (can be deferred) |
 
-おすすめの順番は「7. 直す順番の提案」にまとめた。
+The recommended order is in "7. Proposed order of fixes".
 
-## 2. 前提: 選挙のしくみ（おさらい）
+## 2. Background: how the election works (recap)
 
-- 各セッションは、ポーリングの前に自分のノート `poll:<sessionId>:<pr>` を書く（`notePoll`、`register.js:916`）。中身は `{ at, since, pending, running, ... }`。
-- GraphQL の応答が来たら、他のノートを読む（`readNotes`、`register.js:1187`）。自分より前に始まったノートが 30 秒以内にあるか、10 分以内でまだ `running` のものがあれば、自分は身を引く（defer）。
-- 選ばれたセッション（リーダー）だけが、共有の記録 `pr:<url>` を読んで印を付けて書き戻し（`register.js:751-779`）、それからプロンプトを送る（`deliver`）。送れなかったら印を取り消す（`takeBack`）。
-- `$.store` には、アトミックな更新も、条件付きの書き込みや削除も、スナップショット読み出しもない。セッション内では `exclusive` が書き込みを直列に並べるが、セッションをまたぐ排他はどこにもない。
-- リース: ポーリング開始から `RUNNING_MS - ROUND_MS`（9 分 30 秒）を過ぎた処理は、何も送らない（`lapsed`、`register.js:839`）。
+- Before polling, each session writes its own note `poll:<sessionId>:<pr>` (`notePoll`, `register.js:916`). It holds `{ at, since, pending, running, ... }`.
+- When the GraphQL answer comes, the session reads the other notes (`readNotes`, `register.js:1187`). If a note that started before its own exists within 30 seconds, or one within 10 minutes is still `running`, it holds back (defers).
+- Only the elected session (the leader) reads the shared record `pr:<url>`, marks it and writes it back (`register.js:751-779`), and then sends the prompt (`deliver`). If the send fails, it takes the marks back (`takeBack`).
+- `$.store` has no atomic update, no conditional write or delete, and no snapshot read. Within a session `exclusive` serializes the writes, but nothing excludes across sessions.
+- Lease: work past `RUNNING_MS - ROUND_MS` (9 min 30 s) from the start of the poll sends nothing (`lapsed`, `register.js:839`).
 
-## 3. 再現の方法
+## 3. How to reproduce
 
-再現テストは `reports/pr-relay-races.repro.ts` にある。既存テストの `stubWorld` と定数を使うので、テストファイルの末尾に足して動かす。どのテストも「いまの競合した結果」を期待値にしているので、直すと赤くなる。
+The reproduction tests are in `reports/pr-relay-races.repro.ts`. They use the existing tests' `stubWorld` and constants, so they run appended to the end of the test file. Every test takes "the current outcome of the race" as its expectation, so fixing a race turns it red.
 
-既存のテストファイルにそのまま足すと、ファイルの最後で `the file ran to its end` が 1 件失敗する。これは既存のスイートの問題で、何もしない 3 秒のテストを 1 件足すだけでも同じ失敗が出る（付記 A）。再現テストは、ヘルパー部分（先頭 378 行）とつないで単独で走らせるのが確実である。
+Appended straight to the existing test file, one `the file ran to its end` fails at the end of the file. That is a problem of the existing suite: adding a single 3-second test that does nothing gives the same failure (Appendix A). The reliable way is to join the reproduction tests to the helper part (the first 378 lines) and run them alone.
 
 ```bash
 cd plugins/pr-relay
 cp tests/pr-relay.test.ts /tmp/pr-relay.test.ts.bak
 { head -n 378 /tmp/pr-relay.test.ts.bak; cat ../../reports/pr-relay-races.repro.ts; } > tests/pr-relay.test.ts
-claude plugin test     # 7 pass（すべて競合が起きたことを示す）
+claude plugin test     # 7 pass (each showing the race happened)
 cp /tmp/pr-relay.test.ts.bak tests/pr-relay.test.ts
 ```
 
-確認した環境: Claude Code 2.1.318。既存のスイートは単独で 344 pass。
+Environment checked: Claude Code 2.1.318. The existing suite alone: 344 pass.
 
-テストハーネスは 1 プロセス分のモジュールしか動かせない。そのため「別のセッション」は、ストアに先にノートや記録を書いておくか、`gets`/`sets` フックの途中で書き込んで模している。
+The test harness can run the module of only one process. So "another session" is imitated by writing notes or records to the store in advance, or by writing in the middle of `gets`/`sets` hooks.
 
-## 4. issue #26 に挙がっている競合
+## 4. Races listed in issue #26
 
-### R1. `session.end` での最後の書き込みが失敗すると、ノートが `running` のまま残る
+### R1. If the last write at `session.end` fails, the note stays `running`
 
-- **確認**: 再現済み（`RACE R1`）。他のセッションがその後 10 分待たされる部分は、既存テストの `a poll of another session still running past its round keeps holding back later ones` で確かめられている。
-- **起きる条件**: ポーリングの途中（GraphQL 待ち）か `git push` の途中でセッションが終わり、`retire` の書き込み（`register.js:1013`）を `$.store` が拒む。`writeNote` は strict でない呼び方なので、失敗は飲み込まれる。`dirty` が立っても、終了したモジュールでは誰も再試行しない。
-  - 同じ結果はプロセスが kill されたときにも起きる。この場合は、書き込みの失敗すら要らない。
-  - 前の書き込みが詰まっていて、`noteWrites` の列で後ろに並んだ `retire` をホストの終了タイムアウトが待たない場合も、同じ結果になる（推測）。
-- **影響**: そのプルリクエストを見ている他のセッションが、最大 `RUNNING_MS`（10 分）身を引き続ける。push 中に終わった場合は、`pending[].running` が全員の中継を最大 10 分止める。通知は遅れるが、失われはしない。
-- **直し方**:
-  1. `session.end` では `retire` を strict で呼び、失敗したら短い間隔（例: 200 ms、500 ms、1 s）で数回やり直す。
-  2. 根本的には、`running` の保持時間を短くする。ポーリング中は 60 秒ごとにノートの `at` を上書きするハートビートを打ち、他のセッションは「ハートビートが 2 回途切れたら死んだとみなす」ようにする。そうすれば `RUNNING_MS` を 10 分から 2〜3 分に縮められ、kill された場合の遅延も同じだけ短くなる。リースの計算（`lapsed`）は、ハートビートの時刻を基準に変える。
-- **優先度**: P3。1 はすぐ入れられる。2 は R3 と一緒に設計するのがよい。
+- **Checked**: reproduced (`RACE R1`). That other sessions are then kept waiting 10 minutes is checked by the existing test `a poll of another session still running past its round keeps holding back later ones`.
+- **Conditions**: the session ends during a poll (waiting on GraphQL) or during a `git push`, and `$.store` refuses the `retire` write (`register.js:1013`). `writeNote` is called non-strict, so the failure is swallowed. Even with `dirty` set, nobody retries in a module that has ended.
+  - The same outcome follows when the process is killed. Then not even a failed write is needed.
+  - The same outcome also follows when an earlier write is stuck and the host's exit timeout does not wait for the `retire` queued behind it in `noteWrites` (inferred).
+- **Impact**: other sessions watching that pull request keep holding back for up to `RUNNING_MS` (10 minutes). If the session ended during a push, `pending[].running` stops everyone's relays for up to 10 minutes. Notifications are late but not lost.
+- **Fix**:
+  1. At `session.end`, call `retire` strict, and on failure retry a few times at short intervals (for example 200 ms, 500 ms, 1 s).
+  2. At the root, shorten how long `running` holds. While polling, beat a heartbeat that overwrites the note's `at` every 60 seconds, and have other sessions "take it as dead after two missed heartbeats". Then `RUNNING_MS` can shrink from 10 minutes to 2 or 3, and the delay after a kill shrinks with it. The lease computation (`lapsed`) changes to count from the heartbeat's time.
+- **Priority**: P3. 1 can go in at once. 2 is best designed together with R3.
 
-### R2. `seenAt` を GraphQL の応答のあとに取っている
+### R2. `seenAt` is taken after the GraphQL answer
 
-- **確認**: 推測。モックの時計は即座に答えるので、時計の読み出しを遅らせる再現は作れなかった。
-- **起きる条件**: `query` の中で `seenAt = await $.clock.now()` を取るのは、`gh` プロセスが終わって JSON をパースしたあとである（`register.js:1450`）。その間（`gh` の後片付けやイベントループの遅れ）に終わった別セッションの push は、`doneAt < seenAt` になる。その結果、`unseen`（`register.js:901`）が偽になり、「GitHub はこの push の後の head を見せた」と扱われる。
-- **影響**: 実際に GitHub が見せたのは、push で置き換えられる前の head である。そのため、push 前の head に対するレビューや 👍 が「新しいもの」として 1 回中継されうる。
-- **直し方**: 時刻を 2 つに分ける。
-  - `askedAt`: `gh` を呼ぶ直前に取る。`unseen` の判定（`doneAt >= askedAt` なら保留）に使う。早めに倒れるので、安全側になる。
-  - `answeredAt`: いまと同じ位置で取る。`record.headAt` と `lastHeadAt` に使う。
-  - 片方の時刻だけを早めると、`pushCounts` の `recordHead` 判定（`register.js:864`）が逆向きに壊れるので、2 つに分ける必要がある。
-- **優先度**: P2。数行の変更で、既存テストへの影響も小さい。
+- **Checked**: inferred. The mock clock answers at once, so a reproduction that delays reading the clock could not be built.
+- **Conditions**: within `query`, `seenAt = await $.clock.now()` is taken after the `gh` process has exited and its JSON has been parsed (`register.js:1450`). Another session's push that finishes in between (`gh`'s cleanup, event loop delays) gets `doneAt < seenAt`. As a result `unseen` (`register.js:901`) is false, and it is treated as "GitHub showed the head after this push".
+- **Impact**: what GitHub actually showed was the head before the push replaced it. So a review or 👍 on the head before the push can be relayed once as "new".
+- **Fix**: split the time in two.
+  - `askedAt`: taken just before calling `gh`. Used for the `unseen` check (hold back if `doneAt >= askedAt`). It errs early, so it errs on the safe side.
+  - `answeredAt`: taken where it is now. Used for `record.headAt` and `lastHeadAt`.
+  - Moving only one time earlier breaks the `recordHead` check of `pushCounts` (`register.js:864`) the other way, so the two need to be split.
+- **Priority**: P2. A change of a few lines, with little effect on the existing tests.
 
-### R3. 最後の push ハートビートを待たずに投げている
+### R3. The last push heartbeat is fired without being awaited
 
-- **確認**: 推測。
-- **起きる条件**: `tool.call` Bash の中では、push の開始を 4 回のノート書き込みで公開している。最後の `publish()`（`register.js:301`）だけは await していない。それまでの 3 回でストアが遅く、最後の 1 回も遅れるか拒まれると、他のセッションには古い `push.at` が残る。他のセッションは `push.at >= note.at - RUNNING_MS` で push を「まだ走っている」とみなすので、実際より早く「走りっぱなしで死んだ push」として扱ってしまう。
-- **影響**: 10 分近く続く push か、ストアが何分も詰まった場合に限られる。実際に起きることはまずない。
-- **直し方**: R1 のハートビート方式に合わせる。push が走っている間は 60 秒ごとにノートを書き直し、他のセッションは最後のハートビートの時刻で判断する。
-- **優先度**: P4。R1 の 2 と一緒に片付ける。
+- **Checked**: inferred.
+- **Conditions**: within the Bash `tool.call`, the start of a push is published through four note writes. Only the last `publish()` (`register.js:301`) is not awaited. If the store is slow for the first three and the last is late or refused too, other sessions are left with a stale `push.at`. Other sessions take a push as "still running" by `push.at >= note.at - RUNNING_MS`, so they treat it as "a push that hung and died" sooner than it really is.
+- **Impact**: limited to a push that runs close to 10 minutes, or a store stuck for minutes. It is very unlikely to actually happen.
+- **Fix**: align with R1's heartbeat scheme. While a push runs, rewrite the note every 60 seconds, and have other sessions judge by the time of the last heartbeat.
+- **Priority**: P4. Settle it together with R1's 2.
 
-### R4. 最後のノート走査がスナップショットではない
+### R4. The last scan of the notes is not a snapshot
 
-- **確認**: 再現済み（`RACE R4`）。最後の `readNotes` の途中、`store.keys()` で一覧を取ったあとに、4 つ目のセッションが走っている push のノートを書く。それでも、レビューのプロンプトが送られた。
-- **起きる条件**: `readNotes` は、一覧（`keys()`）を取ってから 1 件ずつ順に `get` する（`register.js:1188-1194`）。一覧を取ったあとに作られたキーは見えない。読み終わったキーが、あとで書き換えられた場合も見えない。
-- **影響**: 他のセッションで始まった push の直前の head について、レビューや 👍 が 1 回届く。窓の幅は、ストアの読み出し数回分（ミリ秒単位）。ただし N6 があると、この窓は秒単位まで広がる。
-- **直し方**:
-  1. 窓を狭める。`get` を `Promise.all` で並列にし、読み終わったあとにもう一度 `keys()` を取って、一覧が変わっていたら読み直す。
-  2. N6 を直して、読むキーの数そのものを減らす。
-  3. 完全に閉じるには、セッションをまたぐロックが必要になる（6 章）。
-- **優先度**: P3。1 と 2 は安い。
+- **Checked**: reproduced (`RACE R4`). During the last `readNotes`, after `store.keys()` has listed the keys, a fourth session writes a note of a running push. The review prompt was still sent.
+- **Conditions**: `readNotes` lists the keys (`keys()`) and then `get`s them one at a time (`register.js:1188-1194`). A key created after the listing is not seen. Nor is a key rewritten after it was read.
+- **Impact**: a review or 👍 on the head just before a push started in another session arrives once. The window is a few store reads wide (milliseconds). With N6, however, it widens to seconds.
+- **Fix**:
+  1. Narrow the window. Make the `get`s parallel with `Promise.all`, and after reading take `keys()` again, reading again if the list changed.
+  2. Fix N6, reducing the number of keys read in the first place.
+  3. Closing it completely needs a lock across sessions (section 6).
+- **Priority**: P3. 1 and 2 are cheap.
 
-### R5. リースを過ぎて書いた記録を取り消すと、後継のセッションが付けた印まで消える
+### R5. Taking back a record written past the lease also erases the marks a successor session made
 
-- **確認**: 再現済み（`RACE R5`）。記録の書き込みに 10.5 分かかっている間に、後継のセッションが同じレビューに印を付けて送る。そのあとで自分の書き込みが着地し、取り消しが走って印が空になる。次のラウンドでは、自分のセッションも同じレビューを送る（合計 2 回）。
-- **起きる条件**: `$.store.set` が 9 分 30 秒以上詰まり、そのあいだに別のセッションが選挙を引き継いで印を付ける。
-- **影響**: 重複が 1 回。取り消しをやめると、逆に「後継が自分の印を見て送らない」場合に取りこぼしになる。#24 は重複のほうを選んでいる。
-- **直し方**: 条件付きの書き込み（CAS）か、セッションをまたぐロックが必要になる（6 章）。いまの API の範囲でできる緩和策は一つある。取り消す直前に記録を読み直し、`record.at` が自分の `now` でなければ取り消さない。ただし、自分の遅い書き込みのほうが後に着地するこの再現の筋書きには効かない。
-- **優先度**: P4。起きる条件がきわめて狭いので、既知の制限のままでよい。
+- **Checked**: reproduced (`RACE R5`). While the record write takes 10.5 minutes, a successor session marks the same review and sends it. Then this session's write lands, the take-back runs, and the marks are emptied. In the next round this session sends the same review too (twice in all).
+- **Conditions**: `$.store.set` is stuck for 9 min 30 s or more, and meanwhile another session takes the election over and marks.
+- **Impact**: one duplicate. Dropping the take-back instead loses the notification when "the successor sees this session's mark and does not send". #24 chose the duplicate.
+- **Fix**: needs a conditional write (CAS) or a lock across sessions (section 6). One mitigation fits within the current API: read the record again just before taking back, and do not take back unless `record.at` is this session's `now`. It does not help in this reproduction's scenario, however, where this session's slow write lands later.
+- **Priority**: P4. The conditions are very narrow, so it can stay a known limit.
 
-## 5. コードから新たに見つけた競合
+## 5. Races newly found in the code
 
-### N1. 印を取り消すときの読んで・変えて・書く処理が、別セッションの新しい印を上書きする
+### N1. The read, change and write of a take-back overwrites another session's newer marks
 
-- **確認**: 再現済み（`RACE N1`）。手順は次のとおり。
-  1. 自分が送ったプロンプトが落とされ（drop）、`takeBack` が記録を読む。
-  2. それを書き戻すまでの間に、別のセッションがレビュー 2 の印を書く。
-  3. `takeBack` の書き戻しがレビュー 2 の印を消す。
-  4. 次のラウンドで、レビュー 2 がもう一度送られる。
-- **起きる条件**: `takeBack`（`register.js:1395`）は記録全体を読み、`undo` を当てて、まるごと書き戻す。`exclusive` が直列にするのは同じセッションの中だけである。`deliver` はプロンプトのターンが始まるまで解決しないので、`takeBack` が走るのは、印を付けてから数分後になることがある。その頃には、次のラウンドのリーダー（別のセッションかもしれない）が記録を書いている。印を取り消すきっかけは、次のどれでもよい。
-  - プロンプトが落とされた（drop）
-  - 詳細の取得中に自分が push した
-  - 会話が切り替わった
-- **影響**: 順序が逆になると、取りこぼしも起きる。他のセッションが取り消し前の記録を読み、取り消しのあとに書き戻すと、取り消しが消える。その結果、落とされたプロンプトは二度と送られない。
-- **直し方**: 記録の読み・変更・書き込みをやめて、印をイベントごとのキーに分ける。
-  - 例: `sent:<pr>:review:<id>`、`sent:<pr>:approved`（値は時刻）、`sent:<pr>:usage`。
-  - リーダーは、自分が送ったイベントのキーだけを書く。取り消しは、そのキーを消すだけにする。
-  - `since`、`head`、`headAt` だけは記録に残す。どれも単調に増える値なので、後勝ちになっても害が小さい。
-  - こうすれば、取り消しが他人の印に触れなくなる。
-- **優先度**: P3。起きる条件は狭いが、取りこぼしの経路の一つである。記録の形式が変わるので、移行（古い `reviews[]` を読むこと）も要る。
+- **Checked**: reproduced (`RACE N1`). The steps are these.
+  1. The prompt this session sent is dropped, and `takeBack` reads the record.
+  2. Before it writes back, another session writes the mark for review 2.
+  3. `takeBack`'s write-back erases the mark for review 2.
+  4. In the next round, review 2 is sent again.
+- **Conditions**: `takeBack` (`register.js:1395`) reads the whole record, applies `undo` and writes it back whole. `exclusive` serializes only within the same session. `deliver` does not resolve until the prompt's turn begins, so `takeBack` may run minutes after the marks were made. By then the leader of the next round (possibly another session) is writing the record. Any of these can set off a take-back.
+  - The prompt was dropped
+  - This session pushed while fetching the details
+  - The conversation was switched
+- **Impact**: in the reverse order, a loss happens too. If another session reads the record before the take-back and writes it back after, the take-back is erased. The dropped prompt is then never sent again.
+- **Fix**: stop reading, changing and writing the record, and split the marks into a key per event.
+  - For example `sent:<pr>:review:<id>`, `sent:<pr>:approved` (the value a time), `sent:<pr>:usage`.
+  - The leader writes only the keys of the events it sent. A take-back only deletes that key.
+  - Only `since`, `head` and `headAt` stay in the record. Each only ever grows, so the last writer winning does little harm.
+  - This way a take-back never touches another session's marks.
+- **Priority**: P3. The conditions are narrow, but it is one of the paths to a loss. The record's format changes, so a migration (reading the old `reviews[]`) is needed too.
 
-### N2. 同じ会話を 2 つのプロセスで開くと、ノートのキーが重なり、選挙が成り立たない
+### N2. When the same conversation is open in two processes, the note keys collide and the election fails
 
-- **確認**: 再現済み（`RACE N2`、片側だけ）。自分と同じキー `poll:session-b:<pr>` で、1 秒前に始まった `running` のノートを置いておく。それでも、自分は身を引かずに送った。もう片方のプロセスも同じように振る舞うはずだが、ハーネスでは 1 プロセスしか動かせないので、対称性からの推測である。
-- **起きる条件**: ノートのキーはセッション ID だけで決まる（`register.js:918`）。`readNotes` は自分のキーを除外する（`register.js:1188`）。そのため、同じセッション ID を持つ 2 つのプロセスは、互いのノートを見ない。しかも、同じキーを交互に上書きする。同じ ID を持つ例は、次のとおり。
-  - 同じ会話を `claude --resume <id>` で 2 つの端末から開いた
-  - デスクトップと端末で同じ会話を開いた
-  - ワーカーが入れ替わるときに、旧ワーカーと新ワーカーが重なった
-- **影響**: 両方のプロセスが毎ラウンドのリーダーになり、レビュー・👍・マージのたびに両方が起こされる。ストアの記録も 2 プロセスで取り合いになり、N1 と同じ上書きが起きる。#24 が直したかった「同じレビューで 2 回起こされる」問題が、この条件ではそのまま残っている。
-- **直し方**: ノートのキーに、プロセスごとの識別子を入れる。
-  - 例: モジュールを読み込んだときに `instance = pushId(now)` を作り、`poll:<sessionId>:<instance>:<pr>` とする。
-  - ワーカーが入れ替わったときの引き継ぎ（`notePoll` が前のノートを読む処理）は、`poll:<sessionId>:` で始まるキーを探すように変える。
-  - `prune` の「自分のノート」の判定も、セッション ID の前方一致で変わらず動く。
-- **優先度**: P1。変更は局所的で、起きたときは毎回重複する。
+- **Checked**: reproduced (`RACE N2`, one side only). A `running` note started 1 second earlier is put under this session's own key `poll:session-b:<pr>`. This session still sent without holding back. The other process should behave the same way, but the harness can run only one process, so that is inferred from symmetry.
+- **Conditions**: the note key is decided by the session id alone (`register.js:918`). `readNotes` excludes the session's own key (`register.js:1188`). So two processes with the same session id do not see each other's notes. What is more, they overwrite the same key in turn. Examples with the same id:
+  - The same conversation opened from two terminals with `claude --resume <id>`
+  - The same conversation opened in the desktop app and a terminal
+  - The old and new workers overlapping during a worker replacement
+- **Impact**: both processes become the leader every round, and both are woken at every review, 👍 and merge. The two processes also fight over the store's record, causing the same overwrites as N1. The problem #24 meant to fix, "woken twice for the same review", remains as it was under these conditions.
+- **Fix**: put a per-process identifier in the note key.
+  - For example, make `instance = pushId(now)` when the module loads, and use `poll:<sessionId>:<instance>:<pr>`.
+  - The takeover at a worker replacement (where `notePoll` reads the previous note) changes to look for keys starting with `poll:<sessionId>:`.
+  - `prune`'s check for "this session's own notes" keeps working as a session id prefix match.
+- **Priority**: P1. The change is local, and when it happens it duplicates every time.
 
-### N3. 選ばれたセッションが、キューに積んだプロンプトを届ける前に終了すると、印だけが残る
+### N3. When the elected session ends before delivering a prompt it queued, only the mark is left
 
-- **確認**: 再現済み（`RACE N3`）。プロンプトのターンが始まらないうちに `session.end`（`prompt_input_exit`）を送ると、記録には印が残った。そのあと別のセッションが同じプルリクエストを見ても、レビューは送られなかった。終了したときに、ホストがキューの中のプラグインプロンプトをどう扱うか（`$.prompt.submit` を drop で解決するのか、そのまま放置するのか）は確かめていない。ここは推測である。
-- **起きる条件**: リーダーは、送る前に記録へ印を付ける。`deliver` の `submit` はターンが始まってから解決するので、リーダーが作業中だと、プロンプトはキューで待つ。その間にユーザーがそのセッションを閉じると、次のどちらかになる。
-  - `submit` が解決しない
-  - drop で解決しても、モジュールが止まった後なので `takeBack` が書けない
-  - リーダーは「ポーリングを最初に始めたセッション」なので、ユーザーが注目していないセッションや、もうすぐ閉じるセッションが選ばれることは普通にある。
-- **影響**: **取りこぼし**。他のセッションは印を見て、二度と送らない。レビューが付いたことを誰も知らされない。
-- **直し方**:
-  1. 届けている途中の送信を、モジュールの中で `inFlight` として持つ。最後の `session.end` では、ノートを idle にする前に、まだターンが始まっていないものすべてを `takeBack` し、await してから終える。次のラウンドで、他のセッションが送り直す。
-  2. kill に備えるなら、印に `by: <sessionId>` と `deliveredAt` を持たせる。`deliveredAt` は、ターンが始まって `submit` が解決したときに書き足す。他のセッションは「`deliveredAt` がなく、`by` のノートが idle か古い印」を未送信とみなして送り直す。N1 のイベントごとのキーと一緒に入れると、設計がきれいになる。
-- **優先度**: P1。通常の操作（作業中のセッションを閉じる）で起き、結果が取りこぼしになるので、いちばん重い。
+- **Checked**: reproduced (`RACE N3`). When `session.end` (`prompt_input_exit`) was sent before the prompt's turn began, the mark stayed in the record. When another session then watched the same pull request, the review was not sent. How the host treats queued plugin prompts at exit (whether it resolves `$.prompt.submit` as dropped, or leaves it) has not been checked. That part is inferred.
+- **Conditions**: the leader marks the record before sending. `deliver`'s `submit` resolves after the turn begins, so while the leader is busy the prompt waits in the queue. If the person closes that session meanwhile, one of these follows.
+  - `submit` never resolves
+  - Even if it resolves as dropped, the module has stopped, so `takeBack` cannot write
+  - The leader is "the session that started polling first", so it is common for a session the person is not looking at, or one about to close, to be elected.
+- **Impact**: **loss**. Other sessions see the mark and never send. Nobody is told the review came.
+- **Fix**:
+  1. Keep the sends in delivery in the module as `inFlight`. At the final `session.end`, before making the note idle, `takeBack` everything whose turn has not begun, and await it before ending. In the next round another session sends it again.
+  2. To cover a kill, give the mark `by: <sessionId>` and `deliveredAt`. `deliveredAt` is added when the turn begins and `submit` resolves. Other sessions take "a mark with no `deliveredAt` whose `by` note is idle or old" as unsent and send it again. Put in together with N1's key per event, the design comes out clean.
+- **Priority**: P1. It happens in normal use (closing a busy session) and the outcome is a loss, so it is the heaviest.
 
-### N4. CI モニターの有無をセッションごとにしか知らないため、選ばれたセッション次第で結果が変わる
+### N4. Whether the CI monitor runs is known only per session, so the outcome depends on which session is elected
 
-- **確認**: 推測。
-- **起きる条件**: `monitored`（`register.js:136`）は、そのセッションのデスクトップの状態や `<ci-monitor-event>` だけで決まり、ストアで共有されない。`relay` は `monitored.has(pr.id)` を見て、レビューを黙って印だけ付けるか、プロンプトで送るかを切り替える（`register.js:1225`）。同じプルリクエストを、CI モニターが自動修正しているデスクトップのセッション A と、端末のセッション B が見ている場合を考える。
-  - B がリーダーになると、B はレビューのプロンプトを送り、A には CI モニターがレビューを届ける。同じレビューで 2 つのセッションが動き出す（重複）。
-  - A がリーダーになると、B には何も届かない。これは設計どおりとも言える。
-- **影響**: どちらになるかは、ポーリングの順番で毎回変わる。挙動が予測できない。
-- **直し方**: ノートに `monitored: true` を載せ、リーダーは「そのプルリクエストのどれか生きているノートが監視中と言っていれば、監視中として扱う」ようにする。仕様として「CI モニターがある場合は、端末側には送らない」でよいかは、決めておく必要がある。
-- **優先度**: P2。
+- **Checked**: inferred.
+- **Conditions**: `monitored` (`register.js:136`) is decided only by that session's desktop state and `<ci-monitor-event>`, and is not shared through the store. `relay` looks at `monitored.has(pr.id)` to switch between silently marking a review and sending it in a prompt (`register.js:1225`). Take a desktop session A where the CI monitor auto-fixes the pull request, and a terminal session B, both watching it.
+  - If B becomes the leader, B sends the review prompt while the CI monitor delivers the review to A. Two sessions set off on the same review (a duplicate).
+  - If A becomes the leader, B gets nothing. That may be called as designed.
+- **Impact**: which happens changes every time with the order of the polls. The behavior is unpredictable.
+- **Fix**: put `monitored: true` in the note, and have the leader "treat the pull request as monitored if any live note for it says so". Whether the specification should be "with a CI monitor, send nothing to the terminal side" needs deciding.
+- **Priority**: P2.
 
-### N5. 最後の走査から実際に送るまでの間に、他セッションの push を見ていない
+### N5. Other sessions' pushes between the last scan and the actual send are not seen
 
-- **確認**: 推測。
-- **起きる条件**: `pollNoted` の最後の `readNotes` が終わってから、`deliver` がレビューの詳細を取得し（`gh api graphql` を 1 回、数秒かかる）、`submit` するまでの間の話である。この間に確かめているのは、自分のセッションの push（`pushStarts`、`register.js:1299`）だけで、他のセッションのノートは読み直していない。
-- **影響**: R4 と同じく、push の直前の head についての通知が 1 回届く。窓は数秒あるので、R4 より広い。
-- **直し方**: `deliver` で、詳細を取得したあと・`submit` の直前に、`readNotes` をもう一度呼ぶ。`moved` と同じ判定で、新しい push や `since` が見えたら取り消す。
-- **優先度**: P3。
+- **Checked**: inferred.
+- **Conditions**: this is about the time from the end of `pollNoted`'s last `readNotes` until `deliver` fetches the review details (one `gh api graphql`, taking seconds) and calls `submit`. In that time only this session's own pushes (`pushStarts`, `register.js:1299`) are checked; other sessions' notes are not read again.
+- **Impact**: as with R4, one notification about the head just before a push arrives. The window is seconds, so wider than R4's.
+- **Fix**: in `deliver`, call `readNotes` once more after fetching the details and just before `submit`. With the same check as `moved`, take back if a new push or `since` is seen.
+- **Priority**: P3.
 
-### N6. 過去のセッション ID のノートが溜まり続け、ポーリングのたびに 1 件ずつ順番に 3 回読まれる
+### N6. Notes under past session ids keep piling up, and every poll reads them one at a time, three times
 
-- **確認**: 再現済み（`RACE N6`）。同じプルリクエストについて、過去のセッション ID の idle ノートを 200 件置く。1 回のポーリングで 600 回の `get` が順番に走った（1 回 5 ms なら 3 秒）。200 件はどれも消されなかった。
-- **起きる条件**: `prune`（`register.js:1560`）が消すのは、自分の現在のセッション ID のノートと、「14 日より古く、かつプルリクエストが終わっているか、記録がない」他人のノートだけである。`/clear`、`/resume`、`/branch` のたびにセッション ID が変わるので、開いたままのプルリクエストには、古い ID の idle ノートが増え続ける。`readNotes` は、ポーリング 1 回につき最大 3 回呼ばれ、どれも `for … await` で 1 件ずつ読む。
-- **影響**: それ自体は性能の問題だが、R4・N5・リースの消費（R5、R1）の窓を広げる。ストアが遅い環境では、これが効いてくる。
-- **直し方**:
-  1. `readNotes` の `get` を並列にする。
-  2. idle で、`since` と `pending` が記録で数え済み（`counted`）で、24 時間以上書かれていない他人のノートは、`prune` で消す。消している最中に持ち主が書き直すと、そのノートが 1 ラウンド選挙から消えるおそれは残る。それでも、24 時間触られていない idle ノートの持ち主がちょうどその瞬間に戻ってくる確率は小さい。重複が 1 回で済む程度なので、受け入れてよい。
-- **優先度**: P2。安く直せて、他の競合を軽くする。
+- **Checked**: reproduced (`RACE N6`). 200 idle notes under past session ids are put in place for the same pull request. One poll ran 600 `get`s one after another (3 seconds at 5 ms each). None of the 200 was deleted.
+- **Conditions**: `prune` (`register.js:1560`) deletes only notes under this session's current id, and other sessions' notes "older than 14 days, whose pull request has ended or has no record". The session id changes with each `/clear`, `/resume` and `/branch`, so idle notes under old ids keep growing for a pull request that stays open. `readNotes` is called up to three times per poll, each reading one at a time with `for … await`.
+- **Impact**: in itself a performance problem, but it widens the windows of R4, N5 and lease consumption (R5, R1). It tells in an environment with a slow store.
+- **Fix**:
+  1. Make `readNotes`'s `get`s parallel.
+  2. Have `prune` delete other sessions' notes that are idle, whose `since` and `pending` the record has counted (`counted`), and that have not been written for 24 hours or more. If the owner rewrites the note while it is being deleted, that note may still drop out of the election for one round. Even so, the chance that the owner of an idle note untouched for 24 hours comes back at exactly that moment is small. The cost is at most one duplicate, which is acceptable.
+- **Priority**: P2. Cheap to fix, and it lightens the other races.
 
-## 6. 根本対策について
+## 6. On a root fix
 
-R4、R5、N1 を完全に閉じるには、#26 にもあるとおり、アトミックな操作が要る。
+Closing R4, R5 and N1 completely needs atomic operations, as #26 also says.
 
-- **`$.store` の CAS**: 型定義（`.claude-plugin/types`）がリポジトリにないため、API を確かめきれなかった。`claude plugin validate` が列挙する `$.store` の呼び出しは `get`、`set`、`keys`、`delete` だけで、条件付きの操作は見当たらない。もしホストが追加してくれるなら、それがいちばん素直である。
-- **`mkdir` によるロック**: `$.process.run(['mkdir', <dir>])` は、POSIX のローカルファイルシステムではアトミックに成功か失敗かが決まる。これを、プルリクエストごと・ラウンドごとのリースとして使う方法がある。例えば `~/.claude/pr-relay/lock/<pr-hash>` に作成時刻を書いておき、古ければ奪う。こうすれば、ノートによる選挙そのものを「ロックを取れたセッションが中継する」に置き換えられる。`pending`、`deferred`、`landedAt` まわりの複雑さも、大部分が要らなくなる。代わりに、次の確認が要る。
-  - Windows で動くか
-  - ロックを奪うときの競合（古いロックの削除と作成の間）をどう扱うか
-  - ポーリングのたびにプロセスを 1 つ起動するコスト（60 秒に 1 回なので小さい）
-  - `$.fs` に排他作成があれば、そのほうがよい。ここも未確認。
+- **CAS in `$.store`**: the type declarations (`.claude-plugin/types`) are not in the repository, so the API could not be fully checked. The `$.store` calls `claude plugin validate` lists are only `get`, `set`, `keys` and `delete`, and no conditional operation is to be seen. If the host would add one, that would be the most straightforward.
+- **A lock through `mkdir`**: `$.process.run(['mkdir', <dir>])` succeeds or fails atomically on a local POSIX file system. It could serve as a lease per pull request and per round. For example, write the creation time into `~/.claude/pr-relay/lock/<pr-hash>`, and take it over when it is old. The note election itself could then be replaced by "the session that takes the lock relays". Most of the complexity around `pending`, `deferred` and `landedAt` would no longer be needed. In exchange, these need checking.
+  - Whether it works on Windows
+  - How to handle the race when taking a lock over (between deleting the old lock and creating the new)
+  - The cost of starting a process at every poll (small, once every 60 seconds)
+  - If `$.fs` has an exclusive create, that would be better. This too is unchecked.
 
-いまのノート方式は、#24 で 36 コミットかけて、境界条件を一つずつ塞いできたものである。この上に N1〜N6 の修正を足し続けるか、ロック方式に作り直すかは、一度判断しておく価値がある。
+The current note scheme is what #24 built over 36 commits, closing edge cases one by one. Whether to keep adding the fixes for N1 to N6 on top of it, or to rebuild around a lock, is worth deciding once.
 
-## 7. 直す順番の提案
+## 7. Proposed order of fixes
 
-1. **N3**（取りこぼし）: 1 の「`session.end` で、まだ届いていない送信を取り消す」だけでも、大半の場面を救える。
-2. **N2**（毎回の重複）: ノートのキーにプロセスごとの識別子を入れる。局所的な変更で済む。
-3. **N6 と R2**: どちらも安い。N6 は、R4、N5、R1 の窓を同時に狭める。
-4. **N4**: 仕様の決定（CI モニターがあるときの送り先）とセットで行う。
-5. **N1 と N3 の 2**: 印をイベントごとのキーに分ける作業と、`deliveredAt` を付ける作業は一緒に設計する。記録の形式が変わるので、移行も要る。
-6. **R1、R3、N5**: ハートビートの導入とあわせて行う。
-7. **R5**: 保留。根本対策（6 章）を入れるときに、一緒に消える。
+1. **N3** (loss): its 1, "take back the undelivered sends at `session.end`", alone saves most cases.
+2. **N2** (a duplicate every time): put a per-process identifier in the note key. A local change.
+3. **N6 and R2**: both cheap. N6 narrows the windows of R4, N5 and R1 at once.
+4. **N4**: do it together with the decision on the specification (where to send when a CI monitor runs).
+5. **N1 and N3's 2**: design splitting the marks into keys per event together with adding `deliveredAt`. The record's format changes, so a migration is needed too.
+6. **R1, R3, N5**: do them along with introducing the heartbeat.
+7. **R5**: deferred. It goes away when the root fix (section 6) goes in.
 
-5 に手を付ける前に、6 章のロック方式へ作り直すかどうかを決めておくと、二度手間を避けられる。
+Deciding whether to rebuild around section 6's lock before starting on 5 avoids doing the work twice.
 
-**2026-11-04 追記:** 実際には N3 → N2 → N6・R2（#45）→ N1 → R1 → R4 → N5 → R3 → R5 → N4（#47）の順に直した。
+**Added 2026-11-04:** in the event the fixes went N3 → N2 → N6, R2 (#45) → N1 → R1 → R4 → N5 → R3 → R5 → N4 (#47).
 
-- **N1 と N3 の 2:** 5 では一緒に設計するよう提案したが、N1 だけを取り消し票（`undo:`）の形で直し、N3 の 2（`deliveredAt`）は入れていない。
-- **ハートビート:** 6 で提案したポーリング全体のハートビートは入れていない。代わりに、R5 のために記録の書き込み中だけ打つ `beat` を入れた。
+- **N1 and N3's 2:** 5 proposed designing them together, but only N1 was fixed, in the form of take-back slips (`undo:`), and N3's 2 (`deliveredAt`) was not put in.
+- **Heartbeat:** the heartbeat over the whole poll proposed in 6 was not put in. Instead, for R5, a `beat` written only while the record is being written was put in.
 
-## 付記 A: 既存のテストスイートの後片付け
+## Appendix A: cleaning up after the existing test suite
 
-`tests/pr-relay.test.ts` の末尾に、3 秒かかる何もしないテストを 1 件足すだけで、`the file ran to its end` が失敗する（`$.clock.now refused: no hooks module of that name is loaded`、environment 600 / 612 / 614）。既存のテストのどれかが、終わったあとも非同期処理を残している。いまはファイルがすぐ終わるので表に出ていない。今回の競合とは別の問題だが、テストを足すときに必ずぶつかるので、どのテストが原因かを特定しておくとよい。
+Adding just one 3-second test that does nothing to the end of `tests/pr-relay.test.ts` makes `the file ran to its end` fail (`$.clock.now refused: no hooks module of that name is loaded`, environment 600 / 612 / 614). One of the existing tests leaves asynchronous work behind after it ends. It does not show today because the file ends at once. It is a separate problem from these races, but it is bound to come up whenever tests are added, so it is worth finding which test causes it.
 
-**2026-11-04 追記:** [HolyGrail/claude-mods#46](https://github.com/HolyGrail/claude-mods/pull/46) で、遅い書き込みを各テストの中で着地させるよう直された。
+**Added 2026-11-04:** [HolyGrail/claude-mods#46](https://github.com/HolyGrail/claude-mods/pull/46) fixed it by having the slow writes land within each test.

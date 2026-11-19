@@ -1,51 +1,53 @@
 # zsh-safe
 
-Claude が bash の書き方で書いた Bash コマンドを、macOS の zsh でもそのまま通す Claude Code の mod です。
+English | [日本語](README.ja.md)
+
+A Claude Code mod that lets Bash commands Claude writes in bash style run as they are under macOS's zsh.
 
 ```text
 $ zsh -c 'grep -r --include=*.ts foo .'
 zsh:1: no matches found: --include=*.ts
 ```
 
-モデルは失敗を見て引用を足し、再実行します。
-結果は最終的に得られますが、そのたびに tool 呼び出しが 1 往復増え、エラー出力がコンテキストに残ります。
+The model sees the failure, adds quotes and runs it again.
+It gets its result in the end, but each time at the cost of one more tool round trip, and the error output stays in the context.
 
-## 何をするか
+## What it does
 
-- **zsh のオプション**：Claude Code が起動する zsh で `setopt nonomatch noequals` を有効にします。一致するファイルがない glob は bash と同じく文字列のまま渡り（`nonomatch`）、語頭の `=` はコマンドのパスに展開されなくなります（`noequals`）。
-- **timeout**：コマンドが `command not found: timeout` で失敗したとき、モデルにだけ見える注記を結果に添えます。`timeout` がないことと、Bash ツール自身の `timeout` パラメータで代えられるのは期限がコマンド全体にかかるときだけであることを伝え、書き直し方はモデルに任せます。コマンドの実行には手を加えません。
+- **zsh options**: turns on `setopt nonomatch noequals` in the zsh that Claude Code starts. A glob that matches no file is passed on as a plain string, as in bash (`nonomatch`), and a leading `=` in a word is no longer expanded to a command's path (`noequals`).
+- **timeout**: when a command fails with `command not found: timeout`, adds a note to the result that only the model sees. It says that `timeout` is missing and that the Bash tool's own `timeout` parameter can stand in for it only when the time limit applies to the whole command, and leaves how to rewrite the command to the model. It does not touch how the command runs.
 
-## 仕組み
+## How it works
 
-zsh は、起動のたびに `$ZDOTDIR/.zshenv` を読みます。
-この mod はセッションの開始時に、Claude Code のプロセスの環境変数 `ZDOTDIR` を、mod に同梱した `zdotdir/` に向けます。
-`zdotdir/.zshenv` は最初に `ZDOTDIR` を元の値に戻し（元が未設定なら未設定に戻し）、利用者の `.zshenv` を読んでから `setopt` します。
-`.zprofile` や `.zshrc` も、戻した `ZDOTDIR` から、これまでどおり読まれます。
+zsh reads `$ZDOTDIR/.zshenv` every time it starts.
+At the start of the session, this mod points the `ZDOTDIR` environment variable of the Claude Code process at the `zdotdir/` shipped with the mod.
+`zdotdir/.zshenv` first sets `ZDOTDIR` back to its original value (or unsets it if it was unset), reads the person's `.zshenv`, and then runs `setopt`.
+`.zprofile` and `.zshrc` are read as before, from the restored `ZDOTDIR`.
 
-効くのは Claude Code が起動するシェルだけです。
-`.zshrc` に同じ `setopt` を書いても Claude の Bash には効きますが、その場合は人が普段使う対話シェルでも、一致しない glob を実行前に止める zsh の安全装置が外れます。
+It applies only to the shells Claude Code starts.
+Writing the same `setopt` in `.zshrc` would also work for Claude's Bash, but it would also take away, in the interactive shell the person uses every day, the zsh safeguard that stops a glob with no match before it runs.
 
-コマンドの文字列は書き換えません。
-権限の判定、auto mode の分類器、トランスクリプトは、どれもモデルが書いたままのコマンドを見ます。
-コマンドの先頭に `setopt …;` を付ける方法では、`Bash(echo:*)` のような allow ルールが `setopt` というサブコマンドに当たらずに外れます（`claude -p` で、`echo ===` が拒否されることを確かめました）。
+The command string is not rewritten.
+The permission check, the auto mode classifier and the transcript all see the command as the model wrote it.
+Prefixing the command with `setopt …;` makes an allow rule such as `Bash(echo:*)` stop matching, since it does not cover the `setopt` subcommand (checked with `claude -p`: `echo ===` was denied).
 
-## 制約
+## Limitations
 
-- `zdotdir/.zshenv` の `setopt` は、利用者の `.zshenv` の後、`.zprofile` と `.zshrc` の前に実行されます。そのため、`.zshrc` で `unsetopt nonomatch` のように打ち消している環境では効きません。
-- `/etc/zshenv` が `ZDOTDIR` を設定し直す環境では効きません。zsh は `/etc/zshenv` を先に実行してから `$ZDOTDIR/.zshenv` を探すので、同梱の `.zshenv` が読まれなくなります。
-- `ZDOTDIR` は、Claude Code がこのあと起動するすべての zsh に効きます。Bash ツールのほか、設定のフックから zsh を起動するスクリプトも含みます。コマンドの中でさらに起動した zsh は、元の `ZDOTDIR` に戻っているので、影響を受けません。
-- mod を無効にしたりアンインストールしたりしても、そのプロセスの `ZDOTDIR` は戻りません。mods API に、アンロードを知らせるイベントがないからです。Claude Code を再起動すると戻ります。
-- `timeout` の失敗は防ぎません。`make clean && timeout 30 make` なら、`make clean` は実行されたあとで止まります。mod がないときと同じ振る舞いで、変わるのは、モデルが同じ往復のうちに直し方を受け取ることです。
-- 実行前にコマンドを解析して `timeout` を拒否する方法は、採っていません。字句の解析は、変数名、ヒアドキュメントの行、`case` のパターンを取り違えて、正しいコマンドを止めます。結果のエラー文を見る方法なら、`env timeout` や `$( )` の中のように表記が何であっても拾えます。
-- `timeout` を書き換えることもしません。`perl -e 'alarm shift; exec @ARGV'` では、時間切れの終了コードが `timeout` の 124 から SIGALRM の 142 に変わり、`5s` のような単位付きの時間や小数、`-k` / `-s` の指定も再現できません。
+- The `setopt` in `zdotdir/.zshenv` runs after the person's `.zshenv` and before `.zprofile` and `.zshrc`. So it has no effect where `.zshrc` undoes it, for example with `unsetopt nonomatch`.
+- It has no effect where `/etc/zshenv` sets `ZDOTDIR` again. zsh runs `/etc/zshenv` first and then looks for `$ZDOTDIR/.zshenv`, so the bundled `.zshenv` is not read.
+- `ZDOTDIR` applies to every zsh Claude Code starts from then on. That includes, besides the Bash tool, scripts that start zsh from a settings hook. A zsh started from within a command does not feel it, since `ZDOTDIR` is back to the original by then.
+- Disabling or uninstalling the mod does not restore that process's `ZDOTDIR`. The mods API has no event announcing an unload. Restarting Claude Code restores it.
+- It does not prevent the `timeout` failure. With `make clean && timeout 30 make`, `make clean` runs and then it stops. That is the same behavior as without the mod; what changes is that the model receives how to fix it in the same round trip.
+- Parsing the command before it runs to deny `timeout` is not done. A lexical scan mistakes variable names, here-document lines and `case` patterns, and stops correct commands. Looking at the error text of the result catches it however it is written, as with `env timeout` or inside `$( )`.
+- Nor is `timeout` rewritten. With `perl -e 'alarm shift; exec @ARGV'` the exit code on timeout changes from `timeout`'s 124 to SIGALRM's 142, and durations with units such as `5s`, fractions, and the `-k` / `-s` options cannot be reproduced.
 
-## 使い方
+## Usage
 
-動作を確かめたのは Claude Code v2.1.286 です。
+It has been checked on Claude Code v2.1.286.
 
-### インストール
+### Install
 
-Claude Code のプロンプトで、次の 3 つを順に実行します。
+At the Claude Code prompt, run these three in order.
 
 ```text
 /plugin marketplace add HolyGrail/claude-mods
@@ -53,11 +55,11 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 /reload-plugins
 ```
 
-効き始めるのは、次に起動する zsh からです。
-### 更新
+It takes effect from the next zsh that starts.
+### Update
 
-marketplace の情報を取り込んでから、mod を更新します。
-更新は Claude Code の再起動後に反映されます。
+Pull in the marketplace's information, then update the mod.
+The update takes effect after Claude Code restarts.
 
 ```bash
 claude plugin marketplace update claude-mods
@@ -67,19 +69,19 @@ claude plugin marketplace update claude-mods
 claude plugin update zsh-safe@claude-mods
 ```
 
-注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+What to keep in mind is in the [repository README](../../README.md).
 
-### インストールせずに試す
+### Try it without installing
 
-clone したリポジトリのルートで、次のように起動します。
+From the root of the cloned repository, start Claude Code like this.
 
 ```bash
 claude --plugin-dir ./plugins/zsh-safe
 ```
 
-手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` に `CLAUDE_CODE_PLUGIN_DIRS` としてこのディレクトリの絶対パスを書きます。
+To always load the local code, put this directory's absolute path in `CLAUDE_CODE_PLUGIN_DIRS` under `env` in `~/.claude/settings.json`.
 
-## テスト
+## Tests
 
 ```bash
 cd plugins/zsh-safe

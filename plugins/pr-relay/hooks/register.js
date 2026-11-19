@@ -85,10 +85,99 @@ const STALE_MS = 14 * 24 * HOUR_MS
 const OPEN_STALE_MS = 90 * 24 * HOUR_MS
 // Events are paged back only to the previous poll of the same watch, less this much
 const PAGE_OVERLAP_MS = 5 * 60_000
-// How a pull request that is no longer open reads
-const ENDED = { MERGED: 'マージ', CLOSED: 'クローズ' }
-// JST has no daylight saving time, so a fixed offset gives its clock
-const JST_OFFSET_MS = 9 * HOUR_MS
+// What a person or the model reads, by display language: English unless the session reads as
+// Japanese (see resolveLocale). Nothing here is stored or parsed back, since sessions in other
+// languages, and of older versions, share the records in $.store. Word order differs between the
+// two, so each text that takes values is a function of them rather than joined fragments.
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+const TEXT = {
+  en: {
+    // How a pull request that is no longer open reads
+    ended: { MERGED: 'merged', CLOSED: 'closed' },
+    endedNotice: (number, word) => `PR #${number} was ${word}`,
+    dismiss: 'Dismiss',
+    usageLimit: (number) => `PR #${number}: Codex hit its usage limit, so no review will come`,
+    nudged: (number, head) => `PR #${number}: Codex has not reviewed the latest push (${head}), so ${NUDGE} was posted`,
+    lookupFailed: (time, error) => `PR lookup failed ${time}: ${error}`,
+    endedStatus: (label, word) => `${label} ${word}`,
+    checkFailed: (label, time, error) => `${label} check failed ${time}: ${error}`,
+    watching: (label, time, monitored) => `${label} watching · checked ${time}${monitored ? ' · with CI monitor' : ''}`,
+    baseAdvanced: (plugin, number, base, tip) =>
+      `${plugin}: PR #${number}'s base branch ${base} has advanced, and the commits just pushed do not include its tip (${tip}). ` +
+      `Rebase onto origin/${base} before the next push.`,
+    cleanup: (url) =>
+      `PR ${url} was merged. Carry out the post-merge follow-up for this PR.\n` +
+      'If a skill or command used in this work defines its own post-merge follow-up (such as /dev cleanup), follow it. Otherwise, proceed in this order.\n' +
+      `1. Run gh pr view ${url} --json state,headRefName,headRepository to confirm that it is merged and to find its branch.\n` +
+      "2. If the project's CLAUDE.md defines post-merge steps, read them before removing anything and follow their steps and order.\n" +
+      '3. If items from this work were moved to another PR or left out of scope, ask the user whether to file them as issues.\n' +
+      '4. Find the worktree that has that branch checked out with git worktree list, and remove the worktree and the local branch. If the remote branch remains, ask the user whether to delete it.\n' +
+      '5. Report what you did and what you skipped.\n' +
+      'If no worktree is found, or the PR belongs to another repository, remove nothing and report.\n' +
+      'Before removing anything, check for uncommitted changes and unpushed commits; if any remain, remove nothing and report.',
+    approved: (number, url, time, head, monitorNote) =>
+      `Codex approved PR #${number} (${url}) at ${time}${head ? `, on head ${head}` : ''}. ` +
+      'Check the CI results and, if there are no problems, report that the work is complete.' +
+      (monitorNote
+        ? '\nNote that Codex left a review before this 👍. Its findings arrive through the desktop CI monitor. If you do not push changes for them, you may treat the PR as approved.'
+        : ''),
+    reviewed: (number, url, reviews, comments, endpoint) =>
+      `Codex reviewed PR #${number} (${url}) (${plural(reviews, 'review')}, ${plural(comments, 'inline comment')}).\n` +
+      'Check each finding one by one: fix and push the valid ones, and reply to the comment with your reasons for the ones that are not.\n' +
+      `You can reply with gh api ${endpoint}/<comment id>/replies -f body='...'.`,
+    reviewApproval: (time) =>
+      `\n\nNote that Codex gave a 👍 after this review (at ${time}). If you do not push changes for the findings, you may treat the PR as approved.`,
+    readComments: (command) => `Read the comments with ${command}.`,
+    reviewSection: (id) => `### Review ${id}`,
+    restWithBodies: (n, url) => `\n\nSee ${url} for the remaining ${plural(n, 'comment or review body', 'comments and review bodies')}.`,
+    restComments: (n, url) => `\n\nSee ${url}/files for the remaining ${plural(n, 'comment')}.`,
+    truncated: '…(truncated; see the URL for the full text)',
+  },
+  ja: {
+    ended: { MERGED: 'マージ', CLOSED: 'クローズ' },
+    endedNotice: (number, word) => `PR #${number} が${word}されました`,
+    dismiss: '閉じる',
+    usageLimit: (number) => `PR #${number}: Codex の利用上限に達し、レビューが付きません`,
+    nudged: (number, head) => `PR #${number}: Codex が最新の push (${head}) をレビューしていないため、${NUDGE} を投稿しました`,
+    lookupFailed: (time, error) => `PR 検索失敗 ${time}: ${error}`,
+    endedStatus: (label, word) => `${label} ${word}済み`,
+    checkFailed: (label, time, error) => `${label} 確認失敗 ${time}: ${error}`,
+    watching: (label, time, monitored) => `${label} 監視中 · ${time} 確認${monitored ? ' · CI モニター併用' : ''}`,
+    baseAdvanced: (plugin, number, base, tip) =>
+      `${plugin}: PR #${number} のマージ先 ${base} が進んでいて、いま push したコミットはその先端 (${tip}) を含んでいません。` +
+      `次の push の前に origin/${base} へ rebase してください。`,
+    cleanup: (url) =>
+      `PR ${url} がマージされました。この PR のマージ後の後処理を進めてください。\n` +
+      'この作業で使っているスキルやコマンドがマージ後の後処理を定めていれば (/dev cleanup など)、それに従ってください。定めがなければ、次の順に進めてください。\n' +
+      `1. gh pr view ${url} --json state,headRefName,headRepository で、マージ済みであることとブランチを確かめる。\n` +
+      '2. プロジェクトの CLAUDE.md がマージ後の後処理を定めていれば、何かを消す前に読み、その手順と順序に従う。\n' +
+      '3. この作業で別の PR やスコープ外に回した事項が残っていれば、issue にするかをユーザーに確かめる。\n' +
+      '4. git worktree list でそのブランチを checkout している worktree を探し、worktree とローカルブランチを片付ける。リモートのブランチが残っていれば、消すかをユーザーに確かめる。\n' +
+      '5. 何をして、何を見送ったかを報告する。\n' +
+      'worktree が見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
+      '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。',
+    approved: (number, url, time, head, monitorNote) =>
+      `Codex が PR #${number} (${url}) を approved にしました（${time}${head ? `、head ${head}` : ''}）。` +
+      'CI の結果を確かめ、問題がなければ作業の完了を報告してください。' +
+      (monitorNote
+        ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
+        : ''),
+    reviewed: (number, url, reviews, comments, endpoint) =>
+      `Codex が PR #${number} (${url}) にレビューを付けました（レビュー ${reviews} 件、inline コメント ${comments} 件）。\n` +
+      '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
+      `返信は gh api ${endpoint}/<comment id>/replies -f body='...' で送れます。`,
+    reviewApproval: (time) =>
+      `\n\nなお、このレビューの後（${time}）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。`,
+    readComments: (command) => `コメントは ${command} で確認してください。`,
+    reviewSection: (id) => `### レビュー ${id}`,
+    restWithBodies: (n, url) => `\n\n残り ${n} 件のコメントとレビュー本文は ${url} で確認してください。`,
+    restComments: (n, url) => `\n\n残り ${n} 件のコメントは ${url}/files で確認してください。`,
+    truncated: '…（以下省略、全文は URL で）',
+  },
+}
+// The Claude Code language settings that read as Japanese, trimmed and lower-cased; ja-JP, ja_JP and
+// the like count too
+const JAPANESE = /^(?:ja|jp|jpn|japanese|日本語)$|^ja[-_]/
 
 // The newest events come last, and only those after the last push count. A page holds 100, the
 // most GraphQL gives; a connection whose oldest item on it is still after the push is followed
@@ -215,10 +304,21 @@ const undelivered = new Set()
 // The read, change and write of a record in this session, one after another: an ended poll that
 // outlasts a new watch's first poll would otherwise write what it read before the other wrote
 let writes = Promise.resolve()
+// The display language, 'en' or 'ja', resolved at session.start; render hooks and timers only read it
+let locale = 'en'
+// Formats the clock in the time zone resolved at session.start, built once rather than per call;
+// the runtime's own zone until then
+let clockFormat = clockFormatOf(undefined)
 
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
+    // First, so nothing this start draws or schedules reads the language or time zone a previous
+    // start resolved
+    locale = 'en'
+    clockFormat = clockFormatOf(undefined)
+    locale = await resolveLocale($)
+    clockFormat = await resolveClock($)
     await adoptInstance($)
     // Before any note goes out, so no other session takes this one's polls as a gone process's
     aliveTimer?.cancel()
@@ -428,9 +528,7 @@ export function register(on) {
     // session as it merges, most of which have it already
     const base = push && moved?.shas.length !== 0 ? await baseAdvanced($, push, moved, pushMatches).catch(() => null) : null
     if (base) {
-      const fix =
-        `${$.plugin.name}: PR #${base.number} のマージ先 ${base.name} が進んでいて、いま push したコミットはその先端 (${base.oid.slice(0, 7)}) を含んでいません。` +
-        `次の push の前に origin/${base.name} へ rebase してください。`
+      const fix = words().baseAdvanced($.plugin.name, base.number, base.name, base.oid.slice(0, 7))
       ran = { ...ran, context: [...(ran.context ?? []), fix] }
     }
     if (creates) {
@@ -468,7 +566,7 @@ export function register(on) {
         // On the desktop each offer is a card of its own, apart from the meters below it
         ...(e.surface === 'desktop' && { borderStyle: 'round', paddingX: 1 }),
         children: [
-          elements.Text({ children: [`PR #${number} がマージされました`] }),
+          elements.Text({ children: [words().endedNotice(number, words().ended.MERGED)] }),
           elements.Button({
             key: `cleanup-${id}`,
             label: 'cleanup',
@@ -479,16 +577,7 @@ export function register(on) {
               // The merge's whole aftermath, not only the worktree: a workflow that defines its
               // own (the dev skill's /dev cleanup) takes over, and the URL stays in the first
               // sentence, which that skill matches against its sessions
-              const text =
-                `PR ${url} がマージされました。この PR のマージ後の後処理を進めてください。\n` +
-                'この作業で使っているスキルやコマンドがマージ後の後処理を定めていれば (/dev cleanup など)、それに従ってください。定めがなければ、次の順に進めてください。\n' +
-                `1. gh pr view ${url} --json state,headRefName,headRepository で、マージ済みであることとブランチを確かめる。\n` +
-                '2. プロジェクトの CLAUDE.md がマージ後の後処理を定めていれば、何かを消す前に読み、その手順と順序に従う。\n' +
-                '3. この作業で別の PR やスコープ外に回した事項が残っていれば、issue にするかをユーザーに確かめる。\n' +
-                '4. git worktree list でそのブランチを checkout している worktree を探し、worktree とローカルブランチを片付ける。リモートのブランチが残っていれば、消すかをユーザーに確かめる。\n' +
-                '5. 何をして、何を見送ったかを報告する。\n' +
-                'worktree が見つからない場合や、別のリポジトリの PR の場合は、何も消さずに報告してください。\n' +
-                '消す前に、未コミットの変更や push していないコミットが残っていないかを確かめ、残っていれば消さずに報告してください。'
+              const text = words().cleanup(url)
               // A prompt that did not enter reveals its row in place, unless a new watch or a
               // conversation reset removed that offer while it waited
               if (await submit($, text)) close()
@@ -496,7 +585,7 @@ export function register(on) {
               $.ui.invalidate('ui.render')
             },
           }),
-          elements.Button({ key: `dismiss-${id}`, label: '閉じる', role: 'dismiss', onPress: close }),
+          elements.Button({ key: `dismiss-${id}`, label: words().dismiss, role: 'dismiss', onPress: close }),
         ],
       })
     })
@@ -703,8 +792,8 @@ function trackBound($, { bound, primary, others }) {
     const previous = boundStates.get(pr.id)
     boundStates.set(pr.id, state)
     if (state === 'OPEN') removeCleanup($, pr.id)
-    if (pr.id === watched?.id || previous !== 'OPEN' || !ENDED[state]) continue
-    $.ui.toast(`PR #${pr.number} が${ENDED[state]}されました`)
+    if (pr.id === watched?.id || previous !== 'OPEN' || state === 'OPEN') continue
+    $.ui.toast(words().endedNotice(pr.number, words().ended[state]))
     if (state === 'MERGED') offerCleanup($, pr)
   }
 }
@@ -1071,7 +1160,7 @@ function update($, pr, data, record, notedPush, pending, defers, pushing, now, a
       // Raised once the record says so in time, like a prompt
       return [
         {
-          toast: `PR #${pr.number} が${ENDED[state]}されました`,
+          toast: words().endedNotice(pr.number, words().ended[state]),
           pr,
           undo: { ended: state },
         },
@@ -1595,11 +1684,7 @@ function relay($, pr, signals, record, monitoredElsewhere = false) {
         text:
           // The head it was read with: a prompt waits for the running turn to end, and a push made
           // meanwhile would otherwise read as approved too
-          `Codex が PR #${pr.number} (${pr.url}) を approved にしました（${clock(approvedAt)}${record.head ? `、head ${record.head.slice(0, 7)}` : ''}）。` +
-          'CI の結果を確かめ、問題がなければ作業の完了を報告してください。' +
-          (usesMonitor && fresh.length
-            ? '\nなお、この 👍 の前に Codex のレビューが付いています。指摘は Desktop の CI モニターから届きます。指摘に対応して push しない場合は、approved とみなしてかまいません。'
-            : ''),
+          words().approved(pr.number, pr.url, clock(approvedAt), record.head?.slice(0, 7), Boolean(usesMonitor && fresh.length)),
         undo: { approvedAt: markedAt, previous },
       },
     ]
@@ -1610,7 +1695,7 @@ function relay($, pr, signals, record, monitoredElsewhere = false) {
     record.usageLimitAt = usageLimitAt
     return [
       {
-        toast: `PR #${pr.number}: Codex の利用上限に達し、レビューが付きません`,
+        toast: words().usageLimit(pr.number),
         undo: { usageLimitAt, usagePrevious: previous },
       },
     ]
@@ -1676,7 +1761,7 @@ function ask($, key, { head, pr, undo }, pushedElsewhere) {
     .catch((error) => String(error?.message ?? error))
     .then(async (posted) => {
       if (posted === true) {
-        $.ui.toast(`PR #${pr.number}: Codex が最新の push (${head.slice(0, 7)}) をレビューしていないため、${NUDGE} を投稿しました`)
+        $.ui.toast(words().nudged(pr.number, head.slice(0, 7)))
         return
       }
       takeBackAll($, key, [{ undo }], pr)
@@ -1718,17 +1803,13 @@ function reviewPromptParts(pr, reviews, approvedAt) {
   const count = reviews.reduce((sum, r) => sum + r.comments, 0)
   const endpoint = `repos/${pr.owner}/${pr.name}/pulls/${pr.number}/comments`
   const selection = reviews.map((r) => `(.pull_request_review_id | tostring) == "${r.id}"`).join(' or ')
-  const text =
-    `Codex が PR #${pr.number} (${pr.url}) にレビューを付けました（レビュー ${reviews.length} 件、inline コメント ${count} 件）。\n` +
-    '指摘を一つずつ確かめ、妥当なものは直して push し、妥当でないものは理由を添えてそのコメントに返信してください。\n' +
-    `返信は gh api ${endpoint}/<comment id>/replies -f body='...' で送れます。`
-  const approval = approvedAt
-    ? `\n\nなお、このレビューの後（${clock(approvedAt)}）に Codex が 👍 を付けています。指摘に対応して push しない場合は、approved とみなしてかまいません。`
-    : ''
+  const text = words().reviewed(pr.number, pr.url, reviews.length, count, endpoint)
+  const approval = approvedAt ? words().reviewApproval(clock(approvedAt)) : ''
+  const command = `gh api --paginate ${endpoint} --jq '.[] | select(.in_reply_to_id == null and (${selection})) | {id, path, line, body}'`
   return {
     text,
     approval,
-    fallback: `${text}\nコメントは gh api --paginate ${endpoint} --jq '.[] | select(.in_reply_to_id == null and (${selection})) | {id, path, line, body}' で確認してください。${approval}`,
+    fallback: `${text}\n${words().readComments(command)}${approval}`,
   }
 }
 
@@ -1764,7 +1845,7 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
     if (total === 0 && typeof detail?.body === 'string') {
       const body = detail.body.replace(/<details\b[^>]*>[\s\S]*?<\/details\s*>/gi, '').trim()
       if (body) {
-        sections.push({ text: `### レビュー ${review.id}\n${cappedBody(body)}\n${detail.url}`, comments: 0 })
+        sections.push({ text: `${words().reviewSection(review.id)}\n${cappedBody(body)}\n${detail.url}`, comments: 0 })
         remainingBodies++
       }
     }
@@ -1773,8 +1854,8 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
     return fallback
   }
   const rest = (comments, bodies) => bodies > 0
-    ? `\n\n残り ${comments + bodies} 件のコメントとレビュー本文は ${pr.url} で確認してください。`
-    : comments > 0 ? `\n\n残り ${comments} 件のコメントは ${pr.url}/files で確認してください。` : ''
+    ? words().restWithBodies(comments + bodies, pr.url)
+    : comments > 0 ? words().restComments(comments, pr.url) : ''
   for (const section of sections) {
     const addition = `\n\n${section.text}`
     const bodies = remainingBodies - (section.comments === 0 ? 1 : 0)
@@ -1790,7 +1871,7 @@ async function reviewPrompt($, pr, reviews, approvedAt) {
 // A trimmed body with a link notice when its text exceeds the per-body cap
 function cappedBody(body) {
   const trimmed = body.trim()
-  return trimmed.length > BODY_LIMIT ? trimmed.slice(0, BODY_LIMIT) + '…（以下省略、全文は URL で）' : trimmed
+  return trimmed.length > BODY_LIMIT ? trimmed.slice(0, BODY_LIMIT) + words().truncated : trimmed
 }
 
 // Takes marks back without waiting; a store that refuses it leaves them, and says so
@@ -2142,6 +2223,26 @@ function normalize(record) {
   }
 }
 
+// The mods API carries no locale, and Intl answers en-US even on a Japanese system, so the language
+// comes from Claude Code's own language setting, which decides alone when it is set, and else from
+// the locale variables a terminal may set (the desktop app sets none). Any failure reads as English.
+async function resolveLocale($) {
+  try {
+    const language = await $.settings.read({ key: 'language' })
+    if (typeof language === 'string' && language.trim()) return JAPANESE.test(language.trim().toLowerCase()) ? 'ja' : 'en'
+    // The first of them that is set decides, as the C library reads them
+    const variable = (await $.env.get('LC_ALL')) || (await $.env.get('LC_MESSAGES')) || (await $.env.get('LANG'))
+    return typeof variable === 'string' && variable.toLowerCase().startsWith('ja') ? 'ja' : 'en'
+  } catch {
+    return 'en'
+  }
+}
+
+// The texts of the display language
+function words() {
+  return TEXT[locale]
+}
+
 // id is the pull request whatever the case it is spelled in, as GitHub reads owner and repository
 // names: the store key, and what watches are matched by
 function parse(url) {
@@ -2153,12 +2254,12 @@ function showStatus($) {
   // A lookup gh could not answer says so, rather than leaving the line empty or naming an ended one
   if (!watched || (watched.ended && lookupFailure)) {
     if (!lookupFailure) return $.ui.status(undefined)
-    return $.ui.status(`PR 検索失敗 ${clock(lookupFailure.at)}: ${lookupFailure.error}`)
+    return $.ui.status(words().lookupFailed(clock(lookupFailure.at), lookupFailure.error))
   }
   const label = `PR #${watched.number}`
-  if (watched.ended) return $.ui.status(`${label} ${ENDED[watched.ended]}済み`)
-  if (lastCheck?.error) return $.ui.status(`${label} 確認失敗 ${clock(lastCheck.at)}: ${lastCheck.error}`)
-  $.ui.status(`${label} 監視中 · ${clock(lastCheck?.at ?? 0)} 確認${monitored.has(watched.id) ? ' · CI モニター併用' : ''}`)
+  if (watched.ended) return $.ui.status(words().endedStatus(label, words().ended[watched.ended]))
+  if (lastCheck?.error) return $.ui.status(words().checkFailed(label, clock(lastCheck.at), lastCheck.error))
+  $.ui.status(words().watching(label, clock(lastCheck?.at ?? 0), monitored.has(watched.id)))
 }
 
 function describe() {
@@ -2171,8 +2272,25 @@ function describe() {
   return `pr-relay is watching ${watched.url} and will send a prompt when it changes.${checked}${asked}`
 }
 
-// HH:MM in JST
+// HH:MM in the machine's time zone, the same digits in both languages
 function clock(ms) {
-  const d = new Date(ms + JST_OFFSET_MS)
-  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+  return clockFormat.format(ms)
+}
+
+// A 24-hour HH:MM formatter for a time zone, or for the runtime's own one when timeZone is undefined.
+// en-GB keeps the digits ASCII and the separator a colon whatever the display language.
+function clockFormatOf(timeZone) {
+  return new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+}
+
+// The mods API carries no time zone and Claude Code has no setting for one, so TZ decides when Intl
+// knows its name; a POSIX form such as JST-9, or a read that fails, falls back to the runtime's zone
+async function resolveClock($) {
+  try {
+    const zone = await $.env.get('TZ')
+    if (typeof zone === 'string' && zone) return clockFormatOf(zone)
+  } catch {
+    // RangeError for a zone Intl does not know, or the read itself failing
+  }
+  return clockFormatOf(undefined)
 }

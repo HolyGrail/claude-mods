@@ -1,177 +1,195 @@
 # status-board
 
-このセッションがいま何を目指し、どこまで進み、何を人に聞いているかを、会話の横の枠（Pane）に「状況ボード」として出す Claude Code の mod です。
-いまの状況を 1 行で、プロンプト入力欄の上の帯にも出します。
+English | [日本語](README.ja.md)
+
+A Claude Code mod that shows, as a "status board" in a pane beside the conversation, what this session is aiming for, how far it has come and what it is asking the person.
+It also shows where things stand in one line, in the band above the prompt.
 
 ```text
-● 進行中 (3/6) 帯を描く · 23:41  [ 状況ボード ]
+● In progress (3/6) Draw the band · 23:41  [ Status board ]
 ```
 
-長いセッションでは、いま計画のどこにいて、最後に何を頼み、何が決まったかが、会話をさかのぼらないと分からなくなります。
-会話にはツールの出力や応答の本文も積もるので、指示や決定はその間に埋もれます。
-状況ボードは、その会話全体をモデルに要約させたものです。
-要約の元になった記録は、ボードの下に指示ごとの履歴として畳んであります。
+In a long session, where you are in the plan, what you last asked for and what has been decided can no longer be told without scrolling back through the conversation.
+Tool output and response text pile up in the conversation too, burying the prompts and decisions among them.
+The status board is the whole of that conversation summed up by the model.
+The record it was summed up from is folded away under the board as a history by prompt.
 
-## 状況ボード
+## Status board
 
-ボードは、次の 5 つの見出しを持つ短い Markdown です。
+The board is a short piece of Markdown with these five headings.
 
 ```text
-## 目的
-- 帯と枠でセッションの流れを見せる
-## 現在地
-- 帯の色を直し終えた
-- いまは枠の作り替え中
-## 決まったこと
-- 会話ログから組み立てる（途中から有効にしても組み直せるため）
-## 未解決・あなたの判断待ち
-- README の書き直しを今回やるか
-## 次の一手
-- テストを直してから README へ
+## Goal
+- Show the session's flow in the band and the pane
+## Where things stand
+- Finished fixing the band's colors
+- Now reworking the pane
+## Decided
+- Build from the transcript (so it can be rebuilt when enabled mid-session)
+## Open / waiting on you
+- Whether to rewrite the README this time
+## Next step
+- Fix the tests, then the README
 ```
 
-ボードの下には、`HH:MM 時点 · モデルによる要約` の 1 行が付きます。
-ボードを書いたあとに出来事があったか、ターンが終わっていれば ` · その後に動きあり`、かかったトークンが分かれば ` · 読み 323k / 出力 490` が続きます。
-ボードはモデルの要約なので、言い回しや取捨はモデルしだいです。
-元の記録を確かめたいときは、`履歴を表示` で指示ごとのカードを開きます。
+Under the board comes the line `As of HH:MM · summarized by the model`.
+If something has happened, or a turn has ended, since the board was written, ` · activity since` follows, and when the tokens it took are known, ` · read 323k / output 490`.
+The board is the model's summary, so its wording and what it keeps or leaves out are up to the model.
+To check against the original record, open the cards by prompt with `Show history`.
 
-### いつモデルを呼ぶか
+### When the model is asked
 
-要約は、セッションの会話を引き継いだモデル（`$.model.fork`）にツールなしで 1 回答えさせて作ります。
-このモデルには、終わったばかりのターンの最終回答まで見えています。
-人の判断を待つ問いは最終回答に書かれることが多く、ターンの終わりの要約でボードの判断待ちにそのまま載ります。
-呼ぶのは次の 3 つの場合だけです。
+The summary is made by having a model that carries over the session's conversation (`$.model.fork`) answer once, without tools.
+This model sees up to the final answer of the turn that just ended.
+A question awaiting the person's decision is often written in the final answer, and the summary at the end of the turn puts it straight into the board's waiting-on-you heading.
+The model is asked only in these three cases.
 
-- **ターンが答えて終わったとき**：枠が開いて表示されていれば要約し直す。閉じている間や、置けなかった枠のためには呼ばない
-- **枠を開いたとき**：枠が置けて、ボードがないか古く（`その後に動きあり` の状態）、しかも会話のキャッシュがまだ温かいと見なせるときだけ要約する。温かいと見なすのは、ターンの実行中か、最後のターンが終わってから 5 分以内
-- **ボタンを押したとき**：`状況ボードを作る` か `状況ボードを更新する` で、いつでも要約する。キャッシュが温かいと見なせないときは、ラベルに `（キャッシュ切れの可能性あり）` を添える
+- **When a turn ends with an answer**: summarizes again if the pane is open and shown. It is not asked while the pane is closed, or for a pane that could not be placed
+- **When the pane is opened**: summarizes only when the pane could be placed, there is no board or it is stale (the `activity since` state), and the conversation's cache can be taken as still warm. It is taken as warm while a turn runs, or within 5 minutes of the end of the last turn
+- **When the button is pressed**: `Create the status board` or `Update the status board` summarizes at any time. When the cache cannot be taken as warm, the label gets ` (cache may be cold)`
 
-要約は同時に 1 つしか走らせず、その間のボタンは `要約しています…` になり、押しても何もしません。
-その間にターンが終わると、走っている要約にはその回答が入っていない可能性があるので、終わってからもう一度だけ要約します。
-失敗したときは前のボードを残し、ボタンの下に `要約できませんでした: <理由>` を出します。
-ボードはセッションごとに保存し、再起動や `/resume` のあとはそのまま戻します。
-`/branch` で分かれた会話は、ボードなしから始めます。
-8 日間書かれていないボードは消します。
+Only one summary runs at a time; meanwhile the button reads `Summarizing…`, and pressing it does nothing.
+If a turn ends meanwhile, the running summary may not include that answer, so once it is done it summarizes once more.
+On a failure the previous board stays, and `Could not summarize: <reason>` appears under the button.
+The board is saved per session and comes back as it was after a restart or `/resume`.
+A conversation split off with `/branch` starts with no board.
+Boards not written for 8 days are deleted.
 
-### コストの目安
+### Rough cost
 
-要約はメインの会話のキャッシュを読むので、温かいうちなら安く済みます。
-Desktop アプリで測った 1 回は、5.9 秒、キャッシュからの読み 321,578 トークン、新たな入力 1,063 トークン、出力 490 トークンでした。
-キャッシュが切れたあとは、会話全体を通常の入力として読み直すので、その分だけ高くつきます。
-枠を開いたときにキャッシュが冷えていそうなら自動では呼ばず、ボタンを待つのはそのためです。
-`effort` は渡さず、急いで答えるようにだけ頼んでいます。
-セッションと違う `effort` を渡すと、モデルによっては会話全体をキャッシュに書き直すことになるからです。
+The summary reads the main conversation's cache, so it is cheap while the cache is warm.
+One run measured in the desktop app took 5.9 seconds, with 321,578 tokens read from the cache, 1,063 tokens of new input (685 of them written to the cache) and 490 tokens of output.
+Once the cache has expired, the whole conversation is read again as ordinary input, which costs that much more.
+That is why, when the cache seems cold as the pane opens, the model is not asked on its own but waits for the button.
+No `effort` is passed; the prompt only asks for a quick answer.
+Passing an `effort` other than the session's makes some models write the whole conversation to the cache again.
 
-## 帯
+## Band
 
-進行中のステップがあれば、`進行中` と計画の中での位置（`(3/6)`）、ステップの名前、そのステップが始まった時刻を出します。
-なければ、最新の出来事を 1 件、次の形で出します。
+When a step is in progress, the band shows `In progress`, its place in the plan (`(3/6)`), the step's name and the time the step began.
+Otherwise it shows the newest event, in this form.
 
-| 印 | 種類 | 本文 |
+| Mark | Kind | Text |
 | --- | --- | --- |
-| ●（緑） | ステップの完了 | `完了 <ステップ>` |
-| ●（青） | ステップの開始 | `進行中 <ステップ>` |
-| ○（灰） | ステップを未着手に戻した | `未着手 <ステップ>` |
-| ●（青） | 計画の作成と更新 | `計画を作成: N ステップ`、`計画を更新: N ステップ` |
-| ○（橙） | まとめ（`wrap_up`） | `まとめ <本文>`、質問があれば ` ／質問: <質問>` |
-| ●（橙） | 質問（`AskUserQuestion`） | `質問 <先頭の質問>`、複数なら `（ほか N 問）` |
-| ○（紫） | 人の指示 | `指示 <本文>` |
-| ○（青） | PR の紐付け | `PR #12 を紐付け` |
+| ● (green) | Step completed | `Done <step>` |
+| ● (blue) | Step started | `In progress <step>` |
+| ○ (gray) | Step set back to pending | `Pending <step>` |
+| ● (blue) | Plan created or updated | `Plan created: N steps`, `Plan updated: N steps` |
+| ○ (orange) | Recap (`wrap_up`) | `Recap <text>`, with ` / Question: <question>` if it asks one |
+| ● (orange) | Question (`AskUserQuestion`) | `Question <first question>`, with ` (+N more)` if there are several |
+| ○ (purple) | A person's prompt | `Prompt <text>` |
+| ○ (blue) | PR bound | `Linked PR #12` |
 
-行末の `状況ボード` ボタンと `/board` コマンドで枠を開閉します。
-出来事がまだないときは何も出しません。
-ターミナルでは幅に収まるようステップの名前や本文を切り詰め（`進行中 (3/6)` は残す）、それでも収まらなければ行ごと出しません。
-ほかの mod の行とは別の行に描きます。
+The `Status board` button at the end of the line and the `/board` command open and close the pane.
+Nothing is shown while there are no events yet.
+In the terminal, the step's name or the text is cut to fit the width (keeping `In progress (3/6)`), and if it still does not fit, the line is not shown at all.
+It is drawn on a line of its own, apart from the lines of other mods.
 
-## 履歴
+## History
 
-`履歴を表示` を押すと、ボードの下に、人の指示 1 件と次の指示までに起きたことを 1 枚にしたカードが並びます。
-Desktop アプリでは枠の行から会話のその位置へ飛べないので、カードは枠の中だけで読み切れるように作ってあります。
+Pressing `Show history` lists cards under the board, each holding one prompt a person gave and what happened up to the next one.
+In the desktop app a row in the pane cannot jump to its place in the conversation, so the cards are made to be read in full within the pane.
 
 ```text
-○ 23:20 帯の表示を直して
-○ 23:38 帯の色を直し、時刻を薄くした。テストは通過。
-質問: README も直しますか?
-● 進行中 (3/6) 帯を描く
-計画 6 ステップ · 完了 2 · PR #12
+○ 23:20 Fix the band's display
+○ 23:38 Fixed the band's colors and dimmed the time. Tests pass.
+Question: Shall I fix the README too?
+● In progress (3/6) Draw the band
+Plan: 6 steps · 2 done · PR #12
 ```
 
-カードの中身は、上から次のとおりです。
+A card holds, from the top:
 
-- **見出し**：指示の時刻と本文。本文は 3 行まで折り返す
-- **まとめと質問**：起きた順に並べる。まとめは全文を折り返して出し、まとめに質問が付いていれば、その下に `質問: <質問>` を警告色で出す。`AskUserQuestion` は `質問 <先頭の質問>` の形で、これも折り返して出す
-- **進行中の行**：計画に進行中のステップがあれば、いちばん新しいカードにだけ、帯と同じ `進行中 (k/N) <ステップ>` を出す
-- **足元**：そのカードの間の計画とステップを畳んだ 1 行。最後に出た計画のステップ数、完了したステップの数、紐付けた PR を ` · ` でつなぐ
+- **Heading**: the prompt's time and text. The text wraps to 3 lines at most
+- **Recaps and questions**: in the order they happened. A recap is shown in full, wrapped, and if it carries a question, `Question: <question>` follows below it in the warning color. An `AskUserQuestion` takes the form `Question <first question>`, also wrapped
+- **In-progress line**: if a step of the plan is in progress, only the newest card shows the same `In progress (k/N) <step>` as the band
+- **Footer**: one line folding up the card's plans and steps. The step count of the last plan shown, the number of steps completed, and the PRs bound, joined with ` · `
 
-タスクの通知やほかのセッションの入力で始まったターンのまとめは、直前の指示のカードに入ります。
-最初の指示より前の出来事は、`最初の指示より前` という見出しのカードにまとめます。
+The recap of a turn started by a task notification or another session's input goes on the card of the prompt before it.
+Events before the first prompt are gathered on a card headed `Before the first prompt`.
 
-カードは新しい順に並べ、最初は 5 枚を出します。
-`さらに N 件を表示` で全部に、`新しい 5 件だけにする` で戻ります。
-Desktop アプリではカードを枠線で囲み、ターミナルでは 1 行あけて区切ります。
-Desktop アプリで枠を最小化した小さな形では、ボードではなく、いちばん新しいカードの最新のまとめ（なければ指示）を 3 行まで出します。
+The cards are listed newest first, five at the start.
+`Show N more` shows them all, and `Show only the newest 5` goes back.
+The desktop app frames each card with a border; the terminal separates them with a blank line.
+In the small form of the pane minimized in the desktop app, it shows not the board but the newest card's latest recap (or, with none, its prompt), up to 3 lines.
 
-色はテーマの色に従います。
-時刻は今日の出来事なら `HH:MM`、それより前なら `M/D HH:MM` で、日本時間で表示します。
-まとめと質問は 1,000 字、ほかの本文は 200 字で切り、出来事は新しい 300 件まで覚えます。
+Colors follow the theme's colors.
+Times are shown as `HH:MM` for today's events and `M/D HH:MM` for earlier ones, in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`).
+Recaps and questions are cut at 1,000 characters and other texts at 200, and the newest 300 events are remembered.
 
-人の指示として数えるのは、ターンを始めた入力のうち、人が入力したと記録されたものだけです。
-plugin、タスクの通知、ほかのセッションが差し込んだ入力（`promptSource` が `system` のもの）は数えません。
-Claude Code が入力に添える `<system-reminder>` の部分は本文から除き、それしか残らない入力は数えません。
+Counted as a person's prompt is only input that began a turn and was recorded as typed by a person.
+Input slipped in by a plugin, a task notification or another session (with `promptSource` of `system`) is not counted.
+The `<system-reminder>` parts Claude Code adds to an input are taken out of the text, and input left with nothing else is not counted.
 
-## どのセッションで何が出るか
+## What shows in which session
 
-状況ボードは会話そのものを要約するので、どのセッションでも作れます。
-履歴と帯に出る出来事は、セッションを動かしているアプリで変わります。
-計画、ステップ、まとめの元になる `mcp__ccd_turn__update_plan` と `mcp__ccd_turn__wrap_up` は、Desktop アプリのセッションにしかないツールです。
+The status board sums up the conversation itself, so it can be made in any session.
+The events shown in the history and the band depend on the app running the session.
+`mcp__ccd_turn__update_plan` and `mcp__ccd_turn__wrap_up`, the sources of plans, steps and recaps, are tools only desktop app sessions have.
 
-- **Desktop アプリのセッション**：6 種類すべてが出る
-- **ターミナルのセッション**：指示、質問、PR の紐付けだけが出る。カードには見出しと質問と、足元の PR だけが載る
-- **`claude -p` の実行**：入力が人の指示として記録されないので、指示も出ない
+- **Desktop app sessions**: every event in the band's table shows
+- **Terminal sessions**: only prompts, questions and PR binds show. Cards carry only the heading, questions and the footer's PRs
+- **`claude -p` runs**: input is not recorded as a person's prompt, so no prompts show either
 
-人の入力の記録のされ方は、直近 14 日の会話ログで確かめました。
-Desktop アプリでは `promptSource` が `sdk`、ターミナルでは `typed` か `queued` で、どちらも `origin.kind` が `human` です。
-`claude -p` の入力は `promptSource` が `sdk` でも `origin` がないので、指示として数えません。
+How a person's input is recorded was checked against the transcripts of the last 14 days.
+In the desktop app `promptSource` is `sdk`, in the terminal `typed` or `queued`, and in both `origin.kind` is `human`.
+A `claude -p` input has `promptSource` `sdk` but no `origin`, so it is not counted as a prompt.
 
-## 仕組み
+## How it works
 
-出来事は、フックで積むのではなく、セッションの会話ログ（JSONL）を読んで組み立てます。
-決め手は計画のステップでした。
-ステップの状態は、`update_plan` の入力（一覧の置き換え、`advance`、`done`、`start`）をそれまでの計画に順に当てはめないと分かりません。
-フックだけで積むと、`/resume` した会話や、途中で mod を有効にしたセッションでは、それまでの計画を組み直せません。
-過去の出来事の時刻と、入力が人によるものかどうかも、会話ログにしか書かれていません。
+The events are built not by collecting them in hooks but by reading the session's transcript (JSONL).
+The plan's steps decided it.
+A step's state can be known only by applying the `update_plan` inputs (replacing the list, `advance`, `done`, `start`) in order to the plan before them.
+Collected by hooks alone, the plan so far could not be rebuilt in a conversation brought back with `/resume`, or in a session where the mod was enabled midway.
+Past events' times, and whether an input came from a person, are also written only in the transcript.
 
-会話ログは前回読んだ位置から先だけを読みます。
-読み直すのは、ターンの開始の少しあと、ターンの完了時、ターンの実行中は 2 秒ごと、待機中は 30 秒ごとです。
-どの読み込みもターンを待たせません。
-`/resume`、`/clear`、`/branch` で会話が切り替わると、新しい会話のログを先頭から読み直します。
-読み込みが 3 回続けて失敗すると、ステータス行に `status-board: 会話ログを読めません: <エラー>` と出し、次に読めたところで消します。
-会話ログがまだ作られていない間（セッションの最初の入力まで）は、失敗に数えません。
+The transcript is read only from where the last read stopped.
+It is read again shortly after a turn starts, when a turn completes, every 2 seconds while a turn runs, and every 30 seconds while idle.
+No read holds up a turn.
+When `/resume`, `/clear` or `/branch` switches the conversation, the new conversation's transcript is read from the start.
+After three failed reads in a row, the status line shows `status-board: cannot read the transcript: <error>`, cleared at the next read that succeeds.
+While the transcript does not exist yet (until the session's first input), that is not counted as a failure.
 
-組み立て方は、ローカルのダッシュボード agent-dashboard の会話ログの読み取りから移植しています。
+How the events are built is ported from the transcript reading of agent-dashboard, a local dashboard.
 
-## 使い方
+## Display language
 
-確かめてあることと、まだのことは次のとおりです。
+status-board's text is in English by default.
+It switches to Japanese when Claude Code's `language` setting says Japanese (`ja`, `jp`, `jpn`, `japanese`, `日本語`, or a value starting with `ja-` or `ja_`), or, with no `language` setting, when the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that is set starts with `ja` (such as `ja_JP.UTF-8`).
+Any other `language` value means English, whatever the environment says.
 
-- **Desktop アプリ（エンジン 2.1.326）で確認**：帯の表示。枠がウィンドウ右端の列に出ること。ボタンの押下からの要約 1 回（5.9 秒、キャッシュからの読み 321,578 トークン、出力 490 トークン）
-- **`claude -p --plugin-dir`（v2.1.327）で確認**：mod の読み込み（フックの受け付けと `/board` の登録を含む）。会話ログの読み取り（33 MB の会話ログを最後まで読み、件数が別の方法で数えた値と一致した）。`turn.complete` のフックから頼んだ要約が返ること
-- **Desktop アプリで未確認**：ターンの終わりの自動更新。枠を開いたときの要約。保存したボードの復元
+```json
+{ "language": "japanese" }
+```
 
-`/plugin` でのインストールと更新の手順は、[リポジトリの README](../../README.md) にまとめてあります。
-インストールせずに試すときは、clone したリポジトリのルートで次のように起動します。
+The language covers both what is drawn (the band, the pane, its buttons and labels, the `/board` command, toasts, the status line) and what is sent to the model (the summary prompt).
+So the board too is written in that language: the headings and the bullets alike.
+A board saved earlier is shown as it was written until it is next updated.
+The language is decided when the session starts, so a changed setting takes effect from the next session start or plugin reload.
+In both languages, times are shown in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`).
+
+## Usage
+
+What has been checked, and what has not yet:
+
+- **Checked in the desktop app (engine 2.1.326)**: the band's display. The pane appearing in a column at the window's right edge. One summary from a button press (5.9 seconds, 321,578 tokens read from the cache, 490 tokens of output)
+- **Checked with `claude -p --plugin-dir` (v2.1.327)**: loading the mod (including the hooks being accepted and `/board` registered). Reading the transcript (a 33 MB transcript read to its end, with the count matching one made another way). A summary asked for from the `turn.complete` hook coming back
+- **Not yet checked in the desktop app**: the automatic update at the end of a turn. The summary when the pane is opened. Restoring a saved board
+
+How to install and update through `/plugin` is in the [repository README](../../README.md).
+To try it without installing, start Claude Code like this from the root of the cloned repository.
 
 ```bash
 claude --plugin-dir ./plugins/status-board
 ```
 
-## 制約
+## Limitations
 
-- 会話ログを持たないセッション（`$.session.info()` の `transcriptPath` が空）では何も表示しない
-- 1 行が 64 MiB を超える会話ログの行（大きな画像を貼った入力など）は読み飛ばす。その行が人の指示でもカードにならない
-- 初回は会話ログを先頭から読むので、長いセッションではカードがそろうまで少しかかる
+- Nothing is shown in a session without a transcript (`transcriptPath` of `$.session.info()` empty)
+- Lines of the transcript longer than 64 MiB (such as an input with a large image pasted) are skipped. Even if such a line is a person's prompt, it makes no card
+- The first read is from the start of the transcript, so in a long session it takes a little while for the cards to fill in
 
-## テスト
+## Tests
 
 ```bash
 cd plugins/status-board

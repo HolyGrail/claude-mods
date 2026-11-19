@@ -1,7 +1,9 @@
 # cache-meter
 
-会話のプロンプトキャッシュがあと何分もつかを、プロンプト入力欄の上の帯にゲージで常時表示する Claude Code の mod です。
-キャッシュが切れたあとは、次のメッセージで何トークンを書き直すことになるかを表示します。
+English | [日本語](README.ja.md)
+
+A Claude Code mod that keeps a gauge of how many minutes the conversation's prompt cache has left in the band above the prompt.
+Once the cache has expired, it shows how many tokens the next message will write to the cache again.
 
 ```text
 cache ● ~1h ████████░░ 48m left · hit 91% · misses 0
@@ -9,86 +11,86 @@ cache ● ~1h █░░░░░░░░░ 53s left · hit 91% · misses 0
 cache ○ cold · next message re-caches 128k tokens
 ```
 
-Claude Code はメッセージのたびに会話全体を送り直していて、キャッシュはその読み直しを安くしています。
-ところが、キャッシュの残り時間は、`/usage` を開くかステータスラインのスクリプトを書かない限り目に入りません。
-席を外して戻ってきた直後の 1 ターンが遅く、使用量も多く消費するのは、その間に TTL が切れていたからです。
-残りが少ないときに聞きたいことがあるなら、切れる前に聞いておくほうが安く済みます。
+Claude Code sends the whole conversation again with every message, and the cache is what makes that rereading cheap.
+Yet the time the cache has left is out of sight unless you open `/usage` or write a status line script.
+When the first turn after you step away and come back is slow and uses a lot, it is because the TTL ran out meanwhile.
+If there is something you want to ask while little time is left, asking before the cache expires costs less.
 
-## 表示
+## Display
 
-- **ゲージ**：TTL のうち残っている割合を塗る。Desktop アプリでは SVG、ターミナルでは文字のバーで描き、ターミナルで 1 行に収まらないときはバーを省く。usage-meter など、ほかの mod の行とは別の行に描く
-- **色**：残りが TTL の 2 割以上なら緑、2 割を切ると黄、切れたら赤
-- **残り時間**：1 分ごとに減り、最後の 1 分は秒で数える。切れた瞬間に `cold` へ変わる
-- **hit**：この会話のメインのリクエストで、入力トークンのうちキャッシュから読んだ割合
-- **misses**：直前のリクエストのあとにキャッシュが持っていた量の半分も読めなかったリクエストの数。原因が分かるとき（TTL 切れなら `expired`、モデルの切替なら `model switch`）は括弧で添える。`/compact` のあとの作り直しは数えない
+- **Gauge**: fills the share of the TTL that is left. The desktop app draws it in SVG, the terminal as a bar of characters, and in the terminal the bar is dropped when the line does not fit. It is drawn on a line of its own, apart from the lines of other mods such as usage-meter
+- **Color**: green while 20% or more of the TTL is left, yellow below 20%, red once expired
+- **Time left**: counts down by the minute, and by the second in the last minute. It turns to `cold` the moment the cache expires
+- **hit**: the share of input tokens in this conversation's main requests that were read from the cache
+- **misses**: the number of requests that read less than half of what the cache held after the request before. When the cause is known (`expired` for a lapsed TTL, `model switch` for a model switch) it follows in parentheses. The rebuild after `/compact` is not counted
 
-キャッシュが温まっていない状態は、次のように表示します。
+A cache that is not warm is shown like this.
 
-| 表示 | 状態 |
+| Display | State |
 | --- | --- |
-| `cache ○ cold · next message re-caches N tokens` | TTL を過ぎた。N は直前の応答の入力（キャッシュの読み書きを含む）と出力の合計 |
-| `cache ○ cold · model switch · …` | モデルを切り替えた。キャッシュはモデルごとなので、次の送信は会話全体を書き直す |
-| `cache ○ rebuilding · …` | `/compact` のあと。会話部分のキャッシュは、次の送信で要約から作り直される |
-| `cache ○ off · no cache tokens reported` | 応答にキャッシュの読み書きがなかった。キャッシュを無効にしているか、ゲートウェイが報告していない |
-| `cache ○ off · DISABLE_PROMPT_CACHING` | 環境変数でキャッシュを切っている |
+| `cache ○ cold · next message re-caches N tokens` | The TTL has passed. N is the last response's input (cache reads and writes included) plus its output |
+| `cache ○ cold · model switch · …` | The model was switched. The cache is per model, so the next request writes the whole conversation again |
+| `cache ○ rebuilding · …` | After `/compact`. The conversation's part of the cache is rebuilt from the summary at the next request |
+| `cache ○ off · no cache tokens reported` | The response had no cache reads or writes. Caching is off, or a gateway does not report it |
+| `cache ○ off · DISABLE_PROMPT_CACHING` | Caching is turned off by the environment variable |
 
-最初の応答が返るまでと、`/clear` の直後は何も表示しません。
+Nothing is shown until the first response comes back, or right after `/clear`.
 
-## TTL の決め方
+## How the TTL is decided
 
-残り時間は、メイン会話の最後のリクエストを送った時刻から数えます。
-キャッシュを読んだリクエストは、そのたびにタイマーを戻すからです。
-サブエージェントやワークフローは別のキャッシュを持ち、TTL も別なので、そのリクエストでは数え直しません。
-ただし fork は会話をそのまま引き継ぐので、最初のリクエストがメイン会話のキャッシュを読み、残り時間を戻します。
+The time left counts from when the main conversation's last request was sent.
+That is because each request that reads the cache resets its timer.
+Subagents and workflows have caches of their own, with TTLs of their own, so their requests do not restart the count.
+A fork, however, carries the conversation over as it is, so its first request reads the main conversation's cache and restarts the time left.
 
-TTL は、Claude Code が採用するのと同じ優先順で決めます。
+The TTL is decided in the same order of precedence Claude Code uses.
 
-1. モデル切替のときに Claude Code 自身が知らせる TTL（`PostModelSwitch` の `cache_ttl`）
-2. `FORCE_PROMPT_CACHING_5M=1` なら 5 分
-3. 環境変数 `CLAUDE_CODE_PROMPT_CACHE_TTL`（`5m` か `1h`）
-4. 設定 `promptCacheTtl`（`5m` か `1h`）
-5. `ENABLE_PROMPT_CACHING_1H=1` なら 1 時間
-6. どれもなければ既定値。サブスクリプションでプランの利用枠内なら 1 時間、利用枠を超えて usage credits で払っている場合と、API キーやクラウドプロバイダーなら 5 分
+1. The TTL Claude Code itself reports at a model switch (`cache_ttl` of `PostModelSwitch`)
+2. 5 minutes if `FORCE_PROMPT_CACHING_5M=1`
+3. The environment variable `CLAUDE_CODE_PROMPT_CACHE_TTL` (`5m` or `1h`)
+4. The setting `promptCacheTtl` (`5m` or `1h`)
+5. 1 hour if `ENABLE_PROMPT_CACHING_1H=1`
+6. Otherwise the default: 1 hour on a subscription within the plan's usage, 5 minutes when paying with usage credits past the plan's usage, and with an API key or a cloud provider
 
-6 の既定値だけは推定なので、TTL の前に `~` を付けます（`~1h`）。
-mods API はプランの種類を直接は渡さないため、OAuth ログインならサブスクリプション、5 時間か 7 日の制限が 100% に達していたら usage credits、と見なしています。
-1 は実際の値ですが、モデルを切り替えたときにしか届きません。
+Only the default in 6 is an estimate, so the TTL gets a leading `~` (`~1h`).
+The mods API does not pass the kind of plan directly, so an OAuth login is taken as a subscription, and a 5-hour or 7-day limit at 100% as usage credits.
+1 is the real value, but it arrives only when the model is switched.
 
-TTL はリクエストごとに、応答が返った時点で決めて記録します。
-Claude Code もリクエストごとに TTL を選ぶので、usage credits で書いた 5 分のキャッシュは、そのあと利用枠が戻っても 5 分で切れます。
+The TTL is decided and recorded for each request when its response comes back.
+Claude Code too picks a TTL for each request, so a 5-minute cache written on usage credits still expires in 5 minutes after the plan's usage comes back.
 
-## 使い方
+## Usage
 
-Claude Code v2.1.292 で、読み込みと、実際の応答からの表示を確認しています。
-`/plugin` でのインストールと更新の手順は、[リポジトリの README](../../README.md) にまとめてあります。
-インストールせずに試すときは、clone したリポジトリのルートで次のように起動します。
+Loading, and the display from real responses, have been checked on Claude Code v2.1.292.
+How to install and update through `/plugin` is in the [repository README](../../README.md).
+To try it without installing, start Claude Code like this from the root of the cloned repository.
 
 ```bash
 claude --plugin-dir ./plugins/cache-meter
 ```
 
-## 制約
+## Limitations
 
-次の操作は mod から見えないので、表示に反映されません。
+The mod cannot see the following, so they do not show in the display.
 
-- `/rewind`：巻き戻した先の接頭辞はそれ以後のリクエストが読み続けているので、キャッシュは残る。ただし再キャッシュのトークン数は巻き戻す前の大きさのまま表示される
-- `opusplan` でのプランモードの出入り：モデルの切替にあたるが、切替のイベントが来ない場合は、次の応答が返るまで前のモデルの残り時間を表示する
-- effort の変更、fast mode を有効にした直後、MCP サーバーの接続：多くの場合キャッシュを失うが、表示は次の応答まで変わらない
-- `DISABLE_PROMPT_CACHING_SONNET` などのモデル別の無効化：そのファミリーのエイリアスが指すモデルにだけ効くが、mods API からはエイリアスの解決先が分からない。そのモデルに切り替えた直後は `cold` と表示し、最初の応答で `off` に変わる
+- `/rewind`: later requests keep reading the prefix rewound to, so the cache stays. The re-cache token count, however, still shows the size before the rewind
+- Entering and leaving plan mode under `opusplan`: this is a model switch, but when no switch event comes, the previous model's time left shows until the next response comes back
+- Changing effort, just after turning on fast mode, connecting an MCP server: the cache is lost in most cases, but the display does not change until the next response
+- Per-model disabling such as `DISABLE_PROMPT_CACHING_SONNET`: it applies only to the model the family's alias points to, and the mods API does not say what the alias resolves to. Right after switching to that model the display reads `cold`, and turns to `off` at the first response
 
-公式のステータスラインスクリプトなら、`prompt_cache` オブジェクト（v2.1.251 以降）から `expires_at` や `recache_tokens_if_cold` を Claude Code 自身の計算で受け取れます。
-この mod は、その値に手が届かない mods API の中で、同じものを応答のトークン数から組み立てています。
+An official status line script gets `expires_at` and `recache_tokens_if_cold` from the `prompt_cache` object (v2.1.251 or later), computed by Claude Code itself.
+This mod works within the mods API, which cannot reach those values, and builds the same things from the responses' token counts.
 
-## 前提にした仕様
+## Behavior relied on
 
-すべて [How Claude Code uses prompt caching](https://code.claude.com/docs/en/prompt-caching) によります。
+All of it is from [How Claude Code uses prompt caching](https://code.claude.com/docs/en/prompt-caching).
 
-- キャッシュを読んだリクエストは、そのたびに TTL のタイマーを戻す
-- サブスクリプションでプランの利用枠内なら、メイン会話は 1 時間、サブエージェントやワークフローは 5 分。usage credits、API キー、クラウドプロバイダーではメイン会話も 5 分
-- キャッシュはモデルごとで、`opusplan` ではプランモードの出入りがモデルの切替になる
-- `/compact` は会話部分のキャッシュを作り直し、`/rewind` は巻き戻した先のキャッシュをそのまま読む
+- Each request that reads the cache resets the TTL's timer
+- On a subscription within the plan's usage, the main conversation gets 1 hour and subagents and workflows 5 minutes. With usage credits, an API key or a cloud provider the main conversation also gets 5 minutes
+- The cache is per model, and under `opusplan` entering and leaving plan mode is a model switch
+- `/compact` rebuilds the conversation's part of the cache, and `/rewind` reads the cache of the point rewound to as it is
 
-## テスト
+## Tests
 
 ```bash
 cd plugins/cache-meter

@@ -1,209 +1,226 @@
 # pr-relay
 
-セッションの PR を 1 分ごとに確かめ、マージされたときと Codex がレビューを付けたときだけセッションを起こす Claude Code の mod です。
-人が GitHub を見て「マージした」「レビューが来た」と打たなくても、セッションが次の作業を始めます。
-モデルがレビューの到着を待つために sleep やポーリングの tool を呼ぶ必要もなくなります。
-Codex が最新の push をレビューしないままのときは、PR に `@codex review` とコメントしてレビューを頼みます。
+English | [日本語](README.ja.md)
 
-## 監視する PR
+A Claude Code mod that checks the session's PR every minute and wakes the session only when it is merged or when Codex reviews it.
+The session starts its next piece of work without a person watching GitHub and typing "merged" or "the review is in".
+Nor does the model need to call sleep or a polling tool to wait for a review to arrive.
+When Codex has left the latest push unreviewed, the mod asks for a review by commenting `@codex review` on the PR.
 
-Desktop アプリでは、セッションの PR バーの先頭に表示される PR（最後に紐付けた PR）を監視します。
-新しい PR が紐付けられると、次の確認で監視先を切り替えます。
-先頭の PR が再オープンした場合も、その PR の監視を始めます。
-PR バーのほかの PR はマージとクローズだけを追い、トーストで知らせます。
-マージされた PR には、それぞれ `cleanup` の行も出します。
-この確認にはアプリのキャッシュを使い、GitHub への問い合わせは増やしません。
+## The PR it watches
 
-ターミナルでは、これまでどおりセッションの開始時に `gh pr view` で現在のブランチの OPEN な PR を探します。
-Desktop アプリでも、先頭に OPEN な PR がない場合やアプリの情報を取得できない場合は、同じ方法で探します。
+In the desktop app, it watches the PR shown first in the session's PR bar (the PR bound last).
+When a new PR is bound, the next check switches the watch to it.
+When the first PR is reopened, it starts watching that PR too.
+For the other PRs in the PR bar it follows only merges and closes, and tells of them in a toast.
+Each merged PR also gets a `cleanup` row.
+These checks use the app's cache and add no GitHub requests.
 
-セッションの途中で `gh pr create` を実行すると、その出力の URL から監視を始めます。
-出力に PR の URL が複数あるときは、後ろに `#` や `/` が続かないもののうち最後の URL を使います。
-同じコマンドでレビューに返信すると、返信したコメントの URL（`…/pull/7#discussion_r1`）が新しい PR の URL より先に出るからです。
-`gh pr new` や `gh -R owner/repo pr create` も認識し、`-Rowner/repo`、`--repo owner/repo`、`--repo=owner/repo` の形式でも指定できます。
-`git push` を実行したときに PR を監視していなければ、もう一度 `gh pr view` で探します。
-`git -C <dir> push` では、指定したディレクトリのブランチの PR を探します。
-相対パスはセッションの作業ディレクトリを基準にし、`-C` が複数ある場合は指定順に結合して、`..` の解決はファイルシステムに任せます。
-`--work-tree=<dir>` または `--work-tree <dir>` があれば、そのディレクトリの PR を探し、相対パスはすべての `-C` を適用した後のディレクトリを基準にします。
-引用符で囲まれていない先頭の `~` や `~/` は `HOME` で展開し、引用符で囲まれたチルダは文字どおりの相対パスとして扱います。
-ディレクトリに `$` やバッククォートが含まれる場合、引用符のない `~user` の形式の場合、`HOME` がなく `~` を展開できない場合は、その push による PR 検索を省略します。
-1 回の Bash 呼び出しに複数の `git push` があり、解決した検索先のディレクトリが異なる場合も、push の追跡は続けて PR 検索だけを省略します。
-`git push-deploy` や `gh pr create-extra`、`gh pr new-extra` は検出対象に含めません。
-`mcp__pr-relay__watch` に `pr_url` を渡した場合も、その PR の監視を始めます。
-Desktop アプリの先頭の PR が同じで OPEN のままなら、これらの方法で指定した監視先を保ちます。
-アプリの情報が一部省略されても、確認済みの PR や状態は保ちます。
+In the terminal, as before, it looks for the current branch's OPEN PR with `gh pr view` when the session starts.
+The desktop app falls back on the same lookup when there is no OPEN PR first in the bar, or when the app's information cannot be read.
 
-## 起こし方
+When `gh pr create` runs in the middle of a session, the mod starts watching from the URL in its output.
+When the output holds several PR URLs, it takes the last one not followed by `#` or `/`.
+That is because when the same command replies to a review, the URL of the comment replied to (`…/pull/7#discussion_r1`) comes before the new PR's URL.
+It also recognizes `gh pr new` and `gh -R owner/repo pr create`, with the repository also given as `-Rowner/repo`, `--repo owner/repo` or `--repo=owner/repo`.
+When `git push` runs while no PR is watched, it looks again with `gh pr view`.
+With `git -C <dir> push`, it looks for the PR of the branch in the given directory.
+Relative paths are taken from the session's working directory; several `-C` are joined in the order given, and resolving `..` is left to the file system.
+With `--work-tree=<dir>` or `--work-tree <dir>`, it looks for the PR of that directory, with a relative path taken from the directory after every `-C` has been applied.
+An unquoted leading `~` or `~/` is expanded through `HOME`, while a quoted tilde is taken literally, as a relative path.
+When the directory contains `$` or a backtick, is an unquoted `~user`, or needs `~` expanded with no `HOME`, the PR lookup for that push is skipped.
+When one Bash call holds several `git push` whose lookup directories resolve differently, the push is still tracked and only the PR lookup is skipped.
+`git push-deploy`, `gh pr create-extra` and `gh pr new-extra` are not detected.
+Passing `pr_url` to `mcp__pr-relay__watch` also starts watching that PR.
+While the desktop app's first PR stays the same and OPEN, a watch set in these ways is kept.
+When the app leaves out part of its information, the PRs and states already known are kept.
 
-| GitHub で起きたこと | セッションへの知らせ方 |
+## How it wakes the session
+
+| What happened on GitHub | How the session is told |
 | --- | --- |
-| Codex がレビューを付けた | 指摘の本文と場所を載せたプロンプトを送る |
-| Codex が head のレビューを指摘なしで終えた（[要約コメント](#codex-の判定)のない PR では、👍 を付けた、または「Didn't find any major issues」とコメントした） | CI の確認と完了の報告を促すプロンプトを送る。文面には、そのときの head の SHA を載せる |
-| Codex が head のレビューを 3 分たっても始めない | PR に `@codex review` とコメントし、トーストを出す（[条件](#codex-がレビューを始めないとき)） |
-| Codex の利用上限に達した | トーストだけ出す |
-| 監視中の PR またはアプリに紐付いた PR のいずれかがマージされた | トーストを出し、プロンプトの上の帯にその PR の `cleanup` ボタンを出す。押すと、マージ後の後処理（残った事項の issue 化、worktree とブランチの片付け、プロジェクト固有の手順など）を促すプロンプトを送る。監視中の PR なら、ほかのセッションへ[お知らせ](#ほかのセッションへのお知らせ)も出す |
-| 監視中の PR またはアプリに紐付いた PR がクローズされた | トーストだけ出す |
+| Codex left a review | Sends a prompt with the findings' text and where they are |
+| Codex finished reviewing the head with no findings (on a PR without a [summary comment](#how-codex-is-read), it gave a 👍 or commented "Didn't find any major issues") | Sends a prompt asking to check CI and report the work complete. The text names the head's SHA at that time |
+| Codex has not begun reviewing the head 3 minutes on | Comments `@codex review` on the PR and raises a toast ([conditions](#when-codex-does-not-start-a-review)) |
+| Codex hit its usage limit | Raises a toast only |
+| The watched PR, or any PR bound in the app, was merged | Raises a toast and puts a `cleanup` button for that PR in the band above the prompt. Pressing it sends a prompt asking for the post-merge follow-up (filing what is left as issues, cleaning up the worktree and branch, steps particular to the project, and so on) |
+| The watched PR, or a PR bound in the app, was closed | Raises a toast only |
 
-Desktop アプリで Auto-fix（CI モニター）が有効な PR では、Codex のレビュー、コメントによる approved、利用上限の通知を、コメント本文も届ける CI モニターに任せます。
-その場合、pr-relay は Codex の 👍 とマージを引き続き知らせ、ステータス行に「CI モニター併用」と表示します。
-先頭の PR はアプリの状態から、ほかの PR はセッションに届いた CI モニター自身の通知から Auto-fix が有効だと判断します。
-同じ PR を見ているほかのセッション（Desktop アプリのセッションと端末のセッションなど）のどれかで CI モニターが動いていれば、通知を任されたのが CI モニターのないセッションでも、レビューは CI モニターに任せて送りません（同じレビューで 2 つのセッションが動き出さないようにするため）。
-アプリから PR の紐付けがないと報告された場合は、この判定をリセットします。
-アプリが紐付いた PR の一覧を返した場合は、その一覧と先頭の PR から外れた PR の判定も解除します。
-一覧が省略された場合は、これまでの判定を保ちます。
+On a PR with Auto-fix (the CI monitor) on in the desktop app, Codex's reviews, approval by comment and usage limit notices are left to the CI monitor, which also delivers the comment text.
+pr-relay then still tells of Codex's 👍 and of merges, and the status line shows `with CI monitor`.
+For the first PR it learns that Auto-fix is on from the app's state; for other PRs, from the CI monitor's own notices that reach the session.
+If the CI monitor is running in any other session watching the same PR (a desktop app session and a terminal session, say), the review is left to the CI monitor and not sent, even when the session chosen to notify has no CI monitor (so that two sessions do not set off on the same review).
+When the app reports that no PR is bound, this judgment is reset.
+When the app returns the list of bound PRs, the judgment is also cleared for PRs that have dropped out of that list and the first PR.
+When the list is left out, the judgment so far is kept.
 
-`cleanup` が頼むのは worktree の削除だけではなく、マージ後の後処理の全体です。
-後処理は worktree やブランチを消すので、自動では始めずボタンにしています。
-作業に使っているスキルやコマンドが後処理を定めていれば（`/dev cleanup` など）、プロンプトはそれに従うよう伝えます。
-定めがなければ、次の順に進めるよう伝えます。
+What `cleanup` asks for is not only removing the worktree but the whole post-merge follow-up.
+The follow-up deletes worktrees and branches, so it does not start on its own but waits behind a button.
+If the skill or command used for the work defines its own follow-up (such as `/dev cleanup`), the prompt says to follow it.
+Otherwise, it says to proceed in this order.
 
-1. PR の URL から、マージ済みであることとブランチを確かめる
-2. プロジェクトの CLAUDE.md が後処理を定めていれば、何かを消す前に読み、その手順と順序に従う
-3. 別の PR やスコープ外に回した事項が残っていれば、issue にするかをユーザーに確かめる
-4. そのブランチを checkout している worktree を探し、worktree とローカルブランチを片付ける。リモートのブランチが残っていれば、消すかをユーザーに確かめる
-5. 何をして、何を見送ったかを報告する
+1. From the PR's URL, confirm that it is merged and find its branch
+2. If the project's CLAUDE.md defines post-merge steps, read them before removing anything, and follow their steps and order
+3. If items were moved to another PR or left out of scope, ask the user whether to file them as issues
+4. Find the worktree that has that branch checked out, and clean up the worktree and the local branch. If the remote branch remains, ask the user whether to delete it
+5. Report what was done and what was skipped
 
-スキルの手順に従う場合も含めて、worktree が見つからないときや別のリポジトリの PR のときは、何も消さずに報告するよう伝えます。
-消す前には未コミットの変更や push していないコミットを確かめ、残っていれば消さずに報告するよう伝えます。
-`cleanup` の行は新しいものから最大 3 件を表示し、`cleanup` と `閉じる` はその行だけに作用します。
-デスクトップでは各行を角丸の枠で囲み、使用量メーターとは別のカードとして表示します。
-監視先が変わってもほかの PR の行は残り、同じ PR を再び監視するとその行を消します。
-アプリで OPEN と確認した PR の行も消します。
-アプリのほかの PR は、このセッションで OPEN だったものがマージまたはクローズされたときだけ知らせます。
-`/resume`、`/clear`、`/branch` で会話が変わると、アプリの PR の状態と `cleanup` の行をリセットします。
-マージとクローズを見たら、その PR のポーリングは止めます。
+Including when following a skill's steps, it says to remove nothing and report when no worktree is found or the PR belongs to another repository.
+It says to check for uncommitted changes and unpushed commits before removing anything, and if any remain, to remove nothing and report.
+The newest `cleanup` rows are shown, up to three, and `cleanup` and `Dismiss` act on their own row only.
+On the desktop, each row is framed with rounded corners and shown as a card apart from the usage meters.
+Rows of other PRs stay when the watch changes, and watching the same PR again removes its row.
+A PR the app reports OPEN loses its row as well.
+The app's other PRs are told of only when one that was OPEN in this session is merged or closed.
+When `/resume`, `/clear` or `/branch` changes the conversation, the app's PR states and the `cleanup` rows are reset.
+Once a merge or close is seen, polling of that PR stops.
 
-## マージ先が進んだときの rebase
+## Rebasing when the base branch moves on
 
-監視中の PR のブランチを push すると、そのコミットがマージ先の先端を含んでいるかを確かめます。
-含んでいなければ、Bash の結果に次の一文を添えます。モデルだけが読みます。
+When the watched PR's branch is pushed, the mod checks whether the commits include the tip of the base branch.
+If they do not, it appends the following sentence to the Bash result. Only the model reads it.
 
 ```
-pr-relay: PR #12 のマージ先 main が進んでいて、いま push したコミットはその先端 (1a2b3c4) を含んでいません。次の push の前に origin/main へ rebase してください。
+pr-relay: PR #12's base branch main has advanced, and the commits just pushed do not include its tip (1a2b3c4). Rebase onto origin/main before the next push.
 ```
 
-マージ先の先端は、1 分ごとのポーリングで GitHub から取った値です。
-手元にまだ fetch していない先端も、含んでいないものとして扱います。
-確かめるのは手元の `git merge-base --is-ancestor` だけなので、push のたびにネットワークへは出ません。
-rebase をその場でなく次の push の前にさせるのは、作業の途中で rebase すると、コンフリクトの解消が実装の変更と混ざるからです。
+The base branch's tip is the value taken from GitHub by the poll every minute.
+A tip not fetched locally yet also counts as not included.
+The check is only a local `git merge-base --is-ancestor`, so it makes no network request at each push.
+The rebase is asked for before the next push rather than at once because rebasing in the middle of the work mixes resolving conflicts with the change being implemented.
 
-次の push は確かめません。
+These pushes are not checked.
 
-- 失敗した push と、何も動かさなかった push
-- 出力が PR のブランチ以外の移動だけを示す push
-- 1 回の Bash で別々のディレクトリから行った push
-- origin が監視中の PR の GitHub リポジトリではないディレクトリからの push（`mcp__pr-relay__watch` に別のリポジトリの URL を渡した場合など）。そのリポジトリにはマージ先の先端がないので、毎回「含んでいない」と誤って判定してしまいます
-- 最初のポーリングが答える前の push（`gh pr create` の直後など）。マージ先の先端をまだ知らないからです
+- A push that failed, and a push that moved nothing
+- A push whose output shows only branches other than the PR's moving
+- Pushes made from different directories in one Bash call
+- A push from a directory whose origin is not the watched PR's GitHub repository (such as when `mcp__pr-relay__watch` was given another repository's URL). That repository does not have the base branch's tip, so it would wrongly be judged "not included" every time
+- A push before the first poll answers (such as right after `gh pr create`). The base branch's tip is not known yet
 
-バージョン 0.9 までは、監視中の PR のマージを見たときに notice-board へ「main が進んだ」と投稿していました。
-しかし、お知らせは消えずに溜まり、すでに最新の main から作った worktree にも届いていました。
-rebase が要るのは push の直前で、しかも遅れているブランチだけなので、push のときに確かめる形に改めました。
+Up to version 0.9, when the watched PR was seen merged, the mod posted "main has advanced" to notice-board.
+But the notices piled up without going away, and reached even worktrees already made from the latest main.
+A rebase is needed only just before a push, and only on a branch that has fallen behind, so the check moved to the push.
 
-プロンプトは `$.prompt.submit` で送るので、実行中のターンには割り込まず、セッションが待機中になってから新しいターンを始めます。
+Prompts are sent with `$.prompt.submit`, so they do not cut into a running turn but start a new turn once the session is idle.
 
-ステータス行には、監視中の PR 番号と最後に確かめた時刻（JST）を出します。
-起動時に `gh pr view` が失敗して PR を探せなかったとき（未認証、ネットワークの切断）は、`PR 検索失敗 21:00: <gh のエラー>` を出し、1 分ごとに探し直します。
-git リポジトリではないフォルダ、remote のないリポジトリ、detached HEAD で開いたセッションは、探す PR がそもそもないので、失敗ではなく「PR なし」として扱います。
-ステータス行には何も出さず、`git push` を実行するまで探し直しません。
-`gh pr create` が出力した URL は、探し直しを待たずにその場で監視に入ります。
+The status line shows the watched PR's number and the time it was last checked, in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`).
+When `gh pr view` fails at startup and the PR cannot be looked up (not logged in, network down), it shows `PR lookup failed 21:00: <gh error>` and looks again every minute.
+A session opened in a folder that is not a git repository, in a repository with no remote, or on a detached HEAD has no PR to find in the first place, so this is treated as "no PR", not a failure.
+Nothing is shown in the status line, and it does not look again until `git push` runs.
+A URL that `gh pr create` printed is watched at once, without waiting for the next lookup.
 
-## Codex の判定
+## How Codex is read
 
-Codex の 👍 は PR に 1 つしか付かず、どのコミットへの 👍 かを示しません。
-前の push への 👍 が残った PR に、Codex がレビューしなかったコミットが積まれると、GitHub の画面では approved に見えます。
-2026 年 11 月に 5 つのリポジトリの PR 170 件を調べたところ、7 件が Codex のレビューしていない head のままマージされていました。
+Codex's 👍 is one per PR and does not say which commit it is for.
+When commits Codex has not reviewed are stacked on a PR that still carries the 👍 from an earlier push, GitHub's page shows it as approved.
+A look at 170 PRs across 5 repositories in November 2026 found 7 merged with a head Codex had not reviewed.
 
-一方で、Codex は PR ごとに要約コメントを 1 つ置き、レビューのたびに書き換えます。
-このコメントは、レビューしたコミットの SHA、状態（`running` か `completed`）、指摘の有無を持っています。
-要約コメントがある PR では、mod はこのコメントだけで head の状態を決めます。
+Codex, on the other hand, keeps one summary comment per PR and rewrites it at every review.
+That comment holds the SHA of the commit reviewed, the state (`running` or `completed`), and whether there are findings.
+On a PR with a summary comment, the mod decides the head's state from that comment alone.
 
-| 要約コメントの内容 | mod の扱い |
+| What the summary comment says | How the mod takes it |
 | --- | --- |
-| head のレビューを指摘なしで終えた | approved として知らせる |
-| head のレビューを終え、指摘がある | approved にしない（指摘はレビューとして知らせる） |
-| レビューが進行中 | 待つ |
-| 上のどれでもない（別のコミットのレビューで止まっている、head のレビューが完了していない） | 未レビューとして扱う |
+| Reviewed the head with no findings | Tells of it as approved |
+| Reviewed the head, with findings | Not approved (the findings are told as a review) |
+| A review is in progress | Waits |
+| None of the above (stopped at a review of another commit, the head's review not completed) | Treated as unreviewed |
 
-approved になるのは 1 行目だけで、ほかの行では 👍 があっても approved にしません。
-セキュリティレビューの結果も載っている PR では、そちらも head を指摘なしで終えるまで approved にしません。
-approved の時刻には、要約コメントが最後に編集された時刻を使います。
+Only the first row is approved; in the other rows a 👍 does not make it approved.
+On a PR where the security review's result also appears, that too must finish on the head with no findings before it is approved.
+The time of the approval is the time the summary comment was last edited.
 
-要約コメントの形式は公開された仕様ではなく、2026 年 11 月の PR で観察したものです。
-要約コメントがない PR と、形式が変わって読めなくなった PR では、これまでどおり 👍 と「Didn't find any major issues」のコメントで approved を判定します。
-その場合、👍 は作成時刻が前の push のときのまま残ることがあるので、「👍 がある」だけでは approved と見なさず、最後の push より後のものだけを数えます。
-レビューと利用上限のコメントは、要約コメントの有無にかかわらず、最後の push より後のものだけを数えます。
+The summary comment's format is not a published specification but what was observed on PRs in November 2026.
+On a PR without a summary comment, and on one whose format changed so it can no longer be read, approval is judged as before by the 👍 and the "Didn't find any major issues" comment.
+In that case the 👍 can keep the creation time of an earlier push, so "there is a 👍" alone is not taken as approved: only one after the last push counts.
+Reviews and usage limit comments, with or without a summary comment, count only after the last push.
 
-最後の push の時刻には、次のうち最も新しいものを使います。
+The time of the last push is the newest of these.
 
-- `mcp__pr-relay__watch` の `since` で指定した時刻、または `gh pr create` を始めた時刻
-- このセッションで `git push` を始めた時刻（push が終わってから、PR の head がその push の出力にあるコミットになったときだけ使う。出力にコミットがなければ、push 開始時に分かっていた head から変わったときに使う。`Everything up-to-date` や別ブランチへの push では基準時刻を進めない）
-- PR の最新コミットのコミット時刻
+- The time given in `since` to `mcp__pr-relay__watch`, or the time `gh pr create` started
+- The time a `git push` started in this session (used only once the push has finished and the PR's head has become a commit in that push's output. If the output names no commit, used once the head has changed from the one known when the push started. `Everything up-to-date` and pushes to another branch do not move the baseline)
+- The commit time of the PR's latest commit
 
-まだ知らせていないレビューがあれば、approved より先に知らせます。
-最新のレビューより後に approved のイベントがあれば、レビューのプロンプトの末尾にその時刻を添え、別の approved のプロンプトは送りません。
-最新のレビュー以前の approved も通知済みとして記録し、レビューだけを知らせます。
+Reviews not told yet are told before an approval.
+When an approval event comes after the newest review, its time is added at the end of the review prompt, and no separate approval prompt is sent.
+An approval at or before the newest review is also recorded as told, and only the review is told.
 
-レビューを知らせるときだけ、対象のレビューの詳細を 1 回の追加クエリで取得し、指摘の本文と場所、コメント ID、URL をプロンプトに載せます。
-本文は 1 件につき 4,000 文字で切り、プロンプト全体は 30,000 文字以内に収めます。
-各レビューの inline コメントは 100 件まで取得し、載せきれないコメントは残りの件数と PR の files ページで案内します。
-inline コメントがないレビューでは、`<details>` の部分を除いたレビュー本文を載せます。
-詳細を取得できなくても、件数と `gh api` でコメントを読む手順を載せてセッションを起こします。
+Only when telling of a review does the mod fetch that review's details in one extra query, putting the findings' text and location, comment ids and URLs in the prompt.
+Each body is cut at 4,000 characters, and the whole prompt is kept within 30,000.
+Up to 100 inline comments are fetched per review, and the comments that do not fit are pointed to with the count left and the PR's files page.
+For a review without inline comments, the review body is included with its `<details>` parts removed.
+Even when the details cannot be fetched, the session is woken with the counts and the steps to read the comments with `gh api`.
 
-mod は通知済みかどうかを記録しますが、指摘への対応が済んだかは判定しません。
-現在の head がレビュー済みかも、要約コメントがない PR では判定しません。
-利用上限のトーストは、最後の push より後に上限のコメントがあれば、上限が解けた後でも出ます。
+The mod records whether something has been told, but does not judge whether the findings have been dealt with.
+Nor, on a PR without a summary comment, does it judge whether the current head has been reviewed.
+The usage limit toast is raised whenever there is a limit comment after the last push, even after the limit has lifted.
 
-### Codex がレビューを始めないとき
+### When Codex does not start a review
 
-Codex は、push のたびに head をレビューし直すとは限りません。
-自分で始める場合は、コミットから 20 秒ほどで要約コメントが `running` になります（6 回の push で確かめました）。
-そこで、head を最初に見てから 3 分たっても未レビューのままなら、mod が PR に `@codex review` とコメントします。
-投稿するとトーストを出し、`mcp__pr-relay__watch` の返答にも投稿した head を載せます。
+Codex does not always review the head again at every push.
+When it starts by itself, the summary comment turns `running` some 20 seconds after the commit (checked over 6 pushes).
+So if the head is still unreviewed 3 minutes after it was first seen, the mod comments `@codex review` on the PR.
+Once posted, it raises a toast, and the answer of `mcp__pr-relay__watch` also names the head it was posted for.
 
-コメントするのは、次のすべてを満たすときだけです。
+It comments only when all of these hold.
 
-- 要約コメントがあり、head が上の表の「未レビュー」に当たる
-- PR が Draft ではなく、`gh` のユーザー自身が作成した PR である
-- 最後の push より後に、Codex の利用上限のコメントがない
-- 最後の push より後に、Codex 以外の誰も、いまの head について `@codex review` とコメントしていない
-- その head にまだコメントしていない
+- There is a summary comment, and the head falls under "unreviewed" in the table above
+- The PR is not a draft, and was created by `gh`'s own user
+- There has been no Codex usage limit comment since the last push
+- No one other than Codex has commented `@codex review` for the current head since the last push
+- It has not commented on that head yet
 
-4 つ目の条件で、前の head への依頼は数えません。
-確認のときに前の head と並んで見えていたコメントが、それに当たります。
-コミット日時の古い head がほかの場所から push されると「最後の push」の時刻は進まず、mod が前の head に投稿したコメントが残って見えます。
-これを数えると、次の head には投稿しなくなるためです。
-head が変わった後のコメントは、mod がその head をまだ見ていないうちのものでも数えます。
+In the fourth condition, requests for an earlier head do not count.
+Those are the comments seen alongside the earlier head when it was checked.
+When a head with an older commit date is pushed from elsewhere, the time of "the last push" does not move on, and the comment the mod posted for the earlier head still shows.
+Counting it would stop the mod from posting for the next head.
+A comment after the head changed does count, even one made before the mod has seen that head.
 
-mod が投稿した直後に head が変わり、そのコメントを一度も確認していないときは、mod のコメントと新しい head への依頼を時刻で見分けられません。
-このときだけは、新しい head を最初に見た時刻より後のコメントを数えます。
-投稿より後の push で「最後の push」が進んでいれば、mod のコメントは対象から外れるので、この扱いはしません。
+When the head changes right after the mod posts, before its comment has ever been checked, the mod's comment cannot be told apart from a request for the new head by time.
+Only then are comments counted from after the time the new head was first seen.
+If a push after the post has moved "the last push" on, the mod's comment drops out of what is read, so this is not done.
 
-投稿した head は PR の記録に残すので、同じ PR を見ているほかのセッションが重ねて投稿することはありません。
-head ごとに 1 回なので、それでも Codex がレビューしなければ、次の push までは投稿しません。
-`gh pr comment` が失敗した場合と、投稿の直前に push が始まった場合は記録を戻し、次の確認でやり直します。
-失敗したときは、ステータス行に `PR #12 確認失敗 21:03: @codex review: <gh のエラー>` を出します。
+The head posted for is kept in the PR's record, so other sessions watching the same PR do not post again.
+It is once per head, so if Codex still does not review, nothing more is posted until the next push.
+If `gh pr comment` fails, or a push starts just before the post, the record is rolled back and the next check tries again.
+On a failure, the status line shows `PR #12 check failed 21:03: @codex review: <gh error>`.
 
-監視中の PR について、知らせたイベントは `$.store` に PR ごとに記録します。
-同じ PR を見ている別のセッションや、再起動したセッションが、同じイベントでもう一度起こされることはありません。
-同じ PR を複数のセッションが同時に確かめたときは、先に確認を始めたセッションだけを起こします（下の「制約」）。
-プロンプトがセッションに入らなかったとき（送信の失敗や、別の plugin による拒否）は記録を戻し、次の確認で送り直します。
+For the watched PR, the events told are recorded per PR in `$.store`.
+Another session watching the same PR, or a restarted session, is not woken again for the same event.
+When several sessions check the same PR at the same time, only the session that started checking first is woken ("Limitations" below).
+When a prompt does not enter the session (a failed send, or a refusal by another plugin), the record is rolled back and the next check sends it again.
 
-## /dev スキルと組み合わせるとき
+## Using it with the /dev skill
 
-mod はツール `mcp__pr-relay__watch` を登録するので、モデルのツール一覧にこのツールがあれば mod が動いています。
-`/dev` スキルからこのツールに `pr_url` と `since` を渡すと、PR と最後の push の時刻を mod に伝えられます。
-引数なしで呼ぶと、監視中の PR を返します。
-ツールの説明では、mod が監視している間はモデル自身でポーリングせず、ターンを終えて起こされるのを待つよう伝えています。
-push の後の `@codex review` は mod が投稿するので、モデルからは投稿しないことも伝えています。
-mod はスキルがないセッションでも動き、レビューへの対応や作業の完了に必要な手順をプロンプトで伝えます。
+The mod registers the tool `mcp__pr-relay__watch`, so if the model's tool list has it, the mod is running.
+The `/dev` skill can pass `pr_url` and `since` to this tool to tell the mod the PR and the time of the last push.
+Called with no arguments, it returns the watched PR.
+The tool's description tells the model not to poll by itself while the mod is watching, but to end its turn and wait to be woken.
+It also says that the mod posts `@codex review` after a push, so the model should not post it.
+The mod works in sessions without the skill too, and tells in its prompts the steps needed to deal with a review or complete the work.
 
-## 使い方
+## Display language
 
-`gh` が PATH にあり、認証済みである必要があります。
+pr-relay's text is in English by default.
+It switches to Japanese when Claude Code's `language` setting says Japanese (`ja`, `jp`, `jpn`, `japanese`, `日本語`, or a value starting with `ja-` or `ja_`), or, with no `language` setting, when the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that is set starts with `ja` (such as `ja_JP.UTF-8`).
+Any other `language` value means English, whatever the environment says.
 
-### インストール
+```json
+{ "language": "japanese" }
+```
 
-Claude Code のプロンプトで、次の 3 つを順に実行します。
+The language covers both what is drawn (the band's rows and buttons, toasts, the status line) and what is sent to the model (the review, approval and cleanup prompts, and the rebase note).
+It is decided when the session starts, so a changed setting takes effect from the next session start or plugin reload.
+In both languages, times are shown in the machine's time zone (the zone `TZ` names, when it holds an IANA name such as `Asia/Tokyo`).
+What is recorded in `$.store` does not depend on the language, so sessions in different languages share their records.
+
+## Usage
+
+`gh` must be on the PATH and logged in.
+
+### Install
+
+At the Claude Code prompt, run these three in order.
 
 ```text
 /plugin marketplace add HolyGrail/claude-mods
@@ -211,60 +228,60 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 /reload-plugins
 ```
 
-更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+How to update, and what to keep in mind, is in the [repository README](../../README.md).
 
-### インストールせずに試す
+### Try it without installing
 
-clone したリポジトリのルートで、次のように起動します。
+From the root of the cloned repository, start Claude Code like this.
 
 ```bash
 claude --plugin-dir ./plugins/pr-relay
 ```
 
-手元のコードを常に読み込むなら、`~/.claude/settings.json` の `env` にある `CLAUDE_CODE_PLUGIN_DIRS` にこのディレクトリの絶対パスを足します。
+To always load the local code, add this directory's absolute path to `CLAUDE_CODE_PLUGIN_DIRS` under `env` in `~/.claude/settings.json`.
 
-## 制約
+## Limitations
 
-GitHub への定期的な問い合わせは、1 分に 1 回の GraphQL クエリです。
-レビュー、コメント、👍 はそれぞれ新しい順に 100 件まで取り、100 件目がまだ最後の push より後なら、前のページを最大 10 ページまでたどります。
-レビューを知らせるときは、指摘の本文を取得するクエリを 1 回追加します。
-単純なクエリは 1 回 1 ポイントなので、12 セッションが同時に動いても毎時 720 ポイントで、上限の毎時 5,000 ポイントに収まります。
+The regular requests to GitHub are one GraphQL query a minute.
+Reviews, comments and 👍 are each fetched newest first, up to 100, and if the 100th is still after the last push, up to 10 earlier pages are followed.
+Telling of a review adds one query to fetch the findings' text.
+A simple query costs 1 point, so even 12 sessions running at once use 720 points an hour, within the limit of 5,000 points an hour.
 
-監視開始時に基準時刻が指定されず、どのセッションも `git push` の実行を見ていない PR では、最新コミットのコミット時刻を最後の push の時刻とみなします。
-コミットしてから push するまでの間に付いた Codex のイベントを、新しいものと見なすことがあります。
+For a PR where no baseline was given when the watch started and no session has seen a `git push` run, the commit time of the latest commit is taken as the time of the last push.
+Codex events made between the commit and the push may then be taken as new.
 
-`$.store` には atomic な更新がないので、同じ PR を見ているセッションは、確認を始めるたびに自分のキー（`poll:<セッション ID>:<プロセス ID>:<PR>`）へ開始時刻を書きます。
-同じ会話を 2 つの Claude Code で開いた場合も、プロセスごとにキーが分かれるので、通知はどちらか一方にだけ届きます（プロセス ID は環境変数 `PR_RELAY_INSTANCE` に持ちます）。
-30 秒以内に同じ PR の確認を先に始めたセッション、またはそれより前に始めてまだ GitHub の応答を待っているセッション（10 分まで）があれば、新しいイベントの通知はそのセッションに任せ、PR の記録にも書きません（読んだ時点より古い内容で上書きしないため）。
-自分が知っている push の時刻（監視開始時の基準時刻や、GitHub にまだ head が反映されていない自分の `git push` を含む）は確認の開始時から自分のキーに書き、通知するセッションがそれを読んで基準時刻に加えます。
-1 つのセッションの中では、前の確認が GitHub の応答を待っている間は次の確認を始めません。
-GitHub への問い合わせは store への書き込みよりずっと長くかかるので、問い合わせの後に読めば先のセッションの書き込みが見えるという前提です。
-任されたセッションが通知の前に終了しても、次の確認（1 分後）で残ったセッションが送ります。
-作業中のセッションに送ったプロンプトがまだ順番待ちのうちにそのセッションを終了した場合も、終了時に PR の記録から通知済みの印を取り消すので、残ったセッションが次の確認で送ります。
-通知済みの印の取り消しは、PR の記録を直接書き換えず、`undo:<ID>` の別のキーに書きます。次に記録を書く（通知を任された）セッションがそれを反映するので、取り消しがほかのセッションの印を消したり、ほかのセッションの書き込みで取り消しが消えたりしません。
-確認に失敗したセッションや終了したセッションのキーは、通知を任される対象から外れますが、知っていた push の時刻は残ります。
-セッションの終了時にこのキーの書き込みが失敗した場合は、数秒のうちに 3 回まで書き直します（確認の途中で終了したキーが残ると、ほかのセッションが最大 10 分通知を待つため）。
-各プロセスは 1 分ごとに `alive:<プロセス ID>` へ時刻を書き、3 分途絶えたプロセスは終了したものとみなします。強制終了したセッションが確認の途中や push の途中で残したキーにも、ほかのセッションは 10 分ではなく数分しか待ちません。順番待ちのまま強制終了したセッションのプロンプトも、残ったセッションが送り直します。
-このキーは 1 時間で消しますが、PR の記録がまだ数えていない push の時刻を持つものは 14 日まで残します。
-ほかのセッションのキーも、通知を任される対象から外れて 1 日たち、知っていた push の時刻を PR の記録が数え終えていれば消します（`/clear` や `/resume` のたびに古いセッション ID のキーが残り、確認のたびに読む量が増えるため）。
-マージやクローズも任されたセッションだけがトーストを出し、任せた側は次の確認で記録からそれを知って、ポーリングを止め `cleanup` ボタンを出します。
-自分のキーを書けなかった確認は、他のセッションから見えないので、GitHub に問い合わせずに失敗としてステータス行に出します。
-他のセッションのキーを読めなかった確認も、何も通知せずに失敗として出します。
-どれかのセッションが `git push` を実行している間（開始から 10 分まで）は、GitHub がまだ置き換わる前の head を見せていることがあるので、どのセッションも通知しません。
-どのセッションが起こされるかは確認の順番で決まり、`/dev` のセッションを優先するわけではありません。
+`$.store` has no atomic update, so each session watching the same PR writes its start time to its own key (`poll:<session ID>:<process ID>:<PR>`) every time it starts a check.
+When the same conversation is open in two Claude Code processes, the keys are still separate per process, so a notification reaches only one of them (the process ID is kept in the environment variable `PR_RELAY_INSTANCE`).
+If a session started checking the same PR first within 30 seconds, or started earlier and is still waiting on GitHub's answer (up to 10 minutes), new events are left to that session to tell, and the PR's record is not written either (so that it is not overwritten with content older than the moment it was read).
+The push times a session knows of (including the baseline given when the watch started, and its own `git push` whose head GitHub does not show yet) go into its own key from the start of each check, and the session that notifies reads them and adds them to the baseline.
+Within one session, the next check does not start while the previous one is waiting on GitHub's answer.
+The premise is that a GitHub request takes far longer than a store write, so a read after the request sees the earlier session's write.
+If the session left to notify ends before notifying, a remaining session sends it at the next check (a minute later).
+If a session is closed while a prompt sent to it as it worked is still waiting its turn, the told mark is taken back from the PR's record at exit, so a remaining session sends it at the next check.
+A take-back of a told mark does not rewrite the PR's record directly but goes under a separate key, `undo:<ID>`. The next session to write the record (the one left to notify) applies it, so a take-back neither erases another session's marks nor is erased by another session's write.
+The key of a session whose check failed, or that ended, is out of the running to notify, but the push times it knew of stay.
+When writing this key fails at session end, it is written again up to 3 times within a few seconds (a key left mid-check would make other sessions wait up to 10 minutes to notify).
+Each process writes the time to `alive:<process ID>` every minute, and a process silent for 3 minutes is taken as ended. Other sessions then wait only a few minutes, not 10, on a key a killed session left mid-check or mid-push. The prompt of a session killed while it waited its turn is also sent again by a remaining session.
+This key is deleted after an hour, but one holding push times the PR's record has not counted yet is kept for up to 14 days.
+Other sessions' keys are also deleted once out of the running to notify for a day, with the push times they knew of counted by the PR's record (with each `/clear` and `/resume` a key under the old session ID is left behind, and every check would read more and more).
+A merge or close too is toasted only by the session left to notify; the sessions that left it learn of it from the record at the next check, stop polling and show the `cleanup` button.
+A check that could not write its own key is invisible to other sessions, so it does not ask GitHub but shows a failure in the status line.
+A check that could not read other sessions' keys also notifies nothing and shows a failure.
+While any session is running `git push` (up to 10 minutes from its start), GitHub may still show the head about to be replaced, so no session notifies.
+Which session is woken depends on the order of the checks; a `/dev` session is not preferred.
 
-`@codex review` は、PR の記録に head を書いてから投稿します。
-記録を書いた直後にプロセスが強制終了すると、投稿されないまま記録だけが残り、その head には投稿しません。
-バージョン 0.10 のセッションが PR の記録を書くと、投稿した head の記録は消えます。
-その場合も、最後の push より後に `@codex review` のコメントがあれば投稿しないので、同じ head への投稿は重なりません。
+`@codex review` is posted after the head has been written to the PR's record.
+If the process is killed right after the record is written, the record stays without the post, and nothing is posted for that head.
+When a session of version 0.10 writes the PR's record, the record of the head posted for is lost.
+Even then, nothing is posted if there is an `@codex review` comment after the last push, so posts for the same head do not double.
 
-`gh` の失敗（未認証、ネットワークの切断）はステータス行に出し、次の確認で再試行します。
-レビュー詳細の取得に失敗した場合は、再試行を待たずにコメントの確認手順をプロンプトで伝えます。
+`gh` failures (not logged in, network down) are shown in the status line and retried at the next check.
+When fetching a review's details fails, the steps to check the comments are told in the prompt without waiting for a retry.
 
-CI の結果は監視しません。
-Desktop アプリが PR の CI の結果をセッションへ送るので、両方で見ると同じ失敗で二重に起こされます。
+CI results are not watched.
+The desktop app sends the PR's CI results to the session, so watching them in both places would wake the session twice for the same failure.
 
-## テスト
+## Tests
 
 ```bash
 cd plugins/pr-relay

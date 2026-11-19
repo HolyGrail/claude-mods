@@ -1,7 +1,8 @@
 
 // ---- Reproductions for reports/pr-relay-races.md ----
 // It uses stubWorld and the constants from plugins/pr-relay/tests/pr-relay.test.ts, so run it after
-// that file's helpers (its first 378 lines); see "3. 再現の方法" in the report. Each test asserts
+// that file's helpers (its first 470 lines, through stubWorld, which sets the language to Japanese
+// that the assertions below read); see "3. 再現の方法" in the report. Each test asserts
 // the racy outcome as it happens today, so a fix turns it red.
 
 const R_NOTE = 'poll:session-b:' + URL.toLowerCase()

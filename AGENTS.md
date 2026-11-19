@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-Claude Code plugins live under `plugins/<name>/`: `usage-meter`, `cache-meter`, `notice-board`, `pr-relay`, and `zsh-safe`. Each plugin contains:
+Claude Code plugins live under `plugins/<name>/`: `usage-meter`, `cache-meter`, `notice-board`, `pr-relay`, `status-board`, and `zsh-safe`. Each plugin contains:
 
 - `.claude-plugin/plugin.json` for metadata.
 - `hooks/hooks.json` for module registration and `hooks/register.js` exporting `register(on)`.
-- `tests/<name>.test.ts`, `tsconfig.json`, and a Japanese `README.md`.
+- `tests/<name>.test.ts`, `tsconfig.json`, an English `README.md` and a Japanese `README.ja.md`.
 
 `plugins/zsh-safe/zdotdir/.zshenv` supplies shell configuration; usage-meter generates SVG inline. Register new plugins in root `.claude-plugin/marketplace.json` and bump the affected plugin's manifest version for user-visible changes. Consult `CLAUDE.md` for architecture details and keep guidance consistent.
 
@@ -86,9 +86,9 @@ Verified in a live desktop session on 2026-10-03:
 
 Match existing JavaScript and TypeScript: two-space indentation, single quotes, no semicolons, and trailing commas in multiline structures. Use `camelCase` for functions and variables, `UPPER_SNAKE_CASE` for constants, and kebab-case plugin directories. Keep runtime hooks in JavaScript. No formatter or linter is configured.
 
-Write user-facing READMEs in Japanese; use English for comments, test descriptions, and commit messages.
+Write user-facing docs in English as `README.md`, with a Japanese `README.ja.md` beside each, and change the two together; `reports/` keeps the same pair. Use English for comments, test descriptions, and commit messages. UI text and prompts are English by default; pr-relay and status-board also carry Japanese, in their per-locale tables in `register.js`.
 
-Keep `hooks/register.js` free of dependencies and of imports from outside the plugin. Match the surrounding comment density: a comment says why, in full sentences. When behavior changes, update the tests, the plugin's `README.md` and its section of `CLAUDE.md` in the same change.
+Keep `hooks/register.js` free of dependencies and of imports from outside the plugin. Match the surrounding comment density: a comment says why, in full sentences. When behavior changes, update the tests, the plugin's `README.md` and `README.ja.md`, and its section of `CLAUDE.md` in the same change.
 
 ## Testing Guidelines
 
@@ -123,4 +123,4 @@ Add regression coverage for changed behavior, especially session restarts, store
 
 Follow history with short English imperative subjects, such as `Share readings through a key per session`. Use commit bodies to explain non-obvious behavior or tradeoffs.
 
-PRs should describe the problem, resulting behavior, and validation performed. Link relevant issues when available; include screenshots or terminal examples for visible changes. Update the plugin README when behavior or limitations change.
+PRs should describe the problem, resulting behavior, and validation performed. Link relevant issues when available; include screenshots or terminal examples for visible changes. Update both plugin READMEs (`README.md` and `README.ja.md`) when behavior or limitations change.
