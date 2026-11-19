@@ -58,7 +58,7 @@ Boards not written for 8 days are deleted.
 ### Rough cost
 
 The summary reads the main conversation's cache, so it is cheap while the cache is warm.
-One run measured in the desktop app took 5.9 seconds, with 321,578 tokens read from the cache, 1,063 tokens of new input and 490 tokens of output.
+One run measured in the desktop app took 5.9 seconds, with 321,578 tokens read from the cache, 1,063 tokens of new input (685 of them written to the cache) and 490 tokens of output.
 Once the cache has expired, the whole conversation is read again as ordinary input, which costs that much more.
 That is why, when the cache seems cold as the pane opens, the model is not asked on its own but waits for the button.
 No `effort` is passed; the prompt only asks for a quick answer.
@@ -127,7 +127,7 @@ The status board sums up the conversation itself, so it can be made in any sessi
 The events shown in the history and the band depend on the app running the session.
 `mcp__ccd_turn__update_plan` and `mcp__ccd_turn__wrap_up`, the sources of plans, steps and recaps, are tools only desktop app sessions have.
 
-- **Desktop app sessions**: all six kinds show
+- **Desktop app sessions**: every event in the band's table shows
 - **Terminal sessions**: only prompts, questions and PR binds show. Cards carry only the heading, questions and the footer's PRs
 - **`claude -p` runs**: input is not recorded as a person's prompt, so no prompts show either
 
