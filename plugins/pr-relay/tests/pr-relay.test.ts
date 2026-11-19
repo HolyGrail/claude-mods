@@ -1093,7 +1093,13 @@ for (const surface of ['desktop', 'terminal'] as const) {
     await clock.advance(MINUTE)
     const ui = await $.ui.mount({ ...BAND, surface })
 
-    const band = (await ui.drawn()) as { props: Record<string, unknown>; children: { props: Record<string, unknown> }[] }
+    // The kit may hand back the whole band, every mod's tree under its own part; this mod's is the one
+    // marked pr-relay, or the band itself where the kit hands back only that
+    type Node = { props: Record<string, unknown>; children: Node[]; part?: { plugin: string } }
+    const drawn = (await ui.drawn()) as Node
+    const own = (node: Node): Node | undefined =>
+      node.part?.plugin === 'pr-relay' ? node : (node.children ?? []).map((child) => own(child)).find(Boolean)
+    const band = own(drawn) ?? drawn
     const [row] = band.children
     expect(await ui.find({ key: `cleanup-${PR9.toLowerCase()}` })).toBeDefined()
     if (surface === 'desktop') {
@@ -4645,7 +4651,20 @@ test('a poll yields to a note written while its own was on its way', async ($, o
 })
 
 test('a push started as the watch turns stays with the pull request watched as it started', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
+  // The watch turns at the first thing the push awaits, its start time: the push has reached the
+  // hooks by then, however many steps the host takes before a Bash call does. mock.clock registers
+  // its clock.now hook as on('clock.now', hook), which this wraps
+  let turn = false
+  let turned: Promise<unknown> | undefined
+  const turnAtNow = ((pattern: string, ...rest: unknown[]) => {
+    if (pattern !== 'clock.now') return (on as (...args: unknown[]) => unknown)(pattern, ...rest)
+    const hook = rest[0] as (...args: unknown[]) => unknown
+    return on('clock.now', ((...args: unknown[]) => {
+      if (turn && !turned) turned = $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
+      return hook(...args)
+    }) as never)
+  }) as On
+  const clock = mock.clock(turnAtNow, { now: NOW })
   const w = stubWorld(on)
   on('tool.call', { tool: 'Bash' }, async () => {
     await clock.sleep(20_000)
@@ -4654,9 +4673,10 @@ test('a push started as the watch turns stays with the pull request watched as i
   await $.session.start(START)
   await clock.settle()
 
+  turn = true
   const push = $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
-  const turned = $.tool.call({ tool: 'mcp__pr-relay__watch', pr_url: PR9 })
   await clock.advance(30_000)
+  expect(turned).toBeDefined()
   await Promise.all([push, turned])
   await clock.advance(MINUTE)
   expect(w.store.get(NOTE)).toMatchObject({ pending: [{ at: NOW }] })
@@ -4714,7 +4734,7 @@ test('a push another session started while the record was written holds back the
 })
 
 // A poll whose record has been written, with review 1 marked, and the other session's idle note
-async function scanAfterRecord($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+async function scanAfterRecord($: Parameters<import('claude-code/testing').TestBody>[0], on: On) {
   const clock = mock.clock(on, { now: NOW })
   const w = stubWorld(on)
   const other = 'poll:session-a:p1:' + URL.toLowerCase()
