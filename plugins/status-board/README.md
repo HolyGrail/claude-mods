@@ -55,6 +55,13 @@ The board is saved per session and comes back as it was after a restart or `/res
 A conversation split off with `/branch` starts with no board.
 Boards not written for 8 days are deleted.
 
+### Copying
+
+The desktop app does not let you select the pane's text, and a mod has no way to change that.
+So the buttons beside `Update the status board` put the text on the clipboard instead: `Copy the board` copies the board as the model wrote it, in Markdown, and `Copy the history` copies every card as plain text, newest first, whether shown or not.
+The history's prompts and recaps are copied as kept, so text past the length the pane keeps (1,000 characters for a recap, 200 for the rest) is already cut.
+A toast says whether the copy took.
+
 ### Rough cost
 
 The summary reads the main conversation's cache, so it is cheap while the cache is warm.
@@ -173,6 +180,7 @@ In both languages, times are shown in the machine's time zone (the zone `TZ` nam
 What has been checked, and what has not yet:
 
 - **Checked in the desktop app (engine 2.1.326)**: the band's display. The pane appearing in a column at the window's right edge. One summary from a button press (5.9 seconds, 321,578 tokens read from the cache, 490 tokens of output)
+- **Copying in the desktop app (2.1.326)**: a probe plugin's Button calling `$.ui.copy` answered `isCopied: true`. The copy buttons of this mod have not been pressed there yet
 - **Checked with `claude -p --plugin-dir` (v2.1.327)**: loading the mod (including the hooks being accepted and `/board` registered). Reading the transcript (a 33 MB transcript read to its end, with the count matching one made another way). A summary asked for from the `turn.complete` hook coming back
 - **Not yet checked in the desktop app**: the automatic update at the end of a turn. The summary when the pane is opened. Restoring a saved board
 

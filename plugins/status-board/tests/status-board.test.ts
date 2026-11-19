@@ -531,7 +531,7 @@ test('the pane draws a card per prompt, newest first and five at a time, with it
   // On the desktop a card is framed; nothing in it is a Button, whose nested Text the app draws
   // without color, so the only Button is the one that shows more
   expect((await historyOf(ui))[0]).toMatchObject({ type: 'Box', props: { borderStyle: 'round' } })
-  expect((await ui.findAll({ type: 'Button' })).map((button) => button.key)).toEqual(['status-board-refresh', 'status-board-history', 'status-board-more'])
+  expect((await ui.findAll({ type: 'Button' })).map((button) => button.key)).toEqual(['status-board-refresh', 'status-board-copy-history', 'status-board-history', 'status-board-more'])
   await ui.press({ key: 'status-board-more' })
   expect((await historyOf(ui)).slice(5).map(asText)).toEqual([['○ 13:15 依頼 1', '○ 13:16 まとめ 1'], ['最初の指示より前', 'PR #3'], '新しい 5 件だけにする'])
   await ui.press({ key: 'status-board-more' })
@@ -1032,4 +1032,67 @@ test('a re-fired session.start draws times in the zone TZ names by then', async 
   h.env.TZ = 'America/New_York'
   await start($, clock)
   expect(await paneCards($)).toEqual([['○ 11/17 23:50 Fix it']])
+})
+
+test('the copy buttons put the board and the history on the clipboard of the pressing surface', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, {
+    [FILE]:
+      prompt('ログを調べて', 30) +
+      toolUse('mcp__ccd_turn__wrap_up', { recap: '原因はキャッシュ', ask: '直しますか？' }, 25, 'w1') +
+      prompt('直して', 10) +
+      toolUse('AskUserQuestion', { questions: [{ question: 'どちらで？' }] }, 9, 'q1'),
+  })
+  h.store.set('board:s1', { at: NOW - MINUTE, text: '## 目的\n- 帯を直す', usage: { read: 1_500, output: 20 } })
+  const copies: { text: string; surface: string | undefined }[] = []
+  let answer: { isCopied: true } | { isCopied: false; reason: 'no-clipboard' } = { isCopied: true }
+  on('ui.copy', ($, e) => {
+    copies.push({ text: e.text, surface: e.surface })
+    return { value: answer }
+  })
+  await start($, clock)
+  await openPane($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.press({ key: 'status-board-copy-history' })
+  await clock.settle()
+  answer = { isCopied: false, reason: 'no-clipboard' }
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.unmount()
+
+  expect(copies).toEqual([
+    { text: '## 目的\n- 帯を直す', surface: 'desktop' },
+    {
+      text: '[13:50] 指示: 直して\n[13:51] 質問: どちらで？\n\n[13:30] 指示: ログを調べて\n[13:35] まとめ: 原因はキャッシュ\n質問: 直しますか？',
+      surface: 'desktop',
+    },
+    { text: '## 目的\n- 帯を直す', surface: 'desktop' },
+  ])
+  expect(h.toasts).toEqual(['状況ボードをコピーしました。', '履歴をコピーしました。', 'コピーできませんでした: no-clipboard'])
+})
+
+test('no copy button is drawn with nothing to copy, and the English labels and toasts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, {}, { language: undefined })
+  on('ui.copy', () => ({ value: { isCopied: true } }))
+  await start($, clock)
+  await openPane($, clock)
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.findAll({ type: 'Button' })).map((button) => button.key)).toEqual(['status-board-refresh', 'status-board-history'])
+  await ui.unmount()
+
+  h.store.set('board:s1', { at: NOW - MINUTE, text: '## Goal\n- fix the band', usage: { read: 1_500, output: 20 } })
+  append(h, FILE, prompt('fix it', 10))
+  await start($, clock)
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status-board-copy' }))?.text).toBe('Copy the board')
+  expect((await ui.find({ key: 'status-board-copy-history' }))?.text).toBe('Copy the history')
+  await ui.press({ key: 'status-board-copy' })
+  await ui.press({ key: 'status-board-copy-history' })
+  await clock.settle()
+  await ui.unmount()
+  expect(h.toasts).toEqual(['Copied the status board.', 'Copied the history.'])
 })

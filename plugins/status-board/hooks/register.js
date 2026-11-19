@@ -139,6 +139,11 @@ const TEXTS = {
     fewer: (shown) => `Show only the newest ${shown}`,
     more: (count) => `Show ${count} more`,
     cannotShow: (reason) => `Cannot show the status board: ${reason}`,
+    copyBoard: 'Copy the board',
+    copyHistory: 'Copy the history',
+    copiedBoard: 'Copied the status board.',
+    copiedHistory: 'Copied the history.',
+    copyFailed: (reason) => `Could not copy: ${reason}`,
   },
   ja: {
     paneTitle: '状況ボード',
@@ -174,6 +179,11 @@ const TEXTS = {
     fewer: (shown) => `新しい ${shown} 件だけにする`,
     more: (count) => `さらに ${count} 件を表示`,
     cannotShow: (reason) => `状況ボードを表示できません: ${reason}`,
+    copyBoard: 'ボードをコピー',
+    copyHistory: '履歴をコピー',
+    copiedBoard: '状況ボードをコピーしました。',
+    copiedHistory: '履歴をコピーしました。',
+    copyFailed: (reason) => `コピーできませんでした: ${reason}`,
   },
 }
 
@@ -949,7 +959,9 @@ function paneBody($, e, now) {
   }
   const label = summarizing ? texts.summarizing : board ? texts.update : texts.create
   const warning = summarizing || isWarm(now) ? '' : texts.cold
-  const action = [
+  // The desktop app draws a pane's text unselectable and no prop of Text or Markdown changes
+  // that, so what the pane shows reaches the clipboard through these buttons instead
+  const buttons = [
     Button({
       key: 'status-board-refresh',
       label: label + warning,
@@ -958,6 +970,27 @@ function paneBody($, e, now) {
       },
     }),
   ]
+  if (board) {
+    buttons.push(
+      Button({
+        key: 'status-board-copy',
+        plain: true,
+        label: texts.copyBoard,
+        onPress: (press) => copy($, press.surface, board ? board.text : '', texts.copiedBoard),
+      }),
+    )
+  }
+  if (cards.length > 0) {
+    buttons.push(
+      Button({
+        key: 'status-board-copy-history',
+        plain: true,
+        label: texts.copyHistory,
+        onPress: async (press) => copy($, press.surface, historyText(cardsOf(data.timeline), await $.clock.now()), texts.copiedHistory),
+      }),
+    )
+  }
+  const action = [buttons.length === 1 ? buttons[0] : Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 2, children: buttons })]
   if (boardError) action.push(Text({ dimColor: true, children: [texts.failed(boardError)] }))
   children.push(Box({ flexDirection: 'column', children: action }))
   children.push(
@@ -993,6 +1026,44 @@ function paneBody($, e, now) {
     )
   }
   return Box({ flexDirection: 'column', rowGap: 1, children })
+}
+
+// The cards as plain text for the clipboard, newest first as the pane lists them, every card
+// whether shown or not; texts are as kept, so a long prompt or recap is already cut
+function historyText(cards, now) {
+  const stamp = (ts) => `[${when(ts, now)}]`
+  const current = data.plan.findIndex((step) => step.status === 'in_progress')
+  const newest = cards[cards.length - 1]
+  return [...cards]
+    .reverse()
+    .map((card) => {
+      const lines = [card.prompt ? `${stamp(card.prompt.ts)} ${texts.labels.prompt}: ${card.prompt.text.trim()}` : texts.beforeFirstPrompt]
+      for (const event of card.events) {
+        if (event.kind === 'recap') {
+          lines.push(`${stamp(event.ts)} ${texts.labels.recap}: ${event.text.trim()}`)
+          if (event.ask) lines.push(texts.ask(event.ask.trim()))
+        } else if (event.kind === 'dialog') {
+          lines.push(`${stamp(event.ts)} ${texts.labels.dialog}: ${event.text}`)
+        }
+      }
+      if (card === newest && current !== -1) {
+        lines.push(`${texts.steps.in_progress} (${current + 1}/${data.plan.length}) ${data.plan[current].content.trim()}`)
+      }
+      const footer = cardFooter(card)
+      if (footer) lines.push(footer)
+      return lines.join('\n')
+    })
+    .join('\n\n')
+}
+
+// Puts text on the clipboard of the surface the press came from and says how it went
+async function copy($, surface, text, done) {
+  try {
+    const result = await $.ui.copy({ text, surface })
+    $.ui.toast(result.isCopied ? done : texts.copyFailed(result.reason))
+  } catch (error) {
+    $.ui.toast(texts.copyFailed(error instanceof Error ? error.message : String(error)))
+  }
 }
 
 // Opens the pane, or closes it when it is open. The engine's list is the one to trust: the pane
