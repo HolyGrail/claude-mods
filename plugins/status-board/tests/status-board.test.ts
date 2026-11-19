@@ -2,7 +2,7 @@ import type { ModelForkResult } from 'claude-code'
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
 const MINUTE = 60_000
-// 14:00 JST
+// 14:00 in Tokyo, the zone the setup's TZ names so the times expected below hold on any machine
 const NOW = Date.UTC(2026, 10, 18, 5)
 const FILE = '/home/me/.claude/projects/work/s1.jsonl'
 
@@ -46,9 +46,22 @@ type Host = {
   forks: string[]
   reply: ModelForkResult
   hold?: Promise<void>
+  // The /board descriptions registered, one per session.start, and the titles panes opened with
+  commands: string[]
+  titles: string[]
+  // What decides the locale: the `language` setting, the locale variables, and whether reading
+  // the settings fails
+  language: string | undefined
+  env: Record<string, string>
+  settingsFail: boolean
+  // A settings read waits on this while it is set
+  settingsHold?: Promise<void>
 }
 
-function stubHost(on: On, files: Record<string, string> = {}): Host {
+// The tests below run under Claude Code's `language` setting `japanese` unless they say otherwise,
+// so the assertions on Japanese text are the Japanese locale's coverage; the English ones set
+// `language: undefined`
+function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pick<Host, 'language' | 'env' | 'settingsFail'>> = {}): Host {
   const h: Host = {
     files: new Map(Object.entries(files).map(([path, text]) => [path, utf8(text)])),
     transcriptPath: FILE,
@@ -63,7 +76,19 @@ function stubHost(on: On, files: Record<string, string> = {}): Host {
     store: new Map(),
     forks: [],
     reply: answered('## 目的\n- 帯を直す'),
+    commands: [],
+    titles: [],
+    language: 'japanese',
+    settingsFail: false,
+    ...locale,
+    // Times are drawn in TZ's zone: Tokyo unless a test names another
+    env: { TZ: 'Asia/Tokyo', ...locale.env },
   }
+  on('settings.read', async () => {
+    if (h.settingsHold) await h.settingsHold
+    return h.settingsFail ? { deny: 'settings unreadable' } : { value: h.language === undefined ? {} : { language: h.language } }
+  })
+  on('env.get', ($, e) => ({ value: h.env[e.name] }))
   on('session.start', () => ({ cwd: '/work' }))
   on('session.id', () => ({ value: h.sessionId }))
   on('store.get', ($, e) => ({ value: h.store.get(e.key) }))
@@ -82,7 +107,10 @@ function stubHost(on: On, files: Record<string, string> = {}): Host {
     return { value: h.reply }
   })
   on('session.info', () => ({ value: { transcriptPath: h.transcriptPath } }))
-  on('command.register', () => ({ value: { command: 'board' } }))
+  on('command.register', ($, e) => {
+    h.commands.push(e.description ?? '')
+    return { value: { command: 'board' } }
+  })
   on('classic.SessionStart', () => ({}))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
@@ -110,6 +138,7 @@ function stubHost(on: On, files: Record<string, string> = {}): Host {
   })
   on('ui.panes', () => ({ value: h.panes.map((id) => ({ id, title: id, isShown: true, isFocused: false, isPlaced: h.placed })) }))
   on('ui.open', ($, e) => {
+    h.titles.push(e.title ?? '')
     if (!h.panes.includes(e.id)) h.panes.push(e.id)
     return { value: h.placed ? { isPlaced: true } : { isPlaced: false, reason: 'no-surface' } }
   })
@@ -238,7 +267,8 @@ type Mounted = Pick<Awaited<ReturnType<Engine['ui']['mount']>>, 'find' | 'press'
 
 // What the pane draws under its history button, with the history shown
 async function historyOf(ui: Mounted): Promise<Node[]> {
-  if (await ui.find({ key: 'status-board-history', text: '履歴を表示' })) await ui.press({ key: 'status-board-history' })
+  const button = await ui.find({ key: 'status-board-history' })
+  if (button?.text === '履歴を表示' || button?.text === 'Show history') await ui.press({ key: 'status-board-history' })
   const top = childrenOf((await ui.drawn()) as Node)
   const at = top.findIndex((child) => typeof child !== 'string' && child.props?.key === 'status-board-history')
   return top.slice(at + 1)
@@ -269,9 +299,9 @@ async function boardOf($: Engine, surface: Surface = 'desktop') {
   await ui.unmount()
   return {
     markdown: markdown?.props.text as string | undefined,
-    meta: lines.find((line) => line.includes('時点')),
+    meta: lines.find((line) => line.includes('時点') || line.startsWith('As of ')),
     button: button?.text,
-    error: lines.find((line) => line.startsWith('要約できませんでした')),
+    error: lines.find((line) => line.startsWith('要約できませんでした') || line.startsWith('Could not summarize')),
   }
 }
 
@@ -772,4 +802,234 @@ test('a transcript that cannot be looked up counts toward the status line, unles
   expect(h.status).toBe('status-board: 会話ログを読めません: status-board: $.fs.stat: EACCES: permission denied')
   await completeTurn($, clock)
   expect(h.status).toBeUndefined()
+})
+
+// ---------------------------------------------------------------- the display language
+
+const ENGLISH = { language: undefined }
+
+test('with no language configured, the band and the cards are in English, with plurals by count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(
+    on,
+    {
+      [FILE]:
+        prompt('Fix the band', 40) +
+        plan(items(['Look', 'in_progress'], ['Change', 'pending'], ['Check', 'pending']), 39) +
+        plan({ done: [1, 2] }, 38) +
+        prLink(12, 37),
+    },
+    ENGLISH,
+  )
+  await start($, clock)
+  expect((await bandLine($)).line).toBe('○ Linked PR #12 · 13:23Status board')
+
+  append(h, FILE, prompt('Read it', 30))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('○ Prompt Read it · 13:30Status board')
+
+  append(h, FILE, toolUse('AskUserQuestion', { questions: [{ question: 'Which one?' }, { question: 'Then?' }] }, 25, 'toolu_ask'))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('● Question Which one? (+1 more) · 13:35Status board')
+
+  append(h, FILE, wrap({ recap: 'Done reading', ask: 'Fix it?', blocked: true }, 22))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('○ Recap Done reading / Question: Fix it? · 13:38Status board')
+
+  append(h, FILE, plan(items(['Read', 'in_progress']), 19))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('● In progress (1/1) Read · 13:41Status board')
+  expect(await paneCards($)).toEqual([
+    ['○ 13:30 Read it', '● 13:35 Question Which one? (+1 more)', '○ 13:38 Done reading', 'Question: Fix it?', '● In progress (1/1) Read', 'Plan: 1 step'],
+    ['○ 13:20 Fix the band', 'Plan: 3 steps · 2 done · PR #12'],
+  ])
+
+  // A plan after a finished one is created, one after an unfinished one updated
+  append(h, FILE, wrap({ recap: 'Finished' }, 18) + plan(items(['Next', 'pending']), 17))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('● Plan created: 1 step · 13:43Status board')
+  append(h, FILE, plan(items(['Next', 'pending'], ['Polish', 'pending']), 16))
+  await completeTurn($, clock)
+  expect((await bandLine($)).line).toBe('● Plan updated: 2 steps · 13:44Status board')
+})
+
+test('with no language configured, /board, the pane, its board, buttons and failures are in English, and the model is asked in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, {}, ENGLISH)
+  await start($, clock)
+  expect(h.commands).toEqual(["Open or close this session's status board"])
+  expect(await $.command.run(COMMAND)).toMatchObject({ text: 'Opened the status board.' })
+  expect(h.titles).toEqual(['Status board'])
+  expect(await $.command.run(COMMAND)).toMatchObject({ text: 'Closed the status board.' })
+
+  expect(await paneCards($)).toEqual(['No record yet. Prompts and plans will be listed here.'])
+  const widget = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  expect(textOf((await widget.drawn()) as Node)).toBe('No record yet.')
+  await widget.unmount()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status-board-refresh' }))?.text).toBe('Create the status board (cache may be cold)')
+  let release = () => {}
+  h.hold = new Promise<void>((resolve) => (release = resolve))
+  await ui.press({ key: 'status-board-refresh' })
+  await clock.settle()
+  expect((await ui.find({ key: 'status-board-refresh' }))?.text).toBe('Summarizing…')
+  release()
+  h.hold = undefined
+  await clock.settle()
+  // Shown since the history was read above
+  expect((await ui.find({ key: 'status-board-history' }))?.text).toBe('Hide history')
+  await ui.press({ key: 'status-board-history' })
+  expect((await ui.find({ key: 'status-board-history' }))?.text).toBe('Show history')
+  await ui.unmount()
+
+  // The board's language is the prompt's: five English headings
+  for (const heading of ['## Goal', '## Where things stand', '## Decided', '## Open / waiting on you', '## Next step']) {
+    expect(h.forks[0]).toContain(`\n${heading}\n`)
+  }
+  expect(h.forks[0]).toContain('English Markdown')
+  expect(await boardOf($)).toMatchObject({
+    meta: 'As of 14:00 · summarized by the model · read 323k / output 490',
+    button: 'Update the status board (cache may be cold)',
+  })
+
+  // A turn that ends after the board outdates it, and warms the cache
+  await clock.advance(MINUTE)
+  await completeTurn($, clock)
+  h.reply = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' } as unknown as ModelForkResult
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await again.press({ key: 'status-board-refresh' })
+  await clock.settle()
+  await again.unmount()
+  expect(await boardOf($)).toMatchObject({
+    meta: 'As of 14:00 · summarized by the model · activity since · read 323k / output 490',
+    button: 'Update the status board',
+    error: 'Could not summarize: api-error 529',
+  })
+
+  h.placed = false
+  await $.command.run(COMMAND)
+  expect(h.toasts).toEqual(['Cannot show the status board: no-surface'])
+})
+
+test('with no language configured, the history pages in English and names the card before the first prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let text = prLink(3, 60)
+  for (let i = 1; i <= 6; i++) text += prompt(`Task ${i}`, 50 - i * 5)
+  stubHost(on, { [FILE]: text }, ENGLISH)
+  await start($, clock)
+
+  expect((await paneCards($)).at(-1)).toBe('Show 2 more')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await historyOf(ui)
+  await ui.press({ key: 'status-board-more' })
+  expect((await historyOf(ui)).slice(5).map(asText)).toEqual([['○ 13:15 Task 1'], ['Before the first prompt', 'PR #3'], 'Show only the newest 5'])
+  await ui.unmount()
+})
+
+test('with no language configured, a transcript that cannot be read says so in English in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('Readable', 1) }, ENGLISH)
+  h.failReads = 3
+  await start($, clock)
+  await completeTurn($, clock)
+  await completeTurn($, clock)
+  expect(h.status).toBe('status-board: cannot read the transcript: status-board: $.fs.read: EACCES: permission denied')
+})
+
+const JAPANESE_DESCRIPTION = 'このセッションの状況ボードを開閉する'
+const ENGLISH_DESCRIPTION = "Open or close this session's status board"
+
+type LocaleCase = { name: string; language?: string; env?: Record<string, string>; settingsFail?: boolean; japanese: boolean }
+
+for (const c of <LocaleCase[]>[
+  { name: 'the setting `japanese` gives Japanese', language: 'japanese', japanese: true },
+  { name: 'the setting `Japanese` gives Japanese', language: 'Japanese', japanese: true },
+  { name: 'the setting `ja` gives Japanese', language: 'ja', japanese: true },
+  { name: 'the setting `ja-JP` gives Japanese', language: 'ja-JP', japanese: true },
+  { name: 'the setting `日本語` gives Japanese', language: '日本語', japanese: true },
+  { name: 'the setting `english` gives English even under LANG=ja_JP.UTF-8', language: 'english', env: { LANG: 'ja_JP.UTF-8' }, japanese: false },
+  { name: 'no setting under LANG=ja_JP.UTF-8 gives Japanese', env: { LANG: 'ja_JP.UTF-8' }, japanese: true },
+  { name: 'no setting and no locale variables gives English', japanese: false },
+  { name: 'LC_ALL wins over LC_MESSAGES and LANG', env: { LC_ALL: 'en_US.UTF-8', LC_MESSAGES: 'ja_JP.UTF-8', LANG: 'ja_JP.UTF-8' }, japanese: false },
+  { name: 'LC_MESSAGES wins over LANG', env: { LC_MESSAGES: 'ja_JP.UTF-8', LANG: 'en_US.UTF-8' }, japanese: true },
+  { name: 'settings that cannot be read give English even under LANG=ja_JP.UTF-8', env: { LANG: 'ja_JP.UTF-8' }, settingsFail: true, japanese: false },
+]) {
+  test(`display language: ${c.name}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const h = stubHost(on, {}, { language: c.language, env: c.env ?? {}, settingsFail: c.settingsFail ?? false })
+    await start($, clock)
+    expect(h.commands).toEqual([c.japanese ? JAPANESE_DESCRIPTION : ENGLISH_DESCRIPTION])
+  })
+}
+
+test('a re-fired session.start draws in the language the setting names by then', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('Fix it', 10) })
+  await start($, clock)
+  expect((await bandLine($)).line).toBe('○ 指示 Fix it · 13:50状況ボード')
+
+  h.language = 'english'
+  await start($, clock)
+  expect((await bandLine($)).line).toBe('○ Prompt Fix it · 13:50Status board')
+  expect(h.commands).toEqual([JAPANESE_DESCRIPTION, ENGLISH_DESCRIPTION])
+})
+
+test('a turn that ends while a re-fired session.start resolves the language reads nothing in the language before', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('Fix it', 10) + plan(items(['Next', 'pending']), 9) }, ENGLISH)
+  await start($, clock)
+  expect((await bandLine($)).line).toBe('● Plan created: 1 step · 13:51Status board')
+
+  h.language = 'japanese'
+  let release = () => {}
+  h.settingsHold = new Promise<void>((resolve) => (release = resolve))
+  const restarted = $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await completeTurn($, clock)
+  release()
+  h.settingsHold = undefined
+  await restarted
+  await clock.settle()
+  expect((await bandLine($)).line).toBe('● 計画を作成: 1 ステップ · 13:51状況ボード')
+})
+
+// ---------------------------------------------------------------- the time zone
+
+const SUMMER = Date.UTC(2026, 6, 1, 5)
+
+for (const c of [
+  // 05:00 UTC on 18 November is midnight in New York (UTC-5): ten minutes earlier is the 17th there
+  { name: 'in winter, with the date when the time is yesterday there', now: NOW, cards: [['○ 00:00 now'], ['○ 11/17 23:50 earlier']] },
+  // On 1 July New York keeps daylight saving time (UTC-4)
+  { name: 'in summer, under daylight saving time', now: SUMMER, cards: [['○ 01:00 now'], ['○ 00:50 earlier']] },
+]) {
+  test(`TZ=America/New_York draws times at New York's local time ${c.name}`, async ($, on) => {
+    const clock = mock.clock(on, { now: c.now })
+    const at = (minutesAgo: number) => new Date(c.now - minutesAgo * MINUTE).toISOString()
+    stubHost(on, { [FILE]: prompt('earlier', 0, { timestamp: at(10) }) + prompt('now', 0, { timestamp: at(0) }) }, { env: { TZ: 'America/New_York' } })
+    await start($, clock)
+    expect(await paneCards($)).toEqual(c.cards)
+  })
+}
+
+test('a TZ Intl does not know draws times in the runtime\'s zone instead of failing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubHost(on, { [FILE]: prompt('Fix it', 10) }, { env: { TZ: 'JST-9' } })
+  await start($, clock)
+  const cards = await paneCards($)
+  expect(cards).toHaveLength(1)
+  // The runtime's zone is the machine's, so only the shape is known
+  expect((cards[0] as string[])[0]).toMatch(/^○ (\d{1,2}\/\d{1,2} )?\d{2}:\d{2} Fix it$/)
+})
+
+test('a re-fired session.start draws times in the zone TZ names by then', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('Fix it', 10) })
+  await start($, clock)
+  expect(await paneCards($)).toEqual([['○ 13:50 Fix it']])
+
+  h.env.TZ = 'America/New_York'
+  await start($, clock)
+  expect(await paneCards($)).toEqual([['○ 11/17 23:50 Fix it']])
 })

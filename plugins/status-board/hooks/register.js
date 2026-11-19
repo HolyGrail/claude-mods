@@ -38,10 +38,27 @@ const IDLE_TICK_MS = 30_000
 // After this many failed reads in a row, the status line says so
 const FAILURES_SHOWN = 3
 
-// The board the model writes: the whole session summed up, the pane's lead. Asked with no
-// `effort`, since a level other than the session's makes a model that takes effort for the whole
-// request write the conversation to the cache again; the prompt asks for haste instead.
-const BOARD_PROMPT = `ここまでの会話を、このセッションを見ている人間が 30 秒で全体を把握するための「状況ボード」にまとめてください。
+// The board the model writes: the whole session summed up, the pane's lead, one fixed prompt per
+// locale. Asked with no `effort`, since a level other than the session's makes a model that takes
+// effort for the whole request write the conversation to the cache again; the prompt asks for
+// haste instead. English runs about twice as long as Japanese for the same content, hence the
+// larger cap.
+const BOARD_PROMPT_EN = `Sum up this conversation so far as a "status board" that lets the person watching this session grasp the whole of it in 30 seconds.
+You have no tools now. Do not deliberate: write only the answer, at once, with no preamble and no closing remarks.
+Use only facts stated in the conversation and write no guesses. Write English Markdown with these headings, in this order.
+Keep each item a short bullet (80 characters at most) and the whole board within 1,200 characters. Under a heading with nothing to say, write "None".
+
+## Goal
+(What this session sets out to achieve. 1-2 items)
+## Where things stand
+(What is done, and what is under way now. 3-5 items)
+## Decided
+(Decisions on approach or design, and why. Up to 5 of the important ones)
+## Open / waiting on you
+(What the person needs to decide or check. "None" if nothing)
+## Next step
+(What happens next. 1-2 items)`
+const BOARD_PROMPT_JA = `ここまでの会話を、このセッションを見ている人間が 30 秒で全体を把握するための「状況ボード」にまとめてください。
 あなたにはいまツールがありません。考え込まず、すぐに答えだけを書いてください。前置きも後書きも不要です。
 会話に書かれた事実だけを使い、推測は書かないでください。日本語の Markdown で、次の見出しをこの順に使います。
 各項目は短い箇条書き（1 項目 40 字以内）にし、全体で 700 字以内に収めてください。該当がない見出しは「なし」と書きます。
@@ -64,19 +81,109 @@ const STALE_MS = 8 * 24 * 60 * 60_000
 const BOARD_PREFIX = 'board:'
 
 const PANE = 'status-board'
-const PANE_TITLE = '状況ボード'
 // The pane shows the newest cards first, this many until asked for the rest
 const SHOWN = 5
 // The band's last column, which the terminal may draw over
 const BAND_RESERVED_COLUMNS = 2
 // Off the terminal, the band's text is cut to this many cells (wide characters count two)
 const BAND_TEXT_CELLS = 80
-const JST_OFFSET_MS = 9 * 60 * 60_000
+// Times are drawn in the machine's time zone: TZ when Intl knows it, else the runtime's own zone
+// (which follows the system's). Two-digit 24-hour times and ASCII digits in either locale
+const CLOCK_OPTIONS = {
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+}
 // The session.end reasons after which this module stops; /clear, /resume and logout leave it
 // running
 const FINAL_REASONS = ['prompt_input_exit', 'other']
 
-const STEP_WORD = { completed: '完了', in_progress: '進行中', pending: '未着手' }
+// Everything a person reads, and the prompt the model gets, per locale. Where the word order
+// differs between the languages a text is a function, not fragments joined. Nothing here is
+// written to $.store: sessions in either locale, and of older versions, share the stored boards.
+const TEXTS = {
+  en: {
+    paneTitle: 'Status board',
+    steps: { completed: 'Done', in_progress: 'In progress', pending: 'Pending' },
+    labels: { recap: 'Recap', dialog: 'Question', prompt: 'Prompt' },
+    boardPrompt: BOARD_PROMPT_EN,
+    commandDescription: "Open or close this session's status board",
+    opened: 'Opened the status board.',
+    closed: 'Closed the status board.',
+    unreadable: (error) => `status-board: cannot read the transcript: ${error}`,
+    noQuestion: 'Answer the question',
+    moreQuestions: (question, more) => `${question} (+${more} more)`,
+    plan: (fresh, count) => `${fresh ? 'Plan created' : 'Plan updated'}: ${stepCount(count)}`,
+    recapAsk: (ask) => ` / Question: ${ask}`,
+    linked: (pr) => `Linked ${pr}`,
+    planSize: (count) => `Plan: ${stepCount(count)}`,
+    completedSteps: (count) => `${count} done`,
+    noRecord: 'No record yet.',
+    noRecordYet: 'No record yet. Prompts and plans will be listed here.',
+    beforeFirstPrompt: 'Before the first prompt',
+    ask: (ask) => `Question: ${ask}`,
+    asOf: (time) => `As of ${time}`,
+    byModel: 'summarized by the model',
+    stale: 'activity since',
+    usage: (read, output) => `read ${read} / output ${output}`,
+    summarizing: 'Summarizing…',
+    update: 'Update the status board',
+    create: 'Create the status board',
+    cold: ' (cache may be cold)',
+    failed: (reason) => `Could not summarize: ${reason}`,
+    showHistory: 'Show history',
+    hideHistory: 'Hide history',
+    fewer: (shown) => `Show only the newest ${shown}`,
+    more: (count) => `Show ${count} more`,
+    cannotShow: (reason) => `Cannot show the status board: ${reason}`,
+  },
+  ja: {
+    paneTitle: '状況ボード',
+    steps: { completed: '完了', in_progress: '進行中', pending: '未着手' },
+    labels: { recap: 'まとめ', dialog: '質問', prompt: '指示' },
+    boardPrompt: BOARD_PROMPT_JA,
+    commandDescription: 'このセッションの状況ボードを開閉する',
+    opened: '状況ボードを開きました。',
+    closed: '状況ボードを閉じました。',
+    unreadable: (error) => `status-board: 会話ログを読めません: ${error}`,
+    noQuestion: '質問に答えてください',
+    moreQuestions: (question, more) => `${question}（ほか ${more} 問）`,
+    plan: (fresh, count) => `${fresh ? '計画を作成' : '計画を更新'}: ${count} ステップ`,
+    recapAsk: (ask) => ` ／質問: ${ask}`,
+    linked: (pr) => `${pr} を紐付け`,
+    planSize: (count) => `計画 ${count} ステップ`,
+    completedSteps: (count) => `完了 ${count}`,
+    noRecord: 'まだ記録はありません。',
+    noRecordYet: 'まだ記録はありません。指示や計画がここに並びます。',
+    beforeFirstPrompt: '最初の指示より前',
+    ask: (ask) => `質問: ${ask}`,
+    asOf: (time) => `${time} 時点`,
+    byModel: 'モデルによる要約',
+    stale: 'その後に動きあり',
+    usage: (read, output) => `読み ${read} / 出力 ${output}`,
+    summarizing: '要約しています…',
+    update: '状況ボードを更新する',
+    create: '状況ボードを作る',
+    cold: '（キャッシュ切れの可能性あり）',
+    failed: (reason) => `要約できませんでした: ${reason}`,
+    showHistory: '履歴を表示',
+    hideHistory: '履歴を隠す',
+    fewer: (shown) => `新しい ${shown} 件だけにする`,
+    more: (count) => `さらに ${count} 件を表示`,
+    cannotShow: (reason) => `状況ボードを表示できません: ${reason}`,
+  },
+}
+
+function stepCount(count) {
+  return `${count} ${count === 1 ? 'step' : 'steps'}`
+}
+
+// Values of Claude Code's free-text `language` setting, trimmed and lower-cased, that mean Japanese
+const JAPANESE_NAMES = new Set(['ja', 'jp', 'jpn', 'japanese', '日本語'])
+
 const PIPS = {
   completed: { glyph: '●', color: 'success' },
   in_progress: { glyph: '●', color: 'suggestion' },
@@ -87,7 +194,6 @@ const PIPS = {
   prompt: { glyph: '○', color: 'merged' },
   pr: { glyph: '○', color: 'suggestion' },
 }
-const LABELS = { recap: 'まとめ', dialog: '質問', prompt: '指示' }
 
 // Lines worth parsing, picked before JSON.parse: a transcript holds API request copies and tool
 // results of hundreds of kilobytes a line
@@ -131,11 +237,19 @@ let turnRunning = false
 let lastTurnEnd = null
 // Whether the pane shows the cards under the board
 let historyShown = false
+// The texts of the locale resolved at session.start, which render hooks and timers only read
+let texts = TEXTS.en
+// The formatter of the time zone resolved at session.start; the runtime's zone until then
+let clockFormat = runtimeClock()
 
 export function register(on) {
   // Fires again on an enable or a worker respawn, which may keep this module's variables
   on('session.start', async ($, e, next) => {
+    texts = TEXTS.en
+    clockFormat = runtimeClock()
     reset()
+    // No read until the locale is known: event texts are built in it as the transcript is parsed
+    path = ''
     showAll = false
     historyShown = false
     turnRunning = false
@@ -144,7 +258,11 @@ export function register(on) {
     ticker = null
     tickerMs = 0
     const result = await next(e)
-    await $.command.register({ name: 'board', description: 'このセッションの状況ボードを開閉する' })
+    // Before the command, whose description is localized, and before the first read, since event
+    // texts are built as the transcript is parsed; the clock's zone with it
+    texts = TEXTS[await resolveLocale($)]
+    clockFormat = await resolveClock($)
+    await $.command.register({ name: 'board', description: texts.commandDescription })
     path = (await $.session.info()).transcriptPath
     setStatus($, undefined)
     setTicker($, IDLE_TICK_MS)
@@ -205,7 +323,7 @@ export function register(on) {
 
   on('command.run', { command: 'board' }, async ($) => {
     const opened = await toggle($)
-    return { text: opened ? '状況ボードを開きました。' : '状況ボードを閉じました。' }
+    return { text: opened ? texts.opened : texts.closed }
   })
 
   on('ui.close', async ($, e, next) => {
@@ -227,6 +345,44 @@ export function register(on) {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     return paneBody($, e, await $.clock.now())
   })
+}
+
+// ---------------------------------------------------------------- the locale and the clock
+
+// `en` or `ja`. The mods API carries no locale, and Intl answers en-US even on a Japanese macOS, so
+// Claude Code's own `language` setting decides when it is set, whatever the environment says; then
+// the first of LC_ALL, LC_MESSAGES and LANG that is set (the desktop app sets none of them); then,
+// and on any failure of those reads, English.
+async function resolveLocale($) {
+  try {
+    const language = await $.settings.read({ key: 'language' })
+    if (typeof language === 'string' && language.trim() !== '') {
+      const name = language.trim().toLowerCase()
+      return JAPANESE_NAMES.has(name) || name.startsWith('ja-') || name.startsWith('ja_') ? 'ja' : 'en'
+    }
+    const variables = [await $.env.get('LC_ALL'), await $.env.get('LC_MESSAGES'), await $.env.get('LANG')]
+    const locale = variables.find((value) => typeof value === 'string' && value !== '')
+    return locale?.toLowerCase().startsWith('ja') ? 'ja' : 'en'
+  } catch {
+    return 'en'
+  }
+}
+
+// The formatter for TZ when it names a zone Intl knows; otherwise, POSIX forms such as JST-9 and
+// :/etc/localtime included, or when the read fails, the runtime's own zone. Claude Code has no time
+// zone setting of its own.
+async function resolveClock($) {
+  try {
+    const zone = await $.env.get('TZ')
+    if (typeof zone === 'string' && zone !== '') return new Intl.DateTimeFormat('en-GB', { ...CLOCK_OPTIONS, timeZone: zone })
+  } catch {
+    // An unknown zone throws a RangeError
+  }
+  return runtimeClock()
+}
+
+function runtimeClock() {
+  return new Intl.DateTimeFormat('en-GB', CLOCK_OPTIONS)
 }
 
 // ---------------------------------------------------------------- reading the transcript
@@ -261,7 +417,7 @@ function failed($, error) {
   failures += 1
   if (failures !== FAILURES_SHOWN) return
   const line = String(error?.message ?? error).split('\n')[0]
-  setStatus($, `status-board: 会話ログを読めません: ${line}`)
+  setStatus($, texts.unreadable(line))
 }
 
 function succeeded($) {
@@ -549,10 +705,10 @@ function handleToolUse(block, ts) {
 
 // The first question, and how many follow it
 function dialogText(questions) {
-  const texts = Array.isArray(questions) ? questions.map((q) => clip(q?.question)).filter(Boolean) : []
-  if (texts.length === 0) return '質問に答えてください'
-  if (texts.length === 1) return texts[0]
-  return `${texts[0]}（ほか ${texts.length - 1} 問）`
+  const asked = Array.isArray(questions) ? questions.map((q) => clip(q?.question)).filter(Boolean) : []
+  if (asked.length === 0) return texts.noQuestion
+  if (asked.length === 1) return asked[0]
+  return texts.moreQuestions(asked[0], asked.length - 1)
 }
 
 // update_plan's input applied to the plan: `items` replaces it; `advance` completes the step in
@@ -589,7 +745,7 @@ function planEvents(prev, next) {
   const sameSteps = prev.length === next.length && prev.every((s, i) => s.content === next[i].content)
   if (!sameSteps) {
     const fresh = prev.length === 0 || prev.every((s) => s.status === 'completed')
-    return [{ kind: 'plan', fresh, steps: next.length, text: `${fresh ? '計画を作成' : '計画を更新'}: ${next.length} ステップ` }]
+    return [{ kind: 'plan', fresh, steps: next.length, text: texts.plan(fresh, next.length) }]
   }
   const events = []
   next.forEach((step, i) => {
@@ -600,34 +756,39 @@ function planEvents(prev, next) {
 
 // ---------------------------------------------------------------- drawing
 
-// An event's mark and its words: a dim label (指示, まとめ, 質問) and the rest
+// An event's mark and its words: a dim label (Prompt, Recap, Question) and the rest
 function eventParts(event) {
   const oneLine = (text) => text.replace(/\s+/g, ' ').trim()
   if (event.kind === 'step') {
-    const to = STEP_WORD[event.to] ? event.to : 'pending'
+    const to = texts.steps[event.to] ? event.to : 'pending'
     // The status leads, as a word too: the pip's color alone does not say it, and a narrow pane
     // cuts the end of the line
-    return { pip: PIPS[to], label: STEP_WORD[to], text: oneLine(event.text) }
+    return { pip: PIPS[to], label: texts.steps[to], text: oneLine(event.text) }
   }
   if (event.kind === 'recap') {
-    const ask = event.ask ? ` ／質問: ${oneLine(event.ask)}` : ''
-    return { pip: PIPS.recap, label: LABELS.recap, text: oneLine(event.text) + ask }
+    const ask = event.ask ? texts.recapAsk(oneLine(event.ask)) : ''
+    return { pip: PIPS.recap, label: texts.labels.recap, text: oneLine(event.text) + ask }
   }
-  if (event.kind === 'pr') return { pip: PIPS.pr, label: null, text: `${event.text} を紐付け` }
+  if (event.kind === 'pr') return { pip: PIPS.pr, label: null, text: texts.linked(event.text) }
   if (event.kind === 'prompt' || event.kind === 'dialog') {
-    return { pip: PIPS[event.kind], label: LABELS[event.kind], text: oneLine(event.text) }
+    return { pip: PIPS[event.kind], label: texts.labels[event.kind], text: oneLine(event.text) }
   }
   return { pip: PIPS.plan, label: null, text: oneLine(event.text) }
 }
 
-// HH:MM today, M/D HH:MM otherwise, in JST
+// HH:MM today, M/D HH:MM otherwise, both the time and what counts as today in the clock's zone
 function when(ts, now) {
-  const d = new Date(ts + JST_OFFSET_MS)
-  const today = new Date(now + JST_OFFSET_MS)
-  const clock = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
-  const sameDay =
-    d.getUTCFullYear() === today.getUTCFullYear() && d.getUTCMonth() === today.getUTCMonth() && d.getUTCDate() === today.getUTCDate()
-  return sameDay ? clock : `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${clock}`
+  const d = clockParts(ts)
+  const today = clockParts(now)
+  const clock = `${d.hour}:${d.minute}`
+  const sameDay = d.year === today.year && d.month === today.month && d.day === today.day
+  return sameDay ? clock : `${d.month}/${d.day} ${clock}`
+}
+
+function clockParts(ms) {
+  const parts = {}
+  for (const part of clockFormat.formatToParts(ms)) parts[part.type] = part.value
+  return parts
 }
 
 // What the band says: the step in progress with its place in the plan, else the newest event
@@ -637,7 +798,7 @@ function bandView(now) {
   if (current !== -1) {
     const step = data.plan[current]
     const text = step.content.replace(/\s+/g, ' ').trim()
-    const label = `${STEP_WORD.in_progress} (${current + 1}/${data.plan.length})`
+    const label = `${texts.steps.in_progress} (${current + 1}/${data.plan.length})`
     return { pip: PIPS.in_progress, label, text, time: data.currentSince === null ? null : when(data.currentSince, now) }
   }
   const latest = data.timeline[data.timeline.length - 1]
@@ -651,8 +812,8 @@ function bandLine($, e, now) {
   const tail = view.time ? ` · ${view.time}` : ''
   let text = view.text
   if (e.surface === 'terminal') {
-    // The pip and its space, the label, the time and the button ([ 状況ボード ]) after a gap
-    const fixed = 2 + (view.label ? width(view.label) + 1 : 0) + width(tail) + 1 + width(`[ ${PANE_TITLE} ]`)
+    // The pip and its space, the label, the time and the button ([ Status board ]) after a gap
+    const fixed = 2 + (view.label ? width(view.label) + 1 : 0) + width(tail) + 1 + width(`[ ${texts.paneTitle} ]`)
     const room = (e.props.bodyColumns ?? 0) - BAND_RESERVED_COLUMNS - fixed
     if (room < 4) return null
     text = fit(text, room)
@@ -676,7 +837,7 @@ function bandLine($, e, now) {
           Text({ dimColor: true, children: [tail] }),
         ],
       }),
-      Button({ key: 'status-board-toggle', label: PANE_TITLE, onPress: () => toggle($) }),
+      Button({ key: 'status-board-toggle', label: texts.paneTitle, onPress: () => toggle($) }),
     ],
   })
 }
@@ -708,9 +869,9 @@ function cardFooter(card) {
   const parts = []
   const plans = card.events.filter((event) => event.kind === 'plan')
   const lastPlan = plans[plans.length - 1]
-  if (lastPlan && typeof lastPlan.steps === 'number') parts.push(`計画 ${lastPlan.steps} ステップ`)
+  if (lastPlan && typeof lastPlan.steps === 'number') parts.push(texts.planSize(lastPlan.steps))
   const completed = card.events.filter((event) => event.kind === 'step' && event.to === 'completed').length
-  if (completed > 0) parts.push(`完了 ${completed}`)
+  if (completed > 0) parts.push(texts.completedSteps(completed))
   for (const event of card.events) if (event.kind === 'pr') parts.push(event.text)
   return parts.join(' · ')
 }
@@ -731,10 +892,10 @@ function paneBody($, e, now) {
 
   // The small form may not take clicks: the newest card's latest recap, else its prompt
   if (e.props.placement === 'widget') {
-    if (!newest) return Text({ dimColor: true, children: ['まだ記録はありません。'] })
+    if (!newest) return Text({ dimColor: true, children: [texts.noRecord] })
     const recaps = newest.events.filter((event) => event.kind === 'recap')
     const shown = recaps[recaps.length - 1] ?? newest.prompt
-    if (!shown) return Text({ dimColor: true, children: ['まだ記録はありません。'] })
+    if (!shown) return Text({ dimColor: true, children: [texts.noRecord] })
     return Text({ maxLines: 3, children: [pip(shown.kind), ' ', time(shown.ts), ' ', shown.text.trim()] })
   }
 
@@ -743,14 +904,14 @@ function paneBody($, e, now) {
     children.push(
       card.prompt
         ? Text({ maxLines: 3, children: [pip('prompt'), ' ', time(card.prompt.ts), ' ', oneLine(card.prompt.text)] })
-        : Text({ dimColor: true, children: ['最初の指示より前'] }),
+        : Text({ dimColor: true, children: [texts.beforeFirstPrompt] }),
     )
     for (const event of card.events) {
       if (event.kind === 'recap') {
         children.push(Text({ children: [pip('recap'), ' ', time(event.ts), ' ', event.text.trim()] }))
-        if (event.ask) children.push(Text({ color: 'warning', children: [`質問: ${event.ask.trim()}`] }))
+        if (event.ask) children.push(Text({ color: 'warning', children: [texts.ask(event.ask.trim())] }))
       } else if (event.kind === 'dialog') {
-        children.push(Text({ children: [pip('dialog'), ' ', time(event.ts), ' ', Text({ dimColor: true, children: [LABELS.dialog] }), ' ', event.text] }))
+        children.push(Text({ children: [pip('dialog'), ' ', time(event.ts), ' ', Text({ dimColor: true, children: [texts.labels.dialog] }), ' ', event.text] }))
       }
     }
     const current = data.plan.findIndex((step) => step.status === 'in_progress')
@@ -760,7 +921,7 @@ function paneBody($, e, now) {
           children: [
             pip('in_progress'),
             ' ',
-            Text({ dimColor: true, children: [`${STEP_WORD.in_progress} (${current + 1}/${data.plan.length})`] }),
+            Text({ dimColor: true, children: [`${texts.steps.in_progress} (${current + 1}/${data.plan.length})`] }),
             ' ',
             oneLine(data.plan[current].content),
           ],
@@ -781,13 +942,13 @@ function paneBody($, e, now) {
   const children = []
   if (board) {
     children.push(Markdown({ text: board.text }))
-    const meta = [`${when(board.at, now)} 時点`, 'モデルによる要約']
-    if (isStale(board)) meta.push('その後に動きあり')
-    if (board.usage) meta.push(`読み ${tokens(board.usage.read)} / 出力 ${tokens(board.usage.output)}`)
+    const meta = [texts.asOf(when(board.at, now)), texts.byModel]
+    if (isStale(board)) meta.push(texts.stale)
+    if (board.usage) meta.push(texts.usage(tokens(board.usage.read), tokens(board.usage.output)))
     children.push(Text({ dimColor: true, children: [meta.join(' · ')] }))
   }
-  const label = summarizing ? '要約しています…' : board ? '状況ボードを更新する' : '状況ボードを作る'
-  const warning = summarizing || isWarm(now) ? '' : '（キャッシュ切れの可能性あり）'
+  const label = summarizing ? texts.summarizing : board ? texts.update : texts.create
+  const warning = summarizing || isWarm(now) ? '' : texts.cold
   const action = [
     Button({
       key: 'status-board-refresh',
@@ -797,14 +958,14 @@ function paneBody($, e, now) {
       },
     }),
   ]
-  if (boardError) action.push(Text({ dimColor: true, children: [`要約できませんでした: ${boardError}`] }))
+  if (boardError) action.push(Text({ dimColor: true, children: [texts.failed(boardError)] }))
   children.push(Box({ flexDirection: 'column', children: action }))
   children.push(
     Button({
       key: 'status-board-history',
       plain: true,
       dimColor: true,
-      label: historyShown ? '履歴を隠す' : '履歴を表示',
+      label: historyShown ? texts.hideHistory : texts.showHistory,
       onPress: () => {
         historyShown = !historyShown
         $.ui.invalidate('ui.render')
@@ -812,7 +973,7 @@ function paneBody($, e, now) {
     }),
   )
   if (!historyShown) return Box({ flexDirection: 'column', rowGap: 1, children })
-  if (cards.length === 0) children.push(Text({ dimColor: true, children: ['まだ記録はありません。指示や計画がここに並びます。'] }))
+  if (cards.length === 0) children.push(Text({ dimColor: true, children: [texts.noRecordYet] }))
 
   const newestFirst = [...cards].reverse()
   const shown = showAll ? newestFirst : newestFirst.slice(0, SHOWN)
@@ -823,7 +984,7 @@ function paneBody($, e, now) {
         key: 'status-board-more',
         plain: true,
         dimColor: true,
-        label: showAll ? `新しい ${SHOWN} 件だけにする` : `さらに ${cards.length - SHOWN} 件を表示`,
+        label: showAll ? texts.fewer(SHOWN) : texts.more(cards.length - SHOWN),
         onPress: () => {
           showAll = !showAll
           $.ui.invalidate('ui.render')
@@ -841,10 +1002,10 @@ async function toggle($) {
     await $.ui.close({ id: PANE })
     return false
   }
-  const opened = await $.ui.open({ id: PANE, title: PANE_TITLE })
+  const opened = await $.ui.open({ id: PANE, title: texts.paneTitle })
   if (!opened.isPlaced) {
     // Nobody would see a board asked for now
-    $.ui.toast(`状況ボードを表示できません: ${opened.reason}`)
+    $.ui.toast(texts.cannotShow(opened.reason))
     return true
   }
   // A missing or outdated board is asked for only on a warm cache; otherwise the button waits
@@ -921,7 +1082,7 @@ async function summarize($, auto = false) {
     const id = sessionId
     // The fork sees the turn's final answer too, and raises no turn events of its own, so a board
     // asked for at turn.complete asks for no other (probed with `claude -p` on 2.1.327)
-    const reply = await $.model.fork({ prompt: BOARD_PROMPT })
+    const reply = await $.model.fork({ prompt: texts.boardPrompt })
     if (run !== boardRuns) return
     if (reply.isAnswered) {
       const usage = reply.usage

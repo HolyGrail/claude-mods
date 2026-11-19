@@ -16,6 +16,9 @@ let scoped = { at: 0, limits: [] }
 let scopedTriedAt = 0
 // Counts session.start, so an answer to a poll an earlier start began is left unused
 let scopedGeneration = 0
+// Tells the reset time of day in the machine's time zone, resolved again at each session.start;
+// the runtime's own zone until then
+let clock = null
 
 // Rate limits are per account, so sessions share readings through $.store, and each shows the
 // newest one. $.store has no atomic update, so each session writes only its own key, and no
@@ -49,7 +52,7 @@ const SAME_RESET_MS = 60_000
 
 const HOUR_MS = 3_600_000
 const WINDOWS = {
-  // showsClock adds the reset time of day, in JST
+  // showsClock adds the reset time of day, in the machine's time zone
   five_hour: { label: '5h', ms: 5 * HOUR_MS, showsClock: true },
   seven_day: { label: '7d', ms: 7 * 24 * HOUR_MS },
   // Labeled with the model's name
@@ -65,8 +68,9 @@ const GREEN_MAX_USED = 10
 // Usage this high is red whatever the pace
 const RED_MIN_USED = 90
 
-// JST has no daylight saving time, so a fixed offset gives its clock
-const JST_OFFSET_MS = 9 * HOUR_MS
+// 24-hour HH:MM; en-GB pads the hour and h23 keeps midnight as 00, not 24
+const CLOCK_FORMAT = { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }
+const RUNTIME_CLOCK = new Intl.DateTimeFormat('en-GB', CLOCK_FORMAT)
 
 const BAR_CELLS = 10
 // Columns between two meters, and the band's last column, which the terminal may draw over
@@ -89,6 +93,8 @@ export function register(on) {
     scoped = { at: 0, limits: [] }
     scopedTriedAt = 0
     scopedGeneration += 1
+    clock = RUNTIME_CLOCK
+    clock = await zoneClock($)
     ownKey = KEY_PREFIX + (await $.session.id())
     const usage = await $.session.usage()
     context = usage.context
@@ -335,7 +341,7 @@ function statusOf(used, elapsed) {
 function valueText({ used, resetsAt, showsClock }, now) {
   let value = typeof used === 'number' ? Math.round(used) + '%' : '—'
   if (resetsAt != null) value += ' ' + untilReset(resetsAt - now)
-  if (resetsAt != null && showsClock) value += ' (' + jstClock(resetsAt) + ')'
+  if (resetsAt != null && showsClock) value += ' (' + (clock ?? RUNTIME_CLOCK).format(resetsAt) + ')'
   return value
 }
 
@@ -421,10 +427,18 @@ function clamp(percent) {
   return Math.min(Math.max(percent, 0), 100)
 }
 
-// The time of day as HH:MM, 24-hour, in JST
-function jstClock(ms) {
-  const jst = new Date(ms + JST_OFFSET_MS)
-  return String(jst.getUTCHours()).padStart(2, '0') + ':' + String(jst.getUTCMinutes()).padStart(2, '0')
+// TZ when it names a zone Intl knows, else the runtime's own zone. Claude Code has no time zone
+// setting, and a POSIX TZ such as JST-9 or :/etc/localtime, which Intl refuses, or a read that
+// fails falls back to the runtime's zone, which the system's settings already decide.
+async function zoneClock($) {
+  try {
+    const tz = await $.env.get('TZ')
+    // Throws a RangeError for a zone Intl does not know
+    if (typeof tz === 'string' && tz !== '') return new Intl.DateTimeFormat('en-GB', { ...CLOCK_FORMAT, timeZone: tz })
+  } catch {
+    // Falls through to the runtime's zone
+  }
+  return RUNTIME_CLOCK
 }
 
 function untilReset(ms) {

@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
-// 2026-10-01T12:00:00Z, 21:00 in JST
+// 2026-10-01T12:00:00Z, 21:00 in Asia/Tokyo, the zone the shared helper sets through TZ
 const NOW = Date.UTC(2026, 9, 1, 12)
 
 const BAND = {
@@ -56,7 +56,16 @@ function stubStore(on: On, saved: Map<string, unknown>, onList = () => {}, sessi
   })
 }
 
-function stubSession(on: On, saved: Map<string, unknown>, rateLimits = LIMITS, context = CONTEXT) {
+// The reset time of day follows TZ, so the helper pins it to a zone without daylight saving and the
+// clock expectations hold on any machine. A test passes its own env to try another value, or none.
+function stubSession(
+  on: On,
+  saved: Map<string, unknown>,
+  rateLimits = LIMITS,
+  context = CONTEXT,
+  env: Record<string, string | undefined> = { TZ: 'Asia/Tokyo' },
+) {
+  on('env.get', ($, e) => ({ value: env[e.name] }))
   on('session.usage', () => ({ value: { startedAt: NOW, context, rateLimits } }))
   on('session.start', () => ({ cwd: '/work' }))
   stubStore(on, saved)
@@ -83,13 +92,60 @@ test('colors a limit by how far usage runs ahead of the time gone', async ($, on
   }
 })
 
-test('the 5-hour limit shows its reset time in JST past midnight', async ($, on) => {
+test('the 5-hour limit shows its reset time in the TZ zone past midnight', async ($, on) => {
   mock.clock(on, { now: NOW })
   stubSession(on, new Map(), [fiveHour(40, 3 * HOUR + 5 * MINUTE)])
   await $.session.start(START)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: '40% 3h5m (00:05)' })).toBeDefined()
+})
+
+// The same 15:05Z reset, told at New York's local time on either side of its daylight saving change
+for (const [season, now, shown] of [
+  ['summer (EDT)', NOW, '11:05'],
+  ['winter (EST)', Date.UTC(2026, 11, 1, 12), '10:05'],
+] as const) {
+  test(`with TZ=America/New_York the reset time is New York's local time in ${season}`, async ($, on) => {
+    mock.clock(on, { now })
+    const resetsAt = new Date(now + 3 * HOUR + 5 * MINUTE).toISOString()
+    stubSession(on, new Map(), [{ kind: 'five_hour', percentUsed: 40, resetsAt }], CONTEXT, { TZ: 'America/New_York' })
+    await $.session.start(START)
+
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: `40% 3h5m (${shown})` })).toBeDefined()
+  })
+}
+
+test('a TZ Intl refuses, or none, still shows a 24-hour reset time from the runtime zone', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const env: Record<string, string | undefined> = {}
+  stubSession(on, new Map(), [fiveHour(40, 3 * HOUR + 5 * MINUTE)], CONTEXT, env)
+
+  // Which time shows depends on the machine's zone (some are off by 30 or 45 minutes), so only
+  // the shape is fixed
+  for (const tz of ['JST-9', ':/etc/localtime', '', undefined]) {
+    env.TZ = tz
+    await $.session.start(START)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: /^40% 3h5m \((?:[01]\d|2[0-3]):[0-5]\d\)$/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('a re-fired session.start picks up a changed TZ', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const env: Record<string, string | undefined> = { TZ: 'Asia/Tokyo' }
+  stubSession(on, new Map(), [fiveHour(40, 3 * HOUR + 5 * MINUTE)], CONTEXT, env)
+  await $.session.start(START)
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '40% 3h5m (00:05)' })).toBeDefined()
+  await ui.unmount()
+
+  env.TZ = 'America/New_York'
+  await $.session.start(START)
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '40% 3h5m (11:05)' })).toBeDefined()
 })
 
 test('a fresh window with little usage is green', async ($, on) => {

@@ -1,6 +1,6 @@
 {
   "name": "usage-meter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shows context, 5-hour, weekly and per-model weekly limit usage above the prompt",
   "author": { "name": "HolyGrail" }
 }

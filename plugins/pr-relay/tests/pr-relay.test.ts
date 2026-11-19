@@ -16,6 +16,7 @@ const BAND = {
   viewport: { columns: 120, rows: 40 },
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: false,
     maxRows: 4,
     bodyColumns: 100,
@@ -274,6 +275,10 @@ type World = {
   pulls?: Record<number, Pull>
   // Process environment variables besides the note key instance
   env?: Record<string, string>
+  // Claude Code's language setting; null leaves it unset
+  language: string | null
+  // Whether reading the settings fails
+  settingsThrows?: boolean
   // The argument vectors of the polling gh api calls
   queryArgv: (readonly string[])[]
   store: Map<string, unknown>
@@ -317,11 +322,26 @@ function stubWorld(on: On, world: Partial<World> = {}): World {
     detailsArgv: [],
     turnStarts: async () => {},
     answers: async () => {},
+    // Japanese unless a test says otherwise: most tests were written against the Japanese texts and
+    // assert them whole, so they cover that locale, while the English ones set language: null
+    language: 'japanese',
     ...world,
   }
   on('session.start', () => ({ cwd: '/repo' }))
-  // The process's part of the note keys
-  mock.env(on, { PR_RELAY_INSTANCE: 'p1', ...w.env })
+  // The process's part of the note keys, and Tokyo's time zone, so the clock times the tests expect
+  // (21:00 for NOW) stand on a machine in any zone. Read from w.env at each call, unlike mock.env's
+  // copy, so a test can change a variable between two session.start events
+  const env: Record<string, string> = (w.env = { PR_RELAY_INSTANCE: 'p1', TZ: 'Asia/Tokyo', ...w.env })
+  on('env.get', ($, e) => ({ value: env[e.name] }))
+  on('env.set', ($, e) => {
+    if (e.value === undefined) delete env[e.name]
+    else env[e.name] = e.value
+    return { value: {} }
+  })
+  on('settings.read', () => {
+    if (w.settingsThrows) throw new Error('settings unreadable')
+    return { value: w.language === null ? {} : { language: w.language } }
+  })
   on('session.id', async () => {
     await w.ids?.()
     return { value: w.sessionId }
@@ -5898,4 +5918,277 @@ test('a command that replies to a review before it opens a pull request watches 
   await clock.settle()
   await clock.advance(MINUTE)
   expect(w.status).toBe('PR #9 監視中 · 21:01 確認')
+})
+
+// ---- Display language ----
+// stubWorld sets the language to Japanese, so the tests above cover that locale; these leave it
+// unset (language: null) unless they test how it is chosen.
+
+const ENGLISH = { language: null }
+const englishCleanup = (url: string) =>
+  `PR ${url} was merged. Carry out the post-merge follow-up for this PR.\n` +
+  'If a skill or command used in this work defines its own post-merge follow-up (such as /dev cleanup), follow it. Otherwise, proceed in this order.\n' +
+  `1. Run gh pr view ${url} --json state,headRefName,headRepository to confirm that it is merged and to find its branch.\n` +
+  "2. If the project's CLAUDE.md defines post-merge steps, read them before removing anything and follow their steps and order.\n" +
+  '3. If items from this work were moved to another PR or left out of scope, ask the user whether to file them as issues.\n' +
+  '4. Find the worktree that has that branch checked out with git worktree list, and remove the worktree and the local branch. If the remote branch remains, ask the user whether to delete it.\n' +
+  '5. Report what you did and what you skipped.\n' +
+  'If no worktree is found, or the PR belongs to another repository, remove nothing and report.\n' +
+  'Before removing anything, check for uncommitted changes and unpushed commits; if any remain, remove nothing and report.'
+const ENGLISH_APPROVED = `Codex approved PR #7 (${URL}) at 20:59, on head a1. Check the CI results and, if there are no problems, report that the work is complete.`
+
+test('with no language configured, a failed lookup reads in English in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, branchPr: 'error' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR lookup failed 21:00: error connecting to api.github.com')
+})
+
+test('with no language configured, a failed check reads in English in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, queryError: 'HTTP 502' })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 check failed 21:00: HTTP 502')
+})
+
+test('with no language configured, a pull request the CI monitor relays reads in English in the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } } })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.status).toBe('PR #7 watching · checked 21:00 · with CI monitor')
+})
+
+test('with no language configured, a merge reads in English in the toast, the status line, the card and the cleanup prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, ENGLISH)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 watching · checked 21:00')
+
+  w.pull.state = 'MERGED'
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #7 was merged'])
+  expect(w.status).toBe('PR #7 merged')
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'PR #7 was merged' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'Dismiss' })).toBeDefined()
+  await ui.press({ key: `cleanup-${URL.toLowerCase()}` })
+  expect(w.prompts).toEqual([englishCleanup(URL)])
+  // The dev skill matches the URL in the first sentence against its sessions
+  expect(w.prompts[0]?.split('. ')[0]).toBe(`PR ${URL} was merged`)
+  expect(w.prompts[0]).toContain('/dev cleanup')
+})
+
+test('with no language configured, a close reads in English in the toast and the status line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, ENGLISH)
+  await $.session.start(START)
+  await clock.settle()
+  w.pull.state = 'CLOSED'
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #7 was closed'])
+  expect(w.status).toBe('PR #7 closed')
+})
+
+test('with no language configured, another bound pull request merging raises an English toast', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, desktop: { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'open' }] } })
+  await $.session.start(START)
+  await clock.settle()
+  w.desktop = { primary: { number: 7, state: 'open' }, others: [{ number: 9, state: 'merged' }] }
+  await clock.advance(MINUTE)
+  expect(w.toasts).toEqual(['PR #9 was merged'])
+})
+
+test('with no language configured, a usage limit raises an English toast', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    ...ENGLISH,
+    pull: { comments: [{ at: NOW - MINUTE, body: 'You have reached your Codex usage limits for code reviews.' }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.toasts).toEqual(['PR #7: Codex hit its usage limit, so no review will come'])
+})
+
+test('with no language configured, asking Codex for a review raises an English toast', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, pull: { thumbsUpAt: LAST_PUSH - 5 * MINUTE, codex: REVIEWED_BEFORE } })
+  await $.session.start(START)
+  await clock.settle()
+  await clock.advance(3 * MINUTE)
+  expect(w.asks).toEqual([ASK])
+  expect(w.toasts).toEqual(['PR #7: Codex has not reviewed the latest push (a1), so @codex review was posted'])
+})
+
+test('with no language configured, a push that leaves out the base tip tells the model to rebase in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  stubWorld(on, { ...ENGLISH, ancestry: 'behind' })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.context).toEqual([
+    "pr-relay: PR #7's base branch main has advanced, and the commits just pushed do not include its tip (c0c0c0c). " +
+    'Rebase onto origin/main before the next push.',
+  ])
+})
+
+test('with no language configured, an approval prompt reads in English and names the head', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, pull: { codex: { sha: 'a1', status: 'completed', findings: false, at: NOW - MINUTE } } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([ENGLISH_APPROVED])
+})
+
+test('with no language configured, an approval after reviews the CI monitor relays adds the English monitor note', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    ...ENGLISH,
+    desktop: { primary: { number: 7, state: 'open' }, monitor: { auto_fix: true } },
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+  })
+  await $.session.start({ ...START, surface: 'desktop' })
+  await clock.settle()
+  expect(w.prompts).toEqual([
+    ENGLISH_APPROVED + '\nNote that Codex left a review before this 👍. Its findings arrive through the desktop CI monitor. ' +
+    'If you do not push changes for them, you may treat the PR as approved.',
+  ])
+})
+
+test('with no language configured, a review prompt without details falls back to English instructions with counted nouns', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    ...ENGLISH,
+    pull: { reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 0 }, { id: 2, at: NOW - MINUTE, comments: 1 }] },
+    detailsError: 'error connecting to api.github.com',
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts).toEqual([
+    `Codex reviewed PR #7 (${URL}) (2 reviews, 1 inline comment).\n` +
+    'Check each finding one by one: fix and push the valid ones, and reply to the comment with your reasons for the ones that are not.\n' +
+    "You can reply with gh api repos/HolyGrail/claude-mods/pulls/7/comments/<comment id>/replies -f body='...'.\n" +
+    'Read the comments with gh api --paginate repos/HolyGrail/claude-mods/pulls/7/comments --jq \'.[] | select(.in_reply_to_id == null and ' +
+    '((.pull_request_review_id | tostring) == "1" or (.pull_request_review_id | tostring) == "2")) | {id, path, line, body}\'.',
+  ])
+})
+
+test('with no language configured, a review prompt notes a later thumbs-up in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, {
+    ...ENGLISH,
+    pull: { thumbsUpAt: NOW - MINUTE, reviews: [{ id: 1, at: NOW - 2 * MINUTE, comments: 1 }] },
+  })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toMatch(/^Codex reviewed PR #7 \(.+\) \(1 review, 1 inline comment\)\.\n/)
+  expect(w.prompts[0]?.endsWith(
+    '\n\nNote that Codex gave a 👍 after this review (at 20:59). If you do not push changes for the findings, you may treat the PR as approved.',
+  )).toBe(true)
+})
+
+test('with no language configured, a review body is headed and cut with English notices', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 0, body: 'x'.repeat(4_001) }] } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]).toContain('\n\n### Review 1\n' + 'x'.repeat(4_000) + '…(truncated; see the URL for the full text)\n')
+})
+
+test('with no language configured, comments left out of a review prompt are counted in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, pull: { reviews: [{ id: 1, at: NOW - MINUTE, comments: 101 }] } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]?.endsWith(`\n\nSee ${URL}/files for the remaining 1 comment.`)).toBe(true)
+})
+
+test('with no language configured, review bodies left out of a review prompt are counted in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const reviews: Review[] = Array.from({ length: 10 }, (_, i) => ({
+    id: i + 1, at: NOW - (11 - i) * MINUTE, comments: 0, body: 'x'.repeat(4_000),
+  }))
+  const w = stubWorld(on, { ...ENGLISH, pull: { reviews } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.prompts[0]?.endsWith(`\n\nSee ${URL} for the remaining 3 comments and review bodies.`)).toBe(true)
+})
+
+const WATCHING = { en: 'PR #7 watching · checked 21:00', ja: 'PR #7 監視中 · 21:00 確認' }
+
+for (const [what, world, locale] of [
+  ['the language setting japanese', { language: 'japanese' }, 'ja'],
+  ['the language setting Japanese', { language: 'Japanese' }, 'ja'],
+  ['the language setting ja', { language: 'ja' }, 'ja'],
+  ['the language setting ja-JP', { language: 'ja-JP' }, 'ja'],
+  ['the language setting 日本語', { language: '日本語' }, 'ja'],
+  ['the language setting english, even with LANG=ja_JP.UTF-8', { language: 'english', env: { LANG: 'ja_JP.UTF-8' } }, 'en'],
+  ['no language setting and LANG=ja_JP.UTF-8', { language: null, env: { LANG: 'ja_JP.UTF-8' } }, 'ja'],
+  ['LC_ALL=en_US.UTF-8 over LC_MESSAGES and LANG in Japanese', { language: null, env: { LC_ALL: 'en_US.UTF-8', LC_MESSAGES: 'ja_JP.UTF-8', LANG: 'ja_JP.UTF-8' } }, 'en'],
+  ['LC_ALL=ja_JP.UTF-8 over LANG=en_US.UTF-8', { language: null, env: { LC_ALL: 'ja_JP.UTF-8', LANG: 'en_US.UTF-8' } }, 'ja'],
+  ['LC_MESSAGES=ja_JP.UTF-8 over LANG=en_US.UTF-8', { language: null, env: { LC_MESSAGES: 'ja_JP.UTF-8', LANG: 'en_US.UTF-8' } }, 'ja'],
+  ['LC_MESSAGES=en_US.UTF-8 over LANG=ja_JP.UTF-8', { language: null, env: { LC_MESSAGES: 'en_US.UTF-8', LANG: 'ja_JP.UTF-8' } }, 'en'],
+  ['settings that cannot be read, even with LANG=ja_JP.UTF-8', { settingsThrows: true, env: { LANG: 'ja_JP.UTF-8' } }, 'en'],
+] as [string, Partial<World>, 'en' | 'ja'][]) {
+  test(`${what} reads in ${locale === 'ja' ? 'Japanese' : 'English'}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = stubWorld(on, world)
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.status).toBe(WATCHING[locale])
+  })
+}
+
+test('a session.start fired again takes up a changed language setting', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, ENGLISH)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe(WATCHING.en)
+
+  w.language = 'japanese'
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe(WATCHING.ja)
+})
+
+// ---- Time zone ----
+
+for (const [season, now, time] of [
+  ['summer', NOW, '08:00'],
+  ['winter', Date.UTC(2027, 0, 15, 12), '07:00'],
+] as const) {
+  test(`TZ=America/New_York shows the clock at New York's ${season} time`, async ($, on) => {
+    const clock = mock.clock(on, { now })
+    const w = stubWorld(on, { ...ENGLISH, env: { TZ: 'America/New_York' } })
+    await $.session.start(START)
+    await clock.settle()
+    expect(w.status).toBe(`PR #7 watching · checked ${time}`)
+  })
+}
+
+test('a TZ Intl does not know still draws the clock as HH:MM', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, { ...ENGLISH, env: { TZ: 'JST-9' } })
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toMatch(/^PR #7 watching · checked \d\d:\d\d$/)
+})
+
+test('a session.start fired again takes up a changed TZ', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = stubWorld(on, ENGLISH)
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 watching · checked 21:00')
+
+  w.env!.TZ = 'Europe/London'
+  await $.session.start(START)
+  await clock.settle()
+  expect(w.status).toBe('PR #7 watching · checked 13:00')
 })
