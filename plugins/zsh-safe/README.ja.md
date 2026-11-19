@@ -1,5 +1,7 @@
 # zsh-safe
 
+[English](README.md) | 日本語
+
 Claude が bash の書き方で書いた Bash コマンドを、macOS の zsh でもそのまま通す Claude Code の mod です。
 
 ```text
@@ -67,7 +69,7 @@ claude plugin marketplace update claude-mods
 claude plugin update zsh-safe@claude-mods
 ```
 
-注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+注意点は、[リポジトリの README](../../README.ja.md) にまとめてあります。
 
 ### インストールせずに試す
 

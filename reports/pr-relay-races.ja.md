@@ -1,5 +1,7 @@
 # pr-relay: #24 のあとに残ったマルチセッション競合の整理
 
+[English](pr-relay-races.md) | 日本語
+
 対象: `plugins/pr-relay/hooks/register.js`（main `25a8969` 時点）、issue [HolyGrail/claude-mods#26](https://github.com/HolyGrail/claude-mods/issues/26)、PR [HolyGrail/claude-mods#24](https://github.com/HolyGrail/claude-mods/pull/24)
 
 このレポートは修正を実装しない。次に何から直すかを決める材料として、競合を一つずつ「起きる条件・再現の有無・影響・直し方・優先度」で整理する。

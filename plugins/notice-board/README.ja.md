@@ -1,5 +1,7 @@
 # notice-board
 
+[English](README.md) | 日本語
+
 マシン上で同時に動く Claude Code のセッションへ、リポジトリ単位でお知らせを届ける mod です。
 「CI を止めているので Codex のレビューだけ見ればよい」のような状況の変化を、セッションごとに打ち直さずに済みます。
 
@@ -20,7 +22,7 @@ notice (all) 1d: Rate limits are tight this week
 期限はなく、消えるのは `/notice clear` を実行したときだけです。
 帯には投稿からの経過時間を出すので、古いお知らせは見ればわかります。
 
-mod が動く Claude Code のバージョンは [usage-meter](../usage-meter/README.md#使い方) と同じです。
+mod が動く Claude Code のバージョンは [usage-meter](../usage-meter/README.ja.md#使い方) と同じです。
 
 ### インストール
 
@@ -32,7 +34,7 @@ Claude Code のプロンプトで、次の 3 つを順に実行します。
 /reload-plugins
 ```
 
-更新の手順と注意点は、[リポジトリの README](../../README.md) にまとめてあります。
+更新の手順と注意点は、[リポジトリの README](../../README.ja.md) にまとめてあります。
 
 ### インストールせずに試す
 
