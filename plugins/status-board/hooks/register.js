@@ -148,6 +148,8 @@ const STALE_MS = 8 * 24 * 60 * 60_000
 const BOARD_PREFIX = 'board:'
 
 const PANE = 'status-board'
+// The most text the Markdown element draws
+const MARKDOWN_LIMIT = 10_000
 // The pane shows the newest cards first, this many until asked for the rest
 const SHOWN = 5
 // The band's last column, which the terminal may draw over
@@ -517,9 +519,10 @@ function newReader() {
 function newData() {
   // timeline: { ts, kind, text, to?, ask?, fresh?, steps? }, oldest first.
   // plan: [{ content, status }] as replayed; currentSince: when its in_progress step started.
-  // prs: the pull request URLs linked so far. lastPrompt and lastPromptLeafId: the last-prompt
+  // prs: the pull request URLs linked so far. prLinks: number -> https URL of those pull requests,
+  // null for a number two URLs carry (pull requests of two repositories). lastPrompt and lastPromptLeafId: the last-prompt
   // row, which names the text of a prompt whose own row is not marked as typed by a person.
-  return { timeline: [], plan: [], currentSince: null, prs: new Set(), lastPrompt: null, lastPromptLeafId: null }
+  return { timeline: [], plan: [], currentSince: null, prs: new Set(), prLinks: new Map(), lastPrompt: null, lastPromptLeafId: null }
 }
 
 function reset() {
@@ -774,12 +777,28 @@ function handleLine(line) {
     if (typeof rec?.prUrl !== 'string' || data.prs.has(rec.prUrl)) return false
     // The same link is written again and again: only the first is an event
     data.prs.add(rec.prUrl)
+    const linked = learnPrLink(rec)
     const ts = Date.parse(rec.timestamp)
-    if (Number.isNaN(ts)) return false
+    // A new link redraws the board, whose numbers it may turn into links, even with no event
+    if (Number.isNaN(ts)) return linked
     push({ ts, kind: 'pr', text: `PR #${rec.prNumber ?? '?'}` })
     return true
   }
   return false
+}
+
+// Records the number -> URL of a pr-link row for the board's links. Only an https URL with nothing
+// that would end a Markdown link target is kept, since the Markdown element draws other schemes as
+// text; a number two URLs carry is ambiguous and linked to neither. Says whether the map changed
+function learnPrLink(rec) {
+  const url = rec.prUrl
+  if (!/^https:\/\/[^\s()<>]+$/.test(url)) return false
+  const number = Number.isSafeInteger(rec.prNumber) && rec.prNumber > 0 ? rec.prNumber : Number(/\/pull\/([1-9]\d*)(?:[/?#]|$)/.exec(url)?.[1])
+  if (!number) return false
+  const known = data.prLinks.get(number)
+  if (known === url || known === null) return false
+  data.prLinks.set(number, known === undefined ? url : null)
+  return true
 }
 
 // promptSource marks the input that began a turn (never a tool result); `system` is a plugin's,
@@ -1067,7 +1086,7 @@ function paneBody($, e, now) {
   // The board leads: the model's summary of the whole session, then what it rests on
   const children = []
   if (board) {
-    children.push(Markdown({ text: shownText() }))
+    children.push(Markdown({ text: linkedText() }))
     const meta = [texts.asOf(when(board.at, now)), texts.byModel]
     if (board.draft !== undefined) meta.push(showDraft ? texts.beforeProofreading : texts.proofread)
     if (isStale(board)) meta.push(texts.stale)
@@ -1094,7 +1113,7 @@ function paneBody($, e, now) {
         plain: true,
         label: texts.copyBoard,
         // The two texts may differ by a few commas, so the toast says which one went
-        onPress: (press) => copy($, press.surface, shownText(), copiedText()),
+        onPress: (press) => copy($, press.surface, linkedText(), copiedText()),
       }),
     )
   }
@@ -1276,6 +1295,95 @@ function copiedText() {
 function shownText() {
   if (!board) return ''
   return showDraft && board.draft !== undefined ? board.draft : board.text
+}
+
+// The board as the pane draws and copies it: shownText with the pull request numbers this
+// conversation linked turned into links. The stored board and the proofread's input stay as the
+// model wrote them; linked text over the Markdown element's limit is drawn unlinked instead
+function linkedText() {
+  const text = shownText()
+  const linked = linkPrNumbers(text, data.prLinks)
+  return linked.length > MARKDOWN_LIMIT ? text : linked
+}
+
+// Rewrites each `#N` of the Markdown whose N maps to a URL as `[#N](url)`, leaving alone fenced
+// code blocks, code spans, links inline or by reference (text, target, the label of a reference
+// whose definition the text holds, and the definition line itself), autolinks, bare URLs, and a
+// `#N` that is part
+// of a word, a URL, an entity or an escape (after a word character, `/`, `&`, `#` or `\`, or
+// followed by a word character). The board names a pull request in parentheses after what it
+// does, `(#12)` or, in Japanese, `（#12）`, which this matches since only ASCII word characters
+// count. A line opening with three or more backticks or tildes, at any indent, starts a fence
+// that a line of the same character at least as long ends, so a fence inside a list item counts
+function linkPrNumbers(markdown, links) {
+  if (links.size === 0 || !markdown.includes('#')) return markdown
+  const lines = markdown.split('\n')
+  // The labels defined, so a shortcut reference (`[PR #12]` alone) to one of them is left whole
+  // while brackets around `#12` with no definition still link
+  const labels = new Set()
+  for (const line of lines) {
+    const definition = DEFINITION.exec(line)
+    if (definition) labels.add(labelKey(definition[1]))
+  }
+  const out = []
+  let prose = []
+  let fence = null
+  const flush = () => {
+    if (prose.length > 0) out.push(linkProse(prose.join('\n'), links, labels))
+    prose = []
+  }
+  for (const line of lines) {
+    if (fence) {
+      out.push(line)
+      const close = /^\s*(`{3,}|~{3,})\s*$/.exec(line)
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null
+      continue
+    }
+    const open = /^\s*(`{3,}|~{3,})(.*)$/.exec(line)
+    // A backtick fence's info string holds no backtick; one that does is a code span
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
+      flush()
+      out.push(line)
+      fence = open[1]
+      continue
+    }
+    // A link reference definition is kept whole: label, destination and title
+    if (DEFINITION.test(line)) {
+      flush()
+      out.push(line)
+      continue
+    }
+    prose.push(line)
+  }
+  flush()
+  return out.join('\n')
+}
+
+// A link reference definition, `[label]: destination "title"`, and its label
+const DEFINITION = /^ {0,3}\[([^\]\n]*[^\]\s][^\]\n]*)\]:/
+
+// Labels match case-insensitively with runs of whitespace as one, as in CommonMark
+function labelKey(label) {
+  return label.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+// Skipped whole, in order: a code span (a backtick run closed by one as long), an inline link or
+// image, a full or collapsed reference link or image (`[text][ref]`, `[text][]`), an autolink, a
+// bare URL (ASCII only, since Japanese runs text up to it with no space); then brackets that may
+// be a shortcut reference (left whole when the text defines their label); then a pull request
+// number
+const PR_MENTION = /(`+)[\s\S]*?[^`]\1(?!`)|!?\[[^\]\n]*\]\([^)\n]*\)|!?\[[^\]\n]*\]\[[^\]\n]*\]|<[A-Za-z][\w+.-]*:[^\s<>]*>|[A-Za-z][\w+.-]*:\/\/[!-;=?-~]*|(!?\[)([^\]\n]*)\](?![(\[])|(?<![\w/&#\\])#([1-9]\d*)(?!\w)/g
+
+function linkProse(text, links, labels) {
+  return text.replace(PR_MENTION, (match, ticks, opening, label, digits) => {
+    if (opening !== undefined) {
+      if (labels.has(labelKey(label))) return match
+      return `${opening}${linkProse(label, links, labels)}]`
+    }
+    if (digits === undefined) return match
+    const url = links.get(Number(digits))
+    return url ? `[#${digits}](${url})` : match
+  })
 }
 
 // Only a pane a surface places and shows is looked at

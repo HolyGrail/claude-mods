@@ -37,6 +37,17 @@ A name coined in the conversation (an option's name, a nickname) or a PR or issu
 Each item says one thing in 1 or 2 sentences, with no limit on its length.
 The whole board is kept to about 2,000 characters (about 1,200 in Japanese), and when it runs over, the model drops items rather than trimming what an item says, keeping the items waiting on the person to the last.
 
+A pull request number on the board, such as `(#12)`, opens that pull request on a click when this session linked it (the PRs the history lists).
+The links are added by the mod as the board is drawn, from the URLs the session's transcript holds; the model is not asked to write URLs, since it could make one up.
+So the board saved for the session stays as the model wrote it, while `Copy the board` copies it with the links in it.
+A number is left as text when:
+
+- the session linked no pull request of that number
+- it linked two of that number, from two repositories
+- the URL is not `https:`
+- it is inside code (backquotes or a fenced block) or an existing link, inline or reference-style (its definition line included)
+- it is part of a URL or a word (`issues/12#3`, `abc#12`; `#123` is a number of its own, not `#12`)
+
 Under the board comes the line `As of HH:MM · summarized by the model`.
 If something has happened, or a turn has ended, since the board was written, ` · activity since` follows, and when the tokens it took are known, ` · read 323k / output 490`.
 The board is the model's summary, so its wording and what it keeps or leaves out are up to the model.
@@ -229,6 +240,7 @@ What has been checked, and what has not yet:
 - **Checked in the desktop app (engine 2.1.326)**: the band's display. The pane appearing in a column at the window's right edge. One summary from a button press (5.9 seconds, 321,578 tokens read from the cache, 490 tokens of output)
 - **Copying in the desktop app (2.1.326)**: a probe plugin's Button calling `$.ui.copy` answered `isCopied: true`. The copy buttons of this mod have not been pressed there yet
 - **Checked with `claude -p --plugin-dir` (v2.1.327)**: loading the mod (including the hooks being accepted and `/board` registered). Reading the transcript (a 33 MB transcript read to its end, with the count matching one made another way). A summary asked for from the `turn.complete` hook coming back
+- **Pull request links in the desktop app (2.1.326)**: a probe plugin's pane `Markdown` drew a link written `[#55](https://github.com/owner/repo/pull/55)` that opened in the browser on a click. A board of this mod then showed `#56` as a link, which opened that pull request on a click. The terminal (where the types say an OSC 8 link is drawn) has not been tried
 - **Not yet checked in the desktop app**: the automatic update at the end of a turn. The summary when the pane is opened. Restoring a saved board
 - **Proofreading in the desktop app (2.1.326)**: with `sonnet` and a skill's `SKILL.md` of 41 KB as the rules, found through a `*` segment, the proofread board came back and passed the check of headings and items. It changed 4 or 5 commas and sentence endings a board, and the two calls together wrote 3,672 and 3,887 tokens of output on two boards. `Copy the board` was pressed with each of the two texts shown, and each time copied the one shown. Whether the rules are read from the cache has not been measured
 
