@@ -1,6 +1,6 @@
 {
   "name": "status-board",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Shows a status board the model writes for this session, optionally proofread against rules you name, a one-line status above the prompt, and the per-prompt history of plans, steps, recaps, questions and linked pull requests",
   "author": {
     "name": "HolyGrail"

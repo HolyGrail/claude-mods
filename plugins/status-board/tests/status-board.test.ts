@@ -249,14 +249,14 @@ function toolUse(name: string, input: unknown, minutesAgo: number, id: string, e
 const plan = (input: unknown, minutesAgo: number, id = `toolu_plan_${++uuids}`) => toolUse('mcp__ccd_turn__update_plan', input, minutesAgo, id)
 const wrap = (input: unknown, minutesAgo: number, id = `toolu_wrap_${++uuids}`) => toolUse('mcp__ccd_turn__wrap_up', input, minutesAgo, id)
 
-function prLink(number: number, minutesAgo: number) {
+function prLink(number: number, minutesAgo: number, repository = 'o/r', scheme = 'https') {
   return (
     JSON.stringify({
       type: 'pr-link',
       sessionId: 's1',
       prNumber: number,
-      prUrl: `https://github.com/o/r/pull/${number}`,
-      prRepository: 'o/r',
+      prUrl: `${scheme}://github.com/${repository}/pull/${number}`,
+      prRepository: repository,
       timestamp: iso(minutesAgo),
     }) + '\n'
   )
@@ -1304,4 +1304,131 @@ test('a proofread overtaken by a switch of conversation is dropped, and an answe
   expect(h.store.get('board:s1')).toEqual(kept)
   expect(h.store.get('board:s9')).toEqual({ at: NOW - 30 * MINUTE, text: '再開した会話のボード' })
   expect((await boardOf($)).markdown).toBe('再開した会話のボード')
+})
+
+// ---------------------------------------------------------------- pull request links on the board
+
+const PR12 = '[#12](https://github.com/o/r/pull/12)'
+const PR3 = '[#3](https://github.com/o/r/pull/3)'
+
+test('the board links the pull request numbers the conversation linked, skipping code, links, URLs, words and ambiguous or unknown numbers', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, {
+    [FILE]:
+      prompt('直して', 30) +
+      prLink(12, 25) +
+      prLink(3, 24) +
+      // Two repositories' pull requests numbered 7: neither is linked
+      prLink(7, 23) +
+      prLink(7, 22, 'o/other') +
+      // A URL that is not https is drawn as text by the Markdown element
+      prLink(9, 21, 'o/r', 'http'),
+  })
+  const board = [
+    '## 目的',
+    '- 検索結果の順序を直す PR（#12）。もう一度 #12 と書く。',
+    '- 前の PR (#3), 別リポジトリの #7, 知らない #5, 平文の #9, 桁違いの #123 と #120',
+    '- コード `#12` と ``a ` #12``、リンク [#12](https://example.com/12) と [詳細](https://github.com/o/r/pull/12#issuecomment-1)',
+    '- URL https://github.com/o/r/issues/12#issuecomment-3（#3）と <https://github.com/o/r/pull/3>',
+    '- 語の一部 abc#12, x/12#3, &#12;, \\#12, #12a, #012',
+    '```',
+    '#12',
+    '```',
+    '  ~~~text',
+    '  #3',
+    '  ~~~',
+    '# 12 は見出しの記号ではない',
+  ].join('\n')
+  h.store.set('board:s1', { at: NOW - MINUTE, text: board })
+  const copies: string[] = []
+  on('ui.copy', ($, e) => {
+    copies.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  await start($, clock)
+  await openPane($, clock)
+
+  const linked = [
+    '## 目的',
+    `- 検索結果の順序を直す PR（${PR12}）。もう一度 ${PR12} と書く。`,
+    `- 前の PR (${PR3}), 別リポジトリの #7, 知らない #5, 平文の #9, 桁違いの #123 と #120`,
+    '- コード `#12` と ``a ` #12``、リンク [#12](https://example.com/12) と [詳細](https://github.com/o/r/pull/12#issuecomment-1)',
+    `- URL https://github.com/o/r/issues/12#issuecomment-3（${PR3}）と <https://github.com/o/r/pull/3>`,
+    '- 語の一部 abc#12, x/12#3, &#12;, \\#12, #12a, #012',
+    '```',
+    '#12',
+    '```',
+    '  ~~~text',
+    '  #3',
+    '  ~~~',
+    '# 12 は見出しの記号ではない',
+  ].join('\n')
+  expect((await boardOf($)).markdown).toBe(linked)
+
+  // The copy carries the links; the stored board stays as the model wrote it
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.unmount()
+  expect(copies).toEqual([linked])
+  expect(h.store.get('board:s1')).toEqual({ at: NOW - MINUTE, text: board })
+  expect(h.forks).toEqual([])
+})
+
+test('a pull request linked after the board was written is linked on the board at the next read, with no new summary', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 30) })
+  h.store.set('board:s1', { at: NOW - MINUTE, text: '## 目的\n- 順序を直す PR（#12）' })
+  await start($, clock)
+  await openPane($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe('## 目的\n- 順序を直す PR（#12）')
+
+  append(h, FILE, prLink(12, 0))
+  await clock.advance(30_000)
+  expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe(`## 目的\n- 順序を直す PR（${PR12}）`)
+  await ui.unmount()
+  expect(h.forks).toEqual([])
+})
+
+test('the proofread board and the draft are both linked, and a board the links would push past the Markdown limit is drawn unlinked', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 30) + prLink(12, 25) })
+  h.store.set('board:s1', { at: NOW - MINUTE, text: '## 目的\n- 校正後（#12）', draft: '## 目的\n- 校正前（#12）' })
+  const copies: string[] = []
+  on('ui.copy', ($, e) => {
+    copies.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  await start($, clock)
+  await openPane($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe(`## 目的\n- 校正後（${PR12}）`)
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.press({ key: 'status-board-proofread-toggle' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Markdown' }))?.props.text).toBe(`## 目的\n- 校正前（${PR12}）`)
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.unmount()
+  expect(copies).toEqual([`## 目的\n- 校正後（${PR12}）`, `## 目的\n- 校正前（${PR12}）`])
+
+  // 9,990 characters fit; with the link they would not
+  const long = '## 目的\n- #12 ' + 'あ'.repeat(9_990 - '## 目的\n- #12 '.length)
+  h.store.set('board:s2', { at: NOW - MINUTE, text: long })
+  h.sessionId = 's2'
+  await start($, clock)
+  expect((await boardOf($)).markdown).toBe(long)
+})
+
+test('a board summarized and proofread while a pull request is linked is drawn linked but stored and proofread unlinked', { options: { proofreadRules: '~/rules.md' } }, async ($, on) => {
+  const { clock, h } = await proofHost($, on, { [RULES]: RULES_TEXT, [FILE]: prompt('直して', 10) + prLink(12, 9) })
+  h.reply = answered('## 目的\n- 順序を直す（#12）')
+  h.proofReply = proofread('## 目的\n- 順序を直す PR（#12）')
+  await completeTurn($, clock)
+
+  expect((await boardOf($)).markdown).toBe(`## 目的\n- 順序を直す PR（${PR12}）`)
+  expect(h.completes[0]?.prompt).toContainEqual({ text: '<board>\n## 目的\n- 順序を直す（#12）\n</board>' })
+  expect(h.store.get('board:s1')).toMatchObject({ text: '## 目的\n- 順序を直す PR（#12）', draft: '## 目的\n- 順序を直す（#12）' })
 })
