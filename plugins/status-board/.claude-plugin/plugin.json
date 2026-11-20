@@ -1,8 +1,22 @@
 {
   "name": "status-board",
-  "version": "0.3.0",
-  "description": "Shows a status board the model writes for this session, a one-line status above the prompt, and the per-prompt history of plans, steps, recaps, questions and linked pull requests",
+  "version": "0.4.0",
+  "description": "Shows a status board the model writes for this session, optionally proofread against rules you name, a one-line status above the prompt, and the per-prompt history of plans, steps, recaps, questions and linked pull requests",
   "author": {
     "name": "HolyGrail"
+  },
+  "userConfig": {
+    "proofreadRules": {
+      "type": "string",
+      "title": "Proofreading rules",
+      "description": "Path to a Markdown file (a skill's SKILL.md, or rules of your own) the finished board is proofread against; a folder means its SKILL.md, a leading ~/ is your home, and a whole * segment takes the highest version found there. Empty: no proofreading.",
+      "default": ""
+    },
+    "proofreadModel": {
+      "type": "string",
+      "title": "Proofreading model",
+      "description": "The model that proofreads the board: an alias such as haiku, sonnet or opus, or a full model id.",
+      "default": "sonnet"
+    }
   }
 }

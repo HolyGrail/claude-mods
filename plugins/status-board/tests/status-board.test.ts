@@ -1,4 +1,4 @@
-import type { ModelForkResult } from 'claude-code'
+import type { ModelCompleteResult, ModelForkResult } from 'claude-code'
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
 const MINUTE = 60_000
@@ -46,6 +46,14 @@ type Host = {
   forks: string[]
   reply: ModelForkResult
   hold?: Promise<void>
+  // The proofreading asks ($.model.complete) and how the next one answers, waiting on
+  // `proofHold` while it is set; the folders $.fs.list and $.fs.stat know, by path
+  completes: { model: string; prompt: unknown; maxTokens?: number; timeoutMs?: number }[]
+  proofReply: ModelCompleteResult
+  proofHold?: Promise<void>
+  // Set, the engine refuses the call with this
+  proofDeny?: string
+  dirs: Map<string, { name: string; kind: 'file' | 'dir' | 'other'; isLink?: boolean }[]>
   // The /board descriptions registered, one per session.start, and the titles panes opened with
   commands: string[]
   titles: string[]
@@ -76,6 +84,9 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
     store: new Map(),
     forks: [],
     reply: answered('## 目的\n- 帯を直す'),
+    completes: [],
+    proofReply: answered('') as ModelCompleteResult,
+    dirs: new Map(),
     commands: [],
     titles: [],
     language: 'japanese',
@@ -106,6 +117,17 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
     if (h.hold) await h.hold
     return { value: h.reply }
   })
+  on('model.complete', async ($, e) => {
+    h.completes.push({ model: e.model, prompt: e.promptBlocks ?? e.prompt, maxTokens: e.maxTokens, timeoutMs: e.timeoutMs })
+    if (h.proofHold) await h.proofHold
+    if (h.proofDeny) return { deny: h.proofDeny }
+    return { value: h.proofReply }
+  })
+  on('fs.list', ($, e) => {
+    const entries = h.dirs.get(e.path)
+    if (!entries) return { deny: `ENOENT: no such file or directory, scandir '${e.path}'` }
+    return { value: entries.map((entry) => ({ size: 0, mtimeMs: 0, isLink: false, ...entry })) }
+  })
   on('session.info', () => ({ value: { transcriptPath: h.transcriptPath } }))
   on('command.register', ($, e) => {
     h.commands.push(e.description ?? '')
@@ -119,6 +141,7 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
       h.failStats -= 1
       return { deny: 'EACCES: permission denied' }
     }
+    if (h.dirs.has(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
     const bytes = h.files.get(e.path)
     if (!bytes) return { deny: `ENOENT: no such file or directory, lstat '${e.path}'` }
     return { value: { kind: 'file', size: bytes.length, mtimeMs: 0, isLink: false } }
@@ -134,6 +157,7 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
     const offset = e.offset ?? 0
     const slice = bytes.subarray(offset, e.length === undefined ? undefined : offset + e.length)
     h.reads.push({ path: e.path, offset, length: slice.length })
+    if (e.as === 'text') return { value: new TextDecoder().decode(slice) }
     return { value: { base64: base64(slice) } }
   })
   on('ui.panes', () => ({ value: h.panes.map((id) => ({ id, title: id, isShown: true, isFocused: false, isPlaced: h.placed })) }))
@@ -302,6 +326,7 @@ async function boardOf($: Engine, surface: Surface = 'desktop') {
     meta: lines.find((line) => line.includes('時点') || line.startsWith('As of ')),
     button: button?.text,
     error: lines.find((line) => line.startsWith('要約できませんでした') || line.startsWith('Could not summarize')),
+    proofError: lines.find((line) => line.startsWith('校正できませんでした') || line.startsWith('Could not proofread')),
   }
 }
 
@@ -600,6 +625,8 @@ test('asks for a board when an answer ends with the pane open, shows it with wha
     error: undefined,
   })
   expect(h.store.get('board:s1')).toEqual({ at: NOW + 6 * MINUTE, text: '## 目的\n- 帯を直す', usage: { read: 322_641, output: 490 } })
+  // With no rules set, nothing is proofread
+  expect(h.completes).toHaveLength(0)
   expect((await boardOf($, 'terminal')).markdown).toBe('## 目的\n- 帯を直す')
 
   // An interrupted turn asks for nothing
@@ -1095,4 +1122,186 @@ test('no copy button is drawn with nothing to copy, and the English labels and t
   await clock.settle()
   await ui.unmount()
   expect(h.toasts).toEqual(['Copied the status board.', 'Copied the history.'])
+})
+
+// ---------------------------------------------------------------- proofreading
+
+const HOME = '/home/me'
+const RULES = `${HOME}/rules.md`
+const RULES_TEXT = '# 規範\n- 漢語を和語に開く'
+const DRAFT = '## 目的\n- 帯を直す\n## 未解決・あなたの判断待ち\n- なし\n## 現在地\n- 帯の幅を測った（テスト実行で確認）\n## 決まったこと\n- 幅は 80 桁に揃える\n## 次の一手\n- モデルが帯を直す'
+const PROOFREAD = '## 目的\n- 帯を直します\n## 未解決・あなたの判断待ち\n- なし\n## 現在地\n- 帯の幅を測りました（テスト実行で確認）\n## 決まったこと\n- 幅は 80 桁にそろえる\n## 次の一手\n- モデルが帯を直します'
+
+// A proofread's answer: what the proofreading model wrote, with usage of its own
+function proofread(text: string): ModelCompleteResult {
+  return { isAnswered: true, text, usage: { input_tokens: 1_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 5_000, output_tokens: 300 } } as ModelCompleteResult
+}
+
+// A host whose summary answers DRAFT, with the rules file at RULES, and the pane open on a warm cache
+async function proofHost($: Engine, on: On, files: Record<string, string> = { [RULES]: RULES_TEXT }) {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 10), ...files }, { env: { HOME } })
+  h.reply = answered(DRAFT)
+  h.proofReply = proofread(PROOFREAD)
+  await start($, clock)
+  await openPane($, clock)
+  return { clock, h }
+}
+
+test('with rules set, the summary shows at once, is proofread against them, and the pane switches between the two', { options: { proofreadRules: '~/rules.md', proofreadModel: 'haiku' } }, async ($, on) => {
+  const copies: string[] = []
+  on('ui.copy', ($, e) => {
+    copies.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  const { clock, h } = await proofHost($, on)
+  let release = () => {}
+  h.proofHold = new Promise<void>((resolve) => (release = resolve))
+  await completeTurn($, clock)
+
+  // The summary does not wait on the proofread
+  expect(await boardOf($)).toMatchObject({ markdown: DRAFT, button: '校正しています…', proofError: undefined })
+  expect(h.completes).toEqual([
+    {
+      model: 'haiku',
+      // The fixed frame and the rules lead and are cached; the board follows, unmarked
+      prompt: [
+        { text: expect.stringContaining('校正後の Markdown だけを返してください') },
+        { text: `${RULES_TEXT}\n</rules>\n`, cache: true },
+        { text: `<board>\n${DRAFT}\n</board>` },
+      ],
+      maxTokens: expect.any(Number),
+      timeoutMs: expect.any(Number),
+    },
+  ])
+  // A Japanese board can pass the default cap of 1,024 tokens
+  expect(h.completes[0]?.maxTokens).toBeGreaterThan(1_024)
+
+  release()
+  await clock.settle()
+  expect(await boardOf($)).toEqual({
+    markdown: PROOFREAD,
+    meta: '14:00 時点 · モデルによる要約 · 校正済み · 読み 329k / 出力 790',
+    button: '状況ボードを更新する',
+    error: undefined,
+    proofError: undefined,
+  })
+  // `text` is what an older version shows; the draft rides beside it
+  expect(h.store.get('board:s1')).toEqual({ at: NOW, text: PROOFREAD, draft: DRAFT, usage: { read: 328_641, output: 790 } })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status-board-proofread-toggle' }))?.text).toBe('校正前を表示')
+  await ui.press({ key: 'status-board-copy' })
+  await ui.press({ key: 'status-board-proofread-toggle' })
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  expect((await ui.find({ key: 'status-board-proofread-toggle' }))?.text).toBe('校正後を表示')
+  await ui.unmount()
+  expect(await boardOf($)).toMatchObject({ markdown: DRAFT, meta: '14:00 時点 · モデルによる要約 · 校正前 · 読み 329k / 出力 790' })
+  // Switched back, the proofread board is what is copied again
+  const back = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await back.press({ key: 'status-board-proofread-toggle' })
+  await back.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await back.unmount()
+  expect(copies).toEqual([PROOFREAD, DRAFT, PROOFREAD])
+  expect(h.toasts).toEqual(['校正後のボードをコピーしました。', '校正前のボードをコピーしました。', '校正後のボードをコピーしました。'])
+
+  // A board read back from the store keeps both
+  await start($, clock)
+  expect(await boardOf($)).toMatchObject({ markdown: PROOFREAD, meta: expect.stringContaining('校正済み') })
+})
+
+const proofCases: { name: string; files: Record<string, string>; reply: ModelCompleteResult | 'refused'; error: unknown }[] = [
+  { name: 'a reply whose headings changed', files: { [RULES]: RULES_TEXT }, reply: proofread(PROOFREAD.replace('## 現在地', '## 今の状況')), error: '校正できませんでした: 見出しが変わったので、校正前のボードを表示しています' },
+  { name: 'a reply that merged two items', files: { [RULES]: RULES_TEXT }, reply: proofread(PROOFREAD.replace('\n## 決まったこと\n- 幅は 80 桁にそろえる', '、幅は 80 桁にそろえる\n## 決まったこと')), error: '校正できませんでした: 項目の数が変わったので、校正前のボードを表示しています' },
+  { name: 'a rules file that is not there', files: {}, reply: proofread(PROOFREAD), error: expect.stringMatching(/^校正できませんでした: .*ENOENT/) },
+  { name: 'a rules file over 200 KB', files: { [RULES]: 'x'.repeat(200 * 1024 + 1) }, reply: proofread(PROOFREAD), error: '校正できませんでした: 規範のファイルが 200 KB を超えています' },
+  { name: 'a model that does not answer', files: { [RULES]: RULES_TEXT }, reply: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' } as unknown as ModelCompleteResult, error: '校正できませんでした: api-error 529' },
+  // A model the engine refuses (a typo in the setting) rejects the call rather than resolving
+  { name: 'a model the engine refuses', files: { [RULES]: RULES_TEXT }, reply: 'refused', error: expect.stringMatching(/^校正できませんでした: .*unknown model/) },
+]
+for (const c of proofCases) {
+  test(`proofreading: ${c.name} leaves the summary's board and says why`, { options: { proofreadRules: '~/rules.md' } }, async ($, on) => {
+    const { clock, h } = await proofHost($, on, c.files)
+    if (c.reply === 'refused') h.proofDeny = 'unknown model: sonet'
+    else h.proofReply = c.reply
+    await completeTurn($, clock)
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect(await ui.find({ key: 'status-board-proofread-toggle' })).toBeUndefined()
+    await ui.unmount()
+    expect(await boardOf($)).toMatchObject({ markdown: DRAFT, button: '状況ボードを更新する', error: undefined, proofError: c.error })
+    expect((h.store.get('board:s1') as { text: string; draft?: string }).text).toBe(DRAFT)
+    expect(h.store.get('board:s1')).not.toHaveProperty('draft')
+  })
+}
+
+test('a * segment of the rules path takes the highest version there, and a folder its SKILL.md', { options: { proofreadRules: '~/.claude/plugins/cache/m/p/*/skills/style' } }, async ($, on) => {
+  const base = `${HOME}/.claude/plugins/cache/m/p`
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('fix it', 10), [`${base}/3.10.0/skills/style/SKILL.md`]: 'newest rules', [`${base}/3.9.0/skills/style/SKILL.md`]: 'older rules' }, { language: undefined, env: { HOME } })
+  h.dirs.set(base, [
+    { name: '3.9.0', kind: 'dir' },
+    { name: '3.10.0', kind: 'other', isLink: true },
+    { name: '3.2.2', kind: 'dir' },
+    { name: '9.0.0.zip', kind: 'file' },
+    { name: 'unknown', kind: 'dir' },
+  ])
+  h.dirs.set(`${base}/3.10.0/skills/style`, [])
+  on('ui.copy', () => ({ value: { isCopied: true } }))
+  const draft = '## Goal\n- fix the band\n## Next step\n- the model fixes it'
+  h.reply = answered(draft)
+  h.proofReply = proofread('## Goal\n- Fix the band.\n## Next step\n- The model fixes it.')
+  await start($, clock)
+  await openPane($, clock)
+  await completeTurn($, clock)
+
+  expect(h.completes[0]?.prompt).toEqual([{ text: expect.stringContaining('Return only the proofread Markdown') }, { text: 'newest rules\n</rules>\n', cache: true }, { text: `<board>\n${draft}\n</board>` }])
+  expect(await boardOf($)).toMatchObject({ markdown: '## Goal\n- Fix the band.\n## Next step\n- The model fixes it.', meta: expect.stringContaining('summarized by the model · proofread ·') })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status-board-proofread-toggle' }))?.text).toBe('Show before proofreading')
+  await ui.press({ key: 'status-board-copy' })
+  await ui.press({ key: 'status-board-proofread-toggle' })
+  await ui.press({ key: 'status-board-copy' })
+  await clock.settle()
+  await ui.press({ key: 'status-board-proofread-toggle' })
+  await ui.unmount()
+  expect(h.toasts).toEqual(['Copied the proofread board.', 'Copied the board before proofreading.'])
+
+  // A * with nothing under it
+  h.dirs.set(base, [])
+  await completeTurn($, clock)
+  expect(await boardOf($)).toMatchObject({ markdown: draft, proofError: 'Could not proofread: no folder matches the * in the rules path' })
+})
+
+test('a proofread overtaken by a switch of conversation is dropped, and an answer ending during it asks again', { options: { proofreadRules: '~/rules.md' } }, async ($, on) => {
+  const { clock, h } = await proofHost($, on)
+  let release = () => {}
+  h.proofHold = new Promise<void>((resolve) => (release = resolve))
+  await completeTurn($, clock)
+  // Pressed during the proofread, the button does nothing; an answer that ends asks again after
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'status-board-refresh' })
+  await ui.unmount()
+  await completeTurn($, clock)
+  expect(h.forks).toHaveLength(1)
+  release()
+  await clock.settle()
+  expect(h.forks).toHaveLength(2)
+  expect(h.completes).toHaveLength(2)
+
+  const kept = h.store.get('board:s1')
+  h.proofHold = new Promise<void>((resolve) => (release = resolve))
+  h.proofReply = proofread(PROOFREAD.replace('モデルが帯を直します', 'モデルが帯を直す予定です'))
+  await completeTurn($, clock)
+  // The conversation resumed has a board of its own, which the answer must not land on
+  h.store.set('board:s9', { at: NOW - 30 * MINUTE, text: '再開した会話のボード' })
+  await $.classic.SessionStart({ source: 'resume', transcript_path: FILE, session_id: 's9' })
+  await clock.settle()
+  release()
+  await clock.settle()
+  expect(h.store.get('board:s1')).toEqual(kept)
+  expect(h.store.get('board:s9')).toEqual({ at: NOW - 30 * MINUTE, text: '再開した会話のボード' })
+  expect((await boardOf($)).markdown).toBe('再開した会話のボード')
 })

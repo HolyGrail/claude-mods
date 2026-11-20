@@ -16,21 +16,26 @@ The record it was summed up from is folded away under the board as a history by 
 
 ## Status board
 
-The board is a short piece of Markdown with these five headings.
+The board is Markdown with these five headings.
 
 ```text
 ## Goal
 - Show the session's flow in the band and the pane
-## Where things stand
-- Finished fixing the band's colors
-- Now reworking the pane
-## Decided
-- Build from the transcript (so it can be rebuilt when enabled mid-session)
 ## Open / waiting on you
-- Whether to rewrite the README this time
+- Should the README be rewritten in this pull request, or in a later one?
+## Where things stand
+- The band's colors are fixed (confirmed by running the tests)
+- The pane is being reworked to show one card per prompt
+## Decided
+- Build the board from the transcript, so it can be rebuilt when the mod is enabled mid-session
 ## Next step
-- Fix the tests, then the README
+- The model fixes the tests, then the README
 ```
+
+The model is asked to write for someone who has not read the conversation, so that they can tell where things stand and what they need to decide without going back to it; being short is not the aim.
+A name coined in the conversation (an option's name, a nickname) or a PR or issue number is never written alone: what the thing does comes first, with the name or number in parentheses.
+Each item says one thing in 1 or 2 sentences, with no limit on its length.
+The whole board is kept to about 2,000 characters (about 1,200 in Japanese), and when it runs over, the model drops items rather than trimming what an item says, keeping the items waiting on the person to the last.
 
 Under the board comes the line `As of HH:MM · summarized by the model`.
 If something has happened, or a turn has ended, since the board was written, ` · activity since` follows, and when the tokens it took are known, ` · read 323k / output 490`.
@@ -58,9 +63,51 @@ Boards not written for 8 days are deleted.
 ### Copying
 
 The desktop app does not let you select the pane's text, and a mod has no way to change that.
-So the buttons beside `Update the status board` put the text on the clipboard instead: `Copy the board` copies the board as the model wrote it, in Markdown, and `Copy the history` copies every card as plain text, newest first, whether shown or not.
+So the buttons beside `Update the status board` put the text on the clipboard instead: `Copy the board` copies the board shown, in Markdown, and `Copy the history` copies every card as plain text, newest first, whether shown or not.
 The history's prompts and recaps are copied as kept, so text past the length the pane keeps (1,000 characters for a recap, 200 for the rest) is already cut.
 A toast says whether the copy took.
+
+### Proofreading
+
+The board's wording can carry the vocabulary and turns of phrase typical of AI writing.
+How to fix that differs from person to person (a proofreading skill, rules of your own), so the mod does not pick one way: it can apply rules you name to the finished board, as a second pass.
+It is off by default; without it, nothing below happens and nothing costs more.
+
+Two settings turn it on.
+
+| Setting | What it is | Default |
+| --- | --- | --- |
+| `proofreadRules` | The path of the rules file: a skill's `SKILL.md`, or a Markdown file of your own. A leading `~/` is your home folder; a folder means the `SKILL.md` in it | empty (no proofreading) |
+| `proofreadModel` | The model that proofreads: an alias (`haiku`, `sonnet`, `opus`) or a full model id | `sonnet` |
+
+A skill that comes from a plugin has the plugin's version in its path, which changes with every update.
+For that, a whole segment of the path may be `*`: the mod lists that folder and takes the entry with the highest version (`3.10.0` above `3.9.0`).
+
+```text
+~/notes/writing-rules.md
+~/.claude/plugins/cache/<marketplace>/<plugin>/*/skills/<skill>
+```
+
+Set them where Claude Code keeps a plugin's options: on the screen that sets them when the plugin is installed, as rows of `/config` in the terminal, or in settings.json under `pluginConfigs`, keyed by the plugin. The example below is the form for a plugin loaded with `--plugin-dir`, keyed `status-board`; the key's spelling for an installed plugin has not been checked yet.
+
+```json
+{ "pluginConfigs": { "status-board": { "options": { "proofreadRules": "~/notes/writing-rules.md", "proofreadModel": "sonnet" } } } }
+```
+
+What happens:
+
+- The summary is shown as soon as it is in, and the button reads `Proofreading…` while the second pass runs. Once the proofread board is in, it takes the summary's place
+- The second pass is one call that reads no conversation (`$.model.complete`). It gets a fixed frame from the mod, the rules file's text and the board. The frame tells the model to keep the headings, the number and order of items, facts, numbers, names, what is in parentheses and code in backquotes, to change only wording, and to return only the proofread Markdown. The frame and the rules are sent first and cached
+- The reply is checked mechanically: the five headings must come in the same order as in the summary, and the bullets must be as many. A reply that fails is thrown away
+- A proofread board adds ` · proofread` to the line under it, and the tokens shown are both passes summed. `Show before proofreading` switches to the board as summarized (and `Show proofread` back); `Copy the board` copies the one shown, and its toast says which (`Copied the proofread board.` or `Copied the board before proofreading.`), since the two can differ by no more than a few commas
+- When the rules file cannot be read, is over 200 KB, or the model does not answer, or the reply fails the check, the board stays as summarized and `Could not proofread: <reason>` appears under the button. This is apart from a failure of the summary itself
+- The board is saved with both texts once the proofread is done
+
+Limits:
+
+- The rules file is passed as text to follow; the skill is not run. Steps in it that use tools, or point to other files, do nothing
+- The rules ride every update of the board, so long rules add time and tokens each time (the cached part costs less within 5 minutes)
+- What keeps the meaning unchanged is the frame's instructions and the check of headings and item count. Wording inside an item that drifts in meaning cannot be caught mechanically; compare with `Show before proofreading` when in doubt
 
 ### Rough cost
 
@@ -183,6 +230,7 @@ What has been checked, and what has not yet:
 - **Copying in the desktop app (2.1.326)**: a probe plugin's Button calling `$.ui.copy` answered `isCopied: true`. The copy buttons of this mod have not been pressed there yet
 - **Checked with `claude -p --plugin-dir` (v2.1.327)**: loading the mod (including the hooks being accepted and `/board` registered). Reading the transcript (a 33 MB transcript read to its end, with the count matching one made another way). A summary asked for from the `turn.complete` hook coming back
 - **Not yet checked in the desktop app**: the automatic update at the end of a turn. The summary when the pane is opened. Restoring a saved board
+- **Proofreading in the desktop app (2.1.326)**: with `sonnet` and a skill's `SKILL.md` of 41 KB as the rules, found through a `*` segment, the proofread board came back and passed the check of headings and items. It changed 4 or 5 commas and sentence endings a board, and the two calls together wrote 3,672 and 3,887 tokens of output on two boards. `Copy the board` was pressed with each of the two texts shown, and each time copied the one shown. Whether the rules are read from the cache has not been measured
 
 How to install and update through `/plugin` is in the [repository README](../../README.md).
 To try it without installing, start Claude Code like this from the root of the cloned repository.
