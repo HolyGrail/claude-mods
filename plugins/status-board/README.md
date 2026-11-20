@@ -45,7 +45,7 @@ A number is left as text when:
 - the session linked no pull request of that number
 - it linked two of that number, from two repositories
 - the URL is not `https:`
-- it is inside code (backquotes or a fenced block) or an existing link
+- it is inside code (backquotes or a fenced block) or an existing link, inline or reference-style (its definition line included)
 - it is part of a URL or a word (`issues/12#3`, `abc#12`; `#123` is a number of its own, not `#12`)
 
 Under the board comes the line `As of HH:MM · summarized by the model`.

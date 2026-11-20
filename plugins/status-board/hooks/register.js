@@ -1307,7 +1307,9 @@ function linkedText() {
 }
 
 // Rewrites each `#N` of the Markdown whose N maps to a URL as `[#N](url)`, leaving alone fenced
-// code blocks, code spans, links (text and target), autolinks, bare URLs, and a `#N` that is part
+// code blocks, code spans, links inline or by reference (text, target, the label of a reference
+// whose definition the text holds, and the definition line itself), autolinks, bare URLs, and a
+// `#N` that is part
 // of a word, a URL, an entity or an escape (after a word character, `/`, `&`, `#` or `\`, or
 // followed by a word character). The board names a pull request in parentheses after what it
 // does, `(#12)` or, in Japanese, `（#12）`, which this matches since only ASCII word characters
@@ -1315,14 +1317,22 @@ function linkedText() {
 // that a line of the same character at least as long ends, so a fence inside a list item counts
 function linkPrNumbers(markdown, links) {
   if (links.size === 0 || !markdown.includes('#')) return markdown
+  const lines = markdown.split('\n')
+  // The labels defined, so a shortcut reference (`[PR #12]` alone) to one of them is left whole
+  // while brackets around `#12` with no definition still link
+  const labels = new Set()
+  for (const line of lines) {
+    const definition = DEFINITION.exec(line)
+    if (definition) labels.add(labelKey(definition[1]))
+  }
   const out = []
   let prose = []
   let fence = null
   const flush = () => {
-    if (prose.length > 0) out.push(linkProse(prose.join('\n'), links))
+    if (prose.length > 0) out.push(linkProse(prose.join('\n'), links, labels))
     prose = []
   }
-  for (const line of markdown.split('\n')) {
+  for (const line of lines) {
     if (fence) {
       out.push(line)
       const close = /^\s*(`{3,}|~{3,})\s*$/.exec(line)
@@ -1337,19 +1347,39 @@ function linkPrNumbers(markdown, links) {
       fence = open[1]
       continue
     }
+    // A link reference definition is kept whole: label, destination and title
+    if (DEFINITION.test(line)) {
+      flush()
+      out.push(line)
+      continue
+    }
     prose.push(line)
   }
   flush()
   return out.join('\n')
 }
 
-// Skipped whole, in order: a code span (a backtick run closed by one as long), a link or image,
-// an autolink, a bare URL (ASCII only, since Japanese runs text up to it with no space); then
-// a pull request number
-const PR_MENTION = /(`+)[\s\S]*?[^`]\1(?!`)|!?\[[^\]\n]*\]\([^)\n]*\)|<[A-Za-z][\w+.-]*:[^\s<>]*>|[A-Za-z][\w+.-]*:\/\/[!-;=?-~]*|(?<![\w/&#\\])#([1-9]\d*)(?!\w)/g
+// A link reference definition, `[label]: destination "title"`, and its label
+const DEFINITION = /^ {0,3}\[([^\]\n]*[^\]\s][^\]\n]*)\]:/
 
-function linkProse(text, links) {
-  return text.replace(PR_MENTION, (match, ticks, digits) => {
+// Labels match case-insensitively with runs of whitespace as one, as in CommonMark
+function labelKey(label) {
+  return label.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+// Skipped whole, in order: a code span (a backtick run closed by one as long), an inline link or
+// image, a full or collapsed reference link or image (`[text][ref]`, `[text][]`), an autolink, a
+// bare URL (ASCII only, since Japanese runs text up to it with no space); then brackets that may
+// be a shortcut reference (left whole when the text defines their label); then a pull request
+// number
+const PR_MENTION = /(`+)[\s\S]*?[^`]\1(?!`)|!?\[[^\]\n]*\]\([^)\n]*\)|!?\[[^\]\n]*\]\[[^\]\n]*\]|<[A-Za-z][\w+.-]*:[^\s<>]*>|[A-Za-z][\w+.-]*:\/\/[!-;=?-~]*|(!?\[)([^\]\n]*)\](?![(\[])|(?<![\w/&#\\])#([1-9]\d*)(?!\w)/g
+
+function linkProse(text, links, labels) {
+  return text.replace(PR_MENTION, (match, ticks, opening, label, digits) => {
+    if (opening !== undefined) {
+      if (labels.has(labelKey(label))) return match
+      return `${opening}${linkProse(label, links, labels)}]`
+    }
     if (digits === undefined) return match
     const url = links.get(Number(digits))
     return url ? `[#${digits}](${url})` : match

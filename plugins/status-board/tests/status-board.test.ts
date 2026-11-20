@@ -1375,6 +1375,39 @@ test('the board links the pull request numbers the conversation linked, skipping
   expect(h.forks).toEqual([])
 })
 
+test('the board leaves reference-style links, their definitions and a shortcut reference to a defined label whole, and still links the rest', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const h = stubHost(on, { [FILE]: prompt('直して', 30) + prLink(12, 25) })
+  const board = [
+    '## 目的',
+    '- 検索結果の順序を直す PR（#12）',
+    '- 参照リンク [PR #12][review]、省略形 [PR #12][]、画像 ![図 #12][figure]',
+    '- 定義のある短縮形 [Fix #12] と、定義のない角括弧 [#12]',
+    '',
+    '[review]: https://github.com/o/r/pull/12#pullrequestreview-1 "Review of #12"',
+    '[PR #12]: https://github.com/o/r/pull/12',
+    '[figure]: https://example.com/12.png',
+    '  [fix  #12]: https://github.com/o/r/pull/12 "#12"',
+  ].join('\n')
+  h.store.set('board:s1', { at: NOW - MINUTE, text: board })
+  await start($, clock)
+  await openPane($, clock)
+
+  expect((await boardOf($)).markdown).toBe(
+    [
+      '## 目的',
+      `- 検索結果の順序を直す PR（${PR12}）`,
+      '- 参照リンク [PR #12][review]、省略形 [PR #12][]、画像 ![図 #12][figure]',
+      `- 定義のある短縮形 [Fix #12] と、定義のない角括弧 [${PR12}]`,
+      '',
+      '[review]: https://github.com/o/r/pull/12#pullrequestreview-1 "Review of #12"',
+      '[PR #12]: https://github.com/o/r/pull/12',
+      '[figure]: https://example.com/12.png',
+      '  [fix  #12]: https://github.com/o/r/pull/12 "#12"',
+    ].join('\n'),
+  )
+})
+
 test('a pull request linked after the board was written is linked on the board at the next read, with no new summary', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const h = stubHost(on, { [FILE]: prompt('直して', 30) })
