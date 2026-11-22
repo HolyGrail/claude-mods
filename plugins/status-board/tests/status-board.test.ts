@@ -7,10 +7,16 @@ const NOW = Date.UTC(2026, 10, 18, 5)
 const FILE = '/home/me/.claude/projects/work/s1.jsonl'
 
 // The engine hands $.fs a path made absolute and native: on Windows '/home/me/x' arrives as
-// 'C:\home\me\x'. The stubs key their files by the POSIX spelling, so they take the drive and the
-// backslashes back off, and the tests hold on macOS, Linux and Windows alike
+// 'C:\home\me\x', and on macOS and Linux a Windows path the rules tests name, not being absolute
+// there, arrives resolved against the session's folder ('D:/' as '/work/D:'). The stubs key their
+// files by the POSIX spelling, so they take everything up to a drive segment, the backslashes and a
+// trailing separator back off, and the tests hold on macOS, Linux and Windows alike
 function local(path: string): string {
-  return path.replace(/^[A-Za-z]:(?=[\\/])/, '').replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
+  const posix = path
+    .replace(/\\/g, '/')
+    .replace(/^(?:.*\/)?[A-Za-z]:(?=\/|$)/, '')
+    .replace(/(?<=.)\/+$/, '')
+  return posix === '' ? '/' : posix
 }
 
 type On = Parameters<typeof mock.clock>[0]
