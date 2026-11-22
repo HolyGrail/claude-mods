@@ -1485,7 +1485,8 @@ async function proofread($, run, locale, config, draft) {
     let stat = await $.fs.stat(target)
     let file = target
     if (stat.kind === 'dir') {
-      file = `${target.replace(/\/+$/, '')}/SKILL.md`
+      // A trailing \ is a separator only on Windows, where the engine takes / too
+      file = `${target.replace(/^(?:[A-Za-z]:[\\/]|\\\\)/.test(target) ? /[\\/]+$/ : /\/+$/, '')}/SKILL.md`
       stat = await $.fs.stat(file)
     }
     if (run !== boardRuns) return {}
@@ -1532,17 +1533,22 @@ function lines(markdown) {
   return markdown.split('\n').map((line) => line.trim())
 }
 
-// The rules file the setting names: a leading ~/ is HOME, and a segment that is a whole `*` is the
-// folder or link there with the highest version (3.10.0 above 3.9.0), since a plugin's skill lives under a
-// folder named for the plugin's version. Null when a `*` matches nothing.
+// The rules file the setting names: a leading ~/ (or ~\) is the home folder, and a segment that is a
+// whole `*` is the folder or link there with the highest version (3.10.0 above 3.9.0), since a
+// plugin's skill lives under a folder named for the plugin's version. Null when a `*` matches nothing.
+// A Windows path (a drive letter, a UNC share, or a home that is one) is split on \ as well as /,
+// while elsewhere \ stays part of a name, as the file system takes it; the parts are joined with /,
+// which Windows takes too.
 async function rulesPath($, setting) {
   let path = setting
-  if (path === '~' || path.startsWith('~/')) {
-    const home = await $.env.get('HOME')
+  if (path === '~' || path.startsWith('~/') || path.startsWith('~\\')) {
+    // Windows sets no HOME unless someone does, so its USERPROFILE stands in
+    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
     if (typeof home !== 'string' || home === '') throw new Error('HOME is not set')
-    path = home.replace(/\/+$/, '') + path.slice(1)
+    path = home.replace(/[\\/]+$/, '') + path.slice(1)
   }
-  const segments = path.split('/')
+  const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(path)
+  const segments = path.split(windows ? /[\\/]/ : '/')
   if (!segments.includes('*')) return path
   let resolved = segments[0]
   for (const segment of segments.slice(1)) {
@@ -1550,8 +1556,9 @@ async function rulesPath($, setting) {
       resolved += `/${segment}`
       continue
     }
-    // A link may stand for a version's folder, so links count beside folders
-    const entries = await $.fs.list(resolved === '' ? '/' : resolved)
+    // A link may stand for a version's folder, so links count beside folders. A bare drive (C:)
+    // would name that drive's current folder, so its root is listed as C:/
+    const entries = await $.fs.list(resolved === '' ? '/' : /^[A-Za-z]:$/.test(resolved) ? `${resolved}/` : resolved)
     const names = entries.filter((entry) => entry.kind === 'dir' || entry.isLink).map((entry) => entry.name)
     if (names.length === 0) return null
     // A name that starts with a digit is a version; others (latest, unknown) only when none is
