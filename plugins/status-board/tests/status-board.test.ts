@@ -1292,7 +1292,8 @@ test('a * segment of the rules path takes the highest version there, and a folde
 // split on \ too, a trailing \ before SKILL.md is a separator, and a * right after the drive lists
 // the drive's root. The stubs drop the drive as the engine's native path comes in, so each case's
 // folders are keyed by the POSIX spelling
-const WINDOWS_RULES = [
+type WindowsRulesCase = { name: string; rules: string; env: Record<string, string>; list: string; file: string; dir?: string }
+const WINDOWS_RULES: WindowsRulesCase[] = [
   { name: '~\\ under USERPROFILE, with a trailing \\', rules: '~\\.claude\\plugins\\cache\\m\\p\\*\\skills\\style\\', env: { USERPROFILE: 'C:\\Users\\me\\' }, list: '/Users/me/.claude/plugins/cache/m/p', file: '/Users/me/.claude/plugins/cache/m/p/3.10.0/skills/style/SKILL.md', dir: '/Users/me/.claude/plugins/cache/m/p/3.10.0/skills/style' },
   { name: 'a * right after the drive', rules: 'D:\\*\\rules.md', env: {}, list: '/', file: '/3.10.0/rules.md' },
 ]
