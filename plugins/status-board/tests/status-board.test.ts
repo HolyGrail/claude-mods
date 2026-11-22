@@ -6,6 +6,13 @@ const MINUTE = 60_000
 const NOW = Date.UTC(2026, 10, 18, 5)
 const FILE = '/home/me/.claude/projects/work/s1.jsonl'
 
+// The engine hands $.fs a path made absolute and native: on Windows '/home/me/x' arrives as
+// 'C:\home\me\x'. The stubs key their files by the POSIX spelling, so they take the drive and the
+// backslashes back off, and the tests hold on macOS, Linux and Windows alike
+function local(path: string): string {
+  return path.replace(/^[A-Za-z]:(?=[\\/])/, '').replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
+}
+
 type On = Parameters<typeof mock.clock>[0]
 type Engine = Parameters<TestBody>[0]
 type Surface = 'terminal' | 'desktop'
@@ -124,7 +131,7 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
     return { value: h.proofReply }
   })
   on('fs.list', ($, e) => {
-    const entries = h.dirs.get(e.path)
+    const entries = h.dirs.get(local(e.path))
     if (!entries) return { deny: `ENOENT: no such file or directory, scandir '${e.path}'` }
     return { value: entries.map((entry) => ({ size: 0, mtimeMs: 0, isLink: false, ...entry })) }
   })
@@ -141,8 +148,8 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
       h.failStats -= 1
       return { deny: 'EACCES: permission denied' }
     }
-    if (h.dirs.has(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
-    const bytes = h.files.get(e.path)
+    if (h.dirs.has(local(e.path))) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
+    const bytes = h.files.get(local(e.path))
     if (!bytes) return { deny: `ENOENT: no such file or directory, lstat '${e.path}'` }
     return { value: { kind: 'file', size: bytes.length, mtimeMs: 0, isLink: false } }
   })
@@ -152,11 +159,11 @@ function stubHost(on: On, files: Record<string, string> = {}, locale: Partial<Pi
       h.failReads -= 1
       return { deny: 'EACCES: permission denied\nsecond line' }
     }
-    const bytes = h.files.get(e.path)
+    const bytes = h.files.get(local(e.path))
     if (!bytes) throw new Error(`ENOENT: ${e.path}`)
     const offset = e.offset ?? 0
     const slice = bytes.subarray(offset, e.length === undefined ? undefined : offset + e.length)
-    h.reads.push({ path: e.path, offset, length: slice.length })
+    h.reads.push({ path: local(e.path), offset, length: slice.length })
     if (e.as === 'text') return { value: new TextDecoder().decode(slice) }
     return { value: { base64: base64(slice) } }
   })
@@ -1274,6 +1281,35 @@ test('a * segment of the rules path takes the highest version there, and a folde
   await completeTurn($, clock)
   expect(await boardOf($)).toMatchObject({ markdown: draft, proofError: 'Could not proofread: no folder matches the * in the rules path' })
 })
+
+// Windows spellings: ~\ with no HOME (Windows sets none) takes USERPROFILE, a drive or UNC path is
+// split on \ too, a trailing \ before SKILL.md is a separator, and a * right after the drive lists
+// the drive's root. The stubs drop the drive as the engine's native path comes in, so each case's
+// folders are keyed by the POSIX spelling
+const WINDOWS_RULES = [
+  { name: '~\\ under USERPROFILE, with a trailing \\', rules: '~\\.claude\\plugins\\cache\\m\\p\\*\\skills\\style\\', env: { USERPROFILE: 'C:\\Users\\me\\' }, list: '/Users/me/.claude/plugins/cache/m/p', file: '/Users/me/.claude/plugins/cache/m/p/3.10.0/skills/style/SKILL.md', dir: '/Users/me/.claude/plugins/cache/m/p/3.10.0/skills/style' },
+  { name: 'a * right after the drive', rules: 'D:\\*\\rules.md', env: {}, list: '/', file: '/3.10.0/rules.md' },
+]
+
+for (const c of WINDOWS_RULES) {
+  test(`Windows rules path: ${c.name}`, { options: { proofreadRules: c.rules } }, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const h = stubHost(on, { [FILE]: prompt('fix it', 10), [c.file]: 'newest rules' }, { language: undefined, env: c.env })
+    h.dirs.set(c.list, [
+      { name: '3.9.0', kind: 'dir' },
+      { name: '3.10.0', kind: 'dir' },
+    ])
+    if (c.dir) h.dirs.set(c.dir, [])
+    h.reply = answered('## Goal\n- fix the band')
+    h.proofReply = proofread('## Goal\n- Fix the band.')
+    await start($, clock)
+    await openPane($, clock)
+    await completeTurn($, clock)
+
+    expect(h.completes[0]?.prompt).toEqual([expect.anything(), { text: 'newest rules\n</rules>\n', cache: true }, expect.anything()])
+    expect(await boardOf($)).toMatchObject({ markdown: '## Goal\n- Fix the band.' })
+  })
+}
 
 test('a proofread overtaken by a switch of conversation is dropped, and an answer ending during it asks again', { options: { proofreadRules: '~/rules.md' } }, async ($, on) => {
   const { clock, h } = await proofHost($, on)

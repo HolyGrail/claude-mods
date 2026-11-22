@@ -99,6 +99,8 @@ For that, a whole segment of the path may be `*`: the mod lists that folder and 
 ~/.claude/plugins/cache/<marketplace>/<plugin>/*/skills/<skill>
 ```
 
+On Windows, `\` works as well as `/` (`~\notes\writing-rules.md`, `C:\Users\me\rules.md`), and `~` is `USERPROFILE` when `HOME` is not set. On macOS and Linux a `\` stays part of a name.
+
 Set them where Claude Code keeps a plugin's options: on the screen that sets them when the plugin is installed, as rows of `/config` in the terminal, or in settings.json under `pluginConfigs`, keyed by the plugin. The example below is the form for a plugin loaded with `--plugin-dir`, keyed `status-board`; the key's spelling for an installed plugin has not been checked yet.
 
 ```json
@@ -241,6 +243,7 @@ What has been checked, and what has not yet:
 - **Copying in the desktop app (2.1.326)**: a probe plugin's Button calling `$.ui.copy` answered `isCopied: true`. The copy buttons of this mod have not been pressed there yet
 - **Checked with `claude -p --plugin-dir` (v2.1.327)**: loading the mod (including the hooks being accepted and `/board` registered). Reading the transcript (a 33 MB transcript read to its end, with the count matching one made another way). A summary asked for from the `turn.complete` hook coming back
 - **Pull request links in the desktop app (2.1.326)**: a probe plugin's pane `Markdown` drew a link written `[#55](https://github.com/owner/repo/pull/55)` that opened in the browser on a click. A board of this mod then showed `#56` as a link, which opened that pull request on a click. The terminal (where the types say an OSC 8 link is drawn) has not been tried
+- **Windows (2.1.330)**: every test passes there. Engines up to 2.1.325 cannot load the mod, since they lack `$.session.info()`. Use in the desktop app on Windows has not been checked yet
 - **Not yet checked in the desktop app**: the automatic update at the end of a turn. The summary when the pane is opened. Restoring a saved board
 - **Proofreading in the desktop app (2.1.326)**: with `sonnet` and a skill's `SKILL.md` of 41 KB as the rules, found through a `*` segment, the proofread board came back and passed the check of headings and items. It changed 4 or 5 commas and sentence endings a board, and the two calls together wrote 3,672 and 3,887 tokens of output on two boards. `Copy the board` was pressed with each of the two texts shown, and each time copied the one shown. Whether the rules are read from the cache has not been measured
 
